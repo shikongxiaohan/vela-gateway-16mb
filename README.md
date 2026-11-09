@@ -227,7 +227,7 @@ tcpip 线程，串口输出会阻塞数毫秒，直接造成 TCP 重传、吞吐
 | SPIFFS 挂载失败无任何提示，录音功能静默失效 | 打印 `SPIFFS_MOUNT_FAILED` + 分区是否存在 + 大小 |
 | 状态接口看不到 Flash / 分区信息，无法确认刷的是不是 16MB 版 | `/api/v1/status` 增加 `flashSize`、`appPartitionSize`、`spiffsPartitionSize` 等 |
 | 启动无版本横幅 | 启动打印芯片型号、Flash 大小、app 分区地址/大小、SPIFFS 大小 |
-| 自动恢复出厂只要 10 分钟没连上就清空，停电/路由器重启也会触发 | 重写为带 5 道健康门槛的倒数窗口，见 §6 |
+| 自动恢复出厂只要 10 分钟没连上就清空，停电/路由器重启也会触发 | 拆成「主动恢复出厂（FACT，清配置）」与「连不上 Wi-Fi 自动开热点（SEPU，不清配置）」两条路径，见 §6 |
 | 管理网页是桌面 720px 布局，手机上要横向滚动 | 重写为移动优先布局，见 §6 |
 | 版本号硬编码在网页和状态接口两处，容易不一致 | 统一到 `main.cpp` 顶部一处宏，见"版本号规则" |
 
@@ -293,7 +293,7 @@ SUCCESS 00:01:09
 
 | 标识 | 值 | 定义位置 |
 |------|-----|---------|
-| 配网热点 SSID | `Vela-Bridge` | `src/main.cpp` → `kApSsid` |
+| 配网热点 SSID | `Vela-Setup`（可在管理台改，存 NVS `ap_ssid`） | `src/main.cpp` → `kApSsid` / `gApSsid` |
 | 热点默认密码 | `12345678` | `setup()` / `/setup` 保存逻辑 |
 | 蓝牙 SPP 本地名 | `Vela-Gateway` | `src/main.cpp` → `kBtLocalName` |
 | mDNS 主机名 | `vela-gateway.local` | `setupMdns()` |
@@ -472,7 +472,8 @@ func: esp_vfs_lwip_sockets_register
 **怎么确认设备上跑的是新固件**：串口日志里会打印 app 镜像的 ELF 指纹，
 
 ```
-ELF file SHA256: 716ad3ffd8e9232a     ← 新固件
+ELF file SHA256: 46d75bc26ddf59de     ← 本次新固件（AP 名可配 + 恢复出厂拆分）
+ELF file SHA256: 716ad3ffd8e9232a     ← 修复 tcpip_init 那一版
 ELF file SHA256: 7d1c587dc0562e5b     ← 修复前那一版
 ```
 
@@ -482,7 +483,7 @@ ELF file SHA256: 7d1c587dc0562e5b     ← 修复前那一版
 
 ## 5. 后续升级（手机就能刷）
 
-1. 手机连热点 `Vela-Bridge`（密码默认 `12345678`）
+1. 手机连热点 `Vela-Setup`（密码默认 `12345678`）
 2. 浏览器打开 `http://192.168.4.1` → 系统页 → 「进入空中升级」
 3. 升级页先看「刷写前自检」，确认 `Flash：16.00 MB ✅`
 4. 点「选择固件并升级」，选 `firmware/*-ota.bin`
@@ -508,7 +509,7 @@ OTA 模式下刷新固件走 A/B 分区：写入另一个槽，重启后新固�
 
 ## 6. 使用
 
-1. 上电后 ESP32 开热点 `Vela-Bridge` / `12345678`
+1. 上电后 ESP32 开热点 `Vela-Setup` / `12345678`
 2. 手机连热点，浏览器打开 `http://192.168.4.1`
 3. 选家里 Wi-Fi、填密码；填手表 MAC 和 AuthKey
 4. 保存后自动重启，进入手表网关模式
@@ -545,43 +546,49 @@ OTA 模式下刷新固件走 A/B 分区：写入另一个槽，重启后新固�
   打开网页时用 `String + replace` 生成一份副本，峰值临时多占约 60KB 堆，
   页面关掉即释放，不影响转发路径
 
-### 恢复出厂设置（本次重写）
+### 恢复出厂 与 自动配网降级（本次重写）
 
 旧逻辑是「10 分钟内没有连接就清空配置」。这在家里停电、路由器重启、出差拔电源时
-都会误触发 —— 回家发现手表连不上、配置也没了。
+都会误触发 —— 回家发现手表连不上、配置也没了。新版把「主动恢复出厂」和
+「连不上 Wi-Fi 的自动降级」拆成两条互不混淆的路径：
 
-新逻辑分三个入口，**只在确实配错的情况下才会自动清**：
+| 触发 | 行为 | 是否清配置 |
+|------|------|-----------|
+| 长按 BOOT **3 秒**（松手时判定） | 只清 Wi-Fi 名称/密码，保留手表密钥 | 部分 |
+| 长按 BOOT **10 秒**（按住时执行） | 全部清空 → 重启 → 直接进配网热点 | 是 |
+| 网页「恢复出厂设置」 | 需输入 `RESET` 确认，清空后重启 | 是 |
+| 自动：连不上 Wi-Fi | 自动开配网热点，**配置全部保留** | **否** |
 
-| 触发 | 行为 |
-|------|------|
-| 长按 BOOT **3 秒**（松手时判定） | 只清 Wi-Fi 名称/密码，保留手表密钥 |
-| 长按 BOOT **10 秒**（按住时执行） | 全部清空 → 重启 → 直接进配网热点 |
-| 网页「恢复出厂设置」 | 需输入 `RESET` 确认，清空后重启 |
-| 自动（A：配网后从没连上） | 10 分钟窗口，多半是密码填错 |
-| 自动（B：曾经连过、长时间失联） | 30 分钟窗口 |
+主动恢复出厂用 `FACT` 标志（清空 `vela` + `ap_ssid`），自动降级用 `SEPU` 标志
+（只进配网、不清任何配置）。两者都存独立命名空间 `vela-fac`，开机处理一律不重启。
 
-自动触发的**五道健康门槛**：
+自动降级的判定参数（`src/main.cpp`）：
 
-1. 开机后 **3 分钟**内不判定（给路由器重启/DHCP 留时间）
-2. 至少重试失败 **5 次**才进入候选
-3. 期间只要成功连上一次，倒计时**立即清零**
-4. SoftAP 上还有浏览器连着 → 倒计时**冻结**（正在调试，不能清）
-5. 长按超过 3 分钟视为下载模式/IO 故障，**放弃**该次长按
+| 常量 | 值 | 含义 |
+|------|----|------|
+| `kAutoSetupGraceMs` | 60 s | 开机 1 分钟内不判定 |
+| `kAutoSetupFallbackMs` | 120 s | 连续连不上 2 分钟 → 触发降级 |
+| `kAutoSetupMinFailures` | 3 | 至少重连失败 3 次才判定 |
+| `kAutoSetupSnoozeMs` | 30 min | 网页「暂不开热点」推迟时长 |
+
+降级后进入 **AP+STA 共存**：保留已存 Wi-Fi 后台继续尝试连接；STA 重新连上且稳定
+60 秒、且没有 AP 客户端连接时，自动重启回正常模式。网页按钮文案为
+「将自动开启配网热点 / 不会清除任何配置」「暂不开热点（30 分钟）」。
 
 清空范围（`factoryClearNvs()` 里逐项列出，不是 `nvs_flash_erase` 全抹）：
 
-* 清：ssid / wifi_pass / watch_mac / watch_auth / ap_pass / local_token / 运行模式
+* 清：ssid / wifi_pass / watch_mac / watch_auth / ap_pass / ap_ssid / local_token / 运行模式
 * 留：固件、分区表、SPIFFS 文件、eFuse、启动计数
 
-串口可以完整追踪决策过程：
+串口可以完整追踪决策过程（自动降级**不会**打印 `FACTORY_RESET_BEGIN`）：
 
 ```
-AUTO_RESET_WINDOW reason=never_connected budget_ms=600000
-AUTO_RESET_PAUSED ap_client_present
-AUTO_RESET_COUNTDOWN reason=never_connected remain_ms=240000
-FACTORY_RESET_REASON auto_never_connected elapsed_ms=600120 failures=12
-FACTORY_RESET_BEGIN reason=auto_never_connected
-FACTORY_RESET_DONE rebooting_into_setup_mode
+AUTO_SETUP_FALLBACK_BEGIN reason=never_connected keep_all_config=true
+AUTO_SETUP_FALLBACK_DONE rebooting_into_setup_mode
+AUTO_SETUP_FALLBACK_PENDING entering_setup_without_clearing
+SETUP_MODE_REASON auto_setup_fallback_config_kept
+SETUP_MODE_STA_CONNECTED ssid=HomeWiFi
+SETUP_MODE_STA_OK rebooting_to_normal_mode
 ```
 
 ### 运行模式

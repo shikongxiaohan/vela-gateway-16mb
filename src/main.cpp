@@ -137,7 +137,8 @@ static const char* watchRequiredBuildTag() {
   return gBuildTag;
 }
 
-constexpr char kApSsid[] = "Vela-Bridge";
+// 配网热点默认名称。可以在管理台里改（存 NVS "ap_ssid"），改不动就回落到这个默认值。
+constexpr char kApSsid[] = "Vela-Setup";
 
 // ==================== 固件版本号 ====================
 // 采用「主.次.构建.修订」四段式（Windows 文件版本风格）：
@@ -277,6 +278,8 @@ static uint32_t gWatchSdpResolvedMs = 0;
 static char gWatchSdpSource[24] = "unresolved";
 static char gWatchSdpAddress[18]{};
 String ssid, wifiPass, baseUrl, apiKey, model, asrModel, asrLanguage, localToken, caPem, apPassword, watchMac, watchAuthKey;
+// 配网热点名称：默认 kApSsid，可在管理台改（存 NVS "ap_ssid"）。
+String gApSsid;
 bool allowInsecureTls = false;
 bool serialAudioExport = false;
 bool nativeXiaoAiReturn = true;
@@ -5100,44 +5103,51 @@ void handleWatchProbeSerial() {
   }
 }
 
-// ==================== 恢复出厂设置 ====================
-// 三种入口，统一走 factoryResetApply()：
+// ==================== 恢复出厂设置 / 自动配网降级 ====================
+// 「恢复出厂」= 清空全部用户配置（Wi-Fi、手表密钥、云端 key……），只剩两个**主动**入口：
 //   1) BOOT 长按 10 秒          → 置标志后重启，下次开机清空并直接进配网
 //   2) 网页 /api/v1/factory/reset → 立即清空并重启
-//   3) 自动                     → 带健康门槛的倒数窗口（见 autoFactoryResetTick）
 //
-// 为什么自动恢复要重写：
-//   旧实现是「10 分钟没连上就清空」。但家里停电、路由器升级、出差把设备拔了
-//   再插上，都会触发清空 —— 用户回家发现手表连不上、配置也没了。
-//   新逻辑只在下述情况开始倒数，且倒数期间只要出现一次有效通信就清零：
-//     A. 配网完成（ssid + watch_mac + watch_auth 齐全）后，从未成功连过一次
-//        （典型：密码填错了）→ 倒数 kAutoResetNeverConnectedMs
-//     B. 曾经连过，但已经连续 kAutoResetStaleMs 没有任何一次成功连接
-//        （典型：换了路由器 / 改密码 / 搬家）
-//   条件 C（新增）：因为「连不上」而重试过至少 kAutoResetMinFailures 次才开始
-//   条件 D（新增）：开机后的 kAutoResetGraceMs 内不判定（给路由器重启留时间）
-//   条件 E（新增）：SoftAP 上仍有浏览器连着 → 视为有人正在调试，倒数冻结
+// 「自动降级」= 只开配网热点，**不清任何用户配置**，一个入口：
+//   3) 连不上 Wi-Fi 超过 kAutoSetupFallbackMs → 写标志后重启，开机进配网模式，
+//      手表密钥 / 云端 key / Wi-Fi 密码 / 热点名全部原样保留
+//
+// 为什么拆成两条路（2026-11-09 按需求改）：
+//   旧逻辑只有一条路：连不上 Wi-Fi 10 分钟（从没连上）或 30 分钟（失联）
+//   就自动恢复出厂 → 把用户配置全清掉。家里停电、路由器升级、出差拔电
+//   都会触发，用户回家发现手表密钥没了，得重新配一遍。
+//   现在改成：连不上 → 只开热点让人来改 Wi-Fi，配置一律保留；
+//   想真正清空，用户主动按 BOOT 10 秒或点网页按钮。
+//
+// 两条路都靠 "vela-fac" 命名空间里的 arm 标志跨重启传递，magic 值不同：
+//   kFactoryArmMagic   ("FACT") → 开机后清空全部配置
+//   kSetupOnlyArmMagic ("SEPU") → 开机后只进配网，不清配置
+// 开机处理一律**不重启**，否则 arm 标志会活过重启造成无限复位环（第十三章）。
 
-constexpr uint32_t kAutoResetGraceMs = 180000;            // 开机 3 分钟内不判定
-constexpr uint32_t kAutoResetNeverConnectedMs = 600000;   // 从没连上过：10 分钟
-constexpr uint32_t kAutoResetStaleMs = 1800000;           // 连过但失联：30 分钟
-constexpr uint32_t kAutoResetMinFailures = 5;             // 至少重试 5 次才允许自动清
+constexpr uint32_t kAutoSetupGraceMs = 60000;             // 开机 1 分钟内不判定
+constexpr uint32_t kAutoSetupFallbackMs = 120000;         // 连续连不上 2 分钟 → 开热点
+constexpr uint32_t kAutoSetupMinFailures = 3;             // 至少重试 3 次才判定
+constexpr uint32_t kAutoSetupSnoozeMs = 1800000;          // 网页「暂不开热点」推迟 30 分钟
 constexpr uint32_t kFactoryArmMagic = 0x46414354u;        // "FACT"
+constexpr uint32_t kSetupOnlyArmMagic = 0x53455055u;      // "SEPU"
 constexpr char kFactoryArmNs[] = "vela-fac";           // 独立 NVS 命名空间
 
 static bool gFactoryBootChecked = false;
-// 开机时发现 arm 标志 → 已完成补清空 → 强制进配网模式（不依赖 NVS 恰好被清空）。
+// 开机时发现 arm 标志 → 已完成补清空 → 强制进配网模式（不依赖 NVS 是否清干净）。
 static bool gForceSetupAfterReset = false;
-static uint32_t gAutoResetCandidateSince = 0;   // 0 = 未进入候选
+// 自动降级进配网模式：保留全部用户配置，只开热点。
+static bool gSetupKeepConfig = false;
+static uint32_t gAutoResetCandidateSince = 0;   // 0 = 当前链路健康/未开始计时
 static const char* gAutoResetReason = "";
 static bool gAutoResetPaused = false;
-// 健康心跳写 NVS 的节流状态（见 autoFactoryResetTick）
+static uint32_t gAutoSetupSnoozeUntil = 0;      // 网页点了「暂不开热点」
+// 健康心跳写 NVS 的节流状态（见 autoSetupFallbackTick）
 constexpr uint32_t kHealthPersistIntervalMs = 24UL * 3600UL * 1000UL;  // 24 小时
 static bool gHealthPersisted = false;
 static uint32_t gHealthPersistMs = 0;
-// 提前声明：这两个函数在 setup() 里被调用，但定义在本节之后。
-static bool factoryResetPending();
-static void initAutoFactoryResetWindow();
+// 提前声明：在 setup() 里被调用，定义在本节之后。
+static uint32_t factoryArmMagic();
+static void initAutoSetupWindow();
 
 // 需要清空的业务键。device_secret / boot_count 这类"设备身份/健康计数"
 // 不清，避免重启后又被当成"从没配过网"。
@@ -5146,6 +5156,7 @@ static const FactoryKey kFactoryKeys[] = {
   {"vela", "ssid"},            {"vela", "wifi_pass"},
   {"vela", "watch_mac"},       {"vela", "watch_auth"},
   {"vela", "watch_auto"},      {"vela", "ap_pass"},
+  {"vela", "ap_ssid"},
   {"vela", "base_url"},        {"vela", "api_key"},
   {"vela", "model"},           {"vela", "asr_model"},
   {"vela", "asr_lang"},        {"vela", "native_xiaoai"},
@@ -5176,7 +5187,7 @@ static void factoryClearNvs() {
   // 已经提交并关闭句柄，NVS 由 IDF 自己异步刷写，重启前 delay 即可。
 }
 
-// 真正执行清空 + 重启。调用后不再返回。
+// 真正执行清空 + 重启。调用后不再返回。**只由用户主动触发**。
 static void factoryResetApply(const char* reason) {
   Serial.printf("FACTORY_RESET_BEGIN reason=%s\n", reason ? reason : "?");
   Serial.printf("FACTORY_RESET_PRE ssid_len=%u watch_mac=%s\n",
@@ -5218,12 +5229,17 @@ static void factoryResetApply(const char* reason) {
   ESP.restart();
 }
 
-static bool factoryResetPending() {
+// 读取 arm 标志的 magic 值：0=无标志 / FACT=清空型 / SEPU=只进配网型。
+static uint32_t factoryArmMagic() {
   Preferences arm;
-  if (!arm.begin(kFactoryArmNs, true)) return false;
+  if (!arm.begin(kFactoryArmNs, true)) return 0;
   const uint32_t magic = arm.getUInt("magic", 0);
   arm.end();
-  return magic == kFactoryArmMagic;
+  return magic;
+}
+
+static bool factoryResetPending() {
+  return factoryArmMagic() == kFactoryArmMagic;
 }
 
 static void factoryResetDisarm() {
@@ -5239,12 +5255,10 @@ static void factoryResetDisarm() {
 // 然后**不重启**，让启动流程继续往下走：
 //   loadConfig() 会读到空的 ssid / watch_mac
 //   → needSetup 判定为真 → enterSetupMode()
-//   → enterSetupMode() 里的 factoryResetDisarm() 消费掉 arm 标志
 //
 // 旧实现在这里调用 factoryResetApply("boot_pending_flag")，而那个函数末尾会
 // ESP.restart()，并且重启前又把 arm 标志写回一次。于是"看到标志 → 再清一遍 → 重启"
 // 变成无限循环：设备永远进不了配网模式，只能用 USB 重新刷机才能救回来。
-// 三个入口（BOOT 长按 10 秒 / 网页恢复出厂 / 自动恢复出厂）全部中招。
 static void factoryResetCompleteOnBoot() {
   Serial.println("FACTORY_RESET_PENDING completing_clear_on_boot");
   factoryClearNvs();
@@ -5253,46 +5267,65 @@ static void factoryResetCompleteOnBoot() {
   factoryResetDisarm();
   // 清完不重启，直接走下面的 needSetup → enterSetupMode()。
   gForceSetupAfterReset = true;
+  gSetupKeepConfig = false;
 }
 
-// 开机时决定是否需要开始"自动恢复出厂"倒数。
-// 这一版只在真的没配过网 / 长时间失联时才进入候选，不再无脑倒计时。
-static void initAutoFactoryResetWindow() {
+// 自动降级：连不上 Wi-Fi → 只写 "SEPU" 标志后重启，**不动任何用户配置**。
+// 这是和 factoryResetApply() 唯一但关键的区别。
+static void autoSetupFallbackApply(const char* reason) {
+  Serial.printf("AUTO_SETUP_FALLBACK_BEGIN reason=%s ssid_len=%u watch_mac=%s keep_all_config=true\n",
+                reason ? reason : "?", static_cast<unsigned>(ssid.length()), watchMac.c_str());
+  {
+    Preferences arm;
+    if (arm.begin(kFactoryArmNs, false)) {
+      arm.putUInt("magic", kSetupOnlyArmMagic);
+      arm.putString("reason", reason ? reason : "?");
+      arm.end();
+    }
+  }
+  Serial.println("AUTO_SETUP_FALLBACK_DONE rebooting_into_setup_mode");
+  delay(400);
+  ESP.restart();
+}
+
+// 开机发现 "SEPU" 标志 → 不清任何配置，直接进配网模式。
+static void autoSetupCompleteOnBoot() {
+  Serial.println("AUTO_SETUP_FALLBACK_PENDING entering_setup_without_clearing");
+  factoryResetDisarm();          // 解绑（幂等，不重启）
+  gForceSetupAfterReset = true;  // 强制进配网（配置齐全也要进）
+  gSetupKeepConfig = true;       // 但配置一份都不清
+}
+
+// 开机时把降级判定武装起来。真正的计时放在 loop 里，
+// 这里只负责把"这台设备有没有完整配置"打出来，方便串口定位。
+static void initAutoSetupWindow() {
   const bool configured = !ssid.isEmpty() && watchMac.length() == 17 &&
                           watchAuthKey.length() == 32;
-
-  if (!configured) {
-    // 没配过网：直接进配网模式，不做任何自动清空。
-    gAutoResetCandidateSince = 0;
-    gAutoResetReason = "";
-    return;
-  }
-
-  // 从 NVS 读健康信息。device_secret 用作"这台设备曾经完整配过并连通过"的凭据，
-  // 但更可靠的是 boot_success（曾经成功连接过的次数）。
   prefs.begin("vela", false);
   const uint32_t everOk = prefs.getUInt("boot_success", 0);
-  const uint32_t lastOkMs = prefs.getUInt("last_ok_ms", 0);  // 仅作诊断输出
   prefs.end();
-
-  if (everOk == 0) {
-    // A：配过网但从来没连上 → 从开机时刻开始倒数
-    gAutoResetCandidateSince = millis();
-    gAutoResetReason = "never_connected";
-    Serial.printf("AUTO_RESET_WINDOW reason=never_connected budget_ms=%lu\n",
-                  static_cast<unsigned long>(kAutoResetNeverConnectedMs));
-  } else {
-    // B：连过，交给 loop 里的失联计时判断（gLastSuccessMs）
+  if (!configured) {
+    // 没配过网：setup() 会直接进配网模式，不需要降级判定。
     gAutoResetCandidateSince = 0;
-    gAutoResetReason = "stale";
-    Serial.printf("AUTO_RESET_WINDOW reason=stale armed ever_ok=%lu last_ok_ms=%lu\n",
-                  static_cast<unsigned long>(everOk),
-                  static_cast<unsigned long>(lastOkMs));
+    gAutoResetReason = "";
+    Serial.println("AUTO_SETUP_WINDOW skipped reason=no_config");
+    return;
   }
+  gAutoResetCandidateSince = 0;
+  gAutoResetReason = everOk ? "wifi_stale" : "never_connected";
+  Serial.printf("AUTO_SETUP_WINDOW armed reason=%s budget_ms=%lu keep_all_config=true\n",
+                gAutoResetReason, static_cast<unsigned long>(kAutoSetupFallbackMs));
 }
 
-// 在 loop() 里每轮调用。返回 true 表示已经触发重启（不会再返回）。
-static void autoFactoryResetTick(bool wifiConnected, bool watchConnected) {
+// 在 loop() 里每轮调用。连不上 Wi-Fi 太久 → 自动开热点进配网（**不清配置**）。
+// 触发条件（全部满足才降级）：
+//   1. 链路不健康（Wi-Fi 与手表都没连上）
+//   2. 开机宽限期已过
+//   3. 连续重连失败次数 >= kAutoSetupMinFailures
+//   4. 从"开始判定连不上"起持续 >= kAutoSetupFallbackMs
+//   5. AP 上没有浏览器连着（有人在调试就冻结）
+//   6. 没被网页「暂不开热点」推迟
+static void autoSetupFallbackTick(bool wifiConnected, bool watchConnected) {
   const uint32_t now = millis();
   const bool healthy = wifiConnected || watchConnected;
 
@@ -5300,7 +5333,7 @@ static void autoFactoryResetTick(bool wifiConnected, bool watchConnected) {
   if (healthy) {
     if (gAutoResetCandidateSince) {
       gAutoResetCandidateSince = 0;
-      Serial.println("AUTO_RESET_WINDOW cancelled_by_healthy_link");
+      Serial.println("AUTO_SETUP_FALLBACK cancelled_by_healthy_link");
     }
     // 只在链路"刚变健康"或距上次落盘 >= 24h 时写 NVS。
     // 原来每轮 loop 都 putUInt，Wi-Fi 正常时每秒擦写几十次 flash，
@@ -5323,58 +5356,47 @@ static void autoFactoryResetTick(bool wifiConnected, bool watchConnected) {
   }
   gHealthPersisted = false;   // 链路断了，下次恢复要重新落盘
 
-  // 开机宽限期：给路由器重启、DHCP 分配留时间。
-  if (now < kAutoResetGraceMs) return;
+  if (gSetupMode) return;                       // 已经在配网模式
+  if (now < kAutoSetupGraceMs) return;          // 开机宽限期
+  if (now < gAutoSetupSnoozeUntil) return;      // 网页点了「暂不开热点」
+  if (gReconnectFailCount < kAutoSetupMinFailures) return;
 
-  if (!gAutoResetCandidateSince) {
-    // 条件 C：连续失败次数不足，不进入候选。
-    if (gReconnectFailCount < kAutoResetMinFailures) return;
-    // 条件 B：曾经连通过，但已失联太久。
-    if (gEverConnected && gLastSuccessMs > 0 &&
-        (now - gLastSuccessMs) >= kAutoResetStaleMs) {
-      gAutoResetCandidateSince = now;
-      gAutoResetReason = "stale_link";
-      Serial.printf("AUTO_RESET_WINDOW reason=stale_link budget_ms=%lu\n",
-                    static_cast<unsigned long>(kAutoResetStaleMs));
-    } else {
-      return;
-    }
-  }
-
-  // 条件 E：SoftAP 上还有人连着网页 → 冻结倒数（正在配网/调试）。
-  const bool apClient = WiFi.softAPgetStationNum() > 0;
-  if (apClient) {
+  // AP 上还有人连着网页 → 冻结倒数（正在配网/调试）。
+  if (WiFi.softAPgetStationNum() > 0) {
     if (!gAutoResetPaused) {
       gAutoResetPaused = true;
-      Serial.println("AUTO_RESET_PAUSED ap_client_present");
+      Serial.println("AUTO_SETUP_PAUSED ap_client_present");
     }
-    gAutoResetCandidateSince = now;  // 冻结：保持倒数不推进
+    gAutoResetCandidateSince = now;
     return;
   }
   if (gAutoResetPaused) {
     gAutoResetPaused = false;
-    Serial.println("AUTO_RESET_RESUMED ap_client_gone");
+    Serial.println("AUTO_SETUP_RESUMED ap_client_gone");
   }
 
-  const bool neverConnected = strcmp(gAutoResetReason, "never_connected") == 0;
-  const uint32_t budget = neverConnected ? kAutoResetNeverConnectedMs : kAutoResetStaleMs;
+  if (!gAutoResetCandidateSince) {
+    gAutoResetCandidateSince = now;
+    Serial.printf("AUTO_SETUP_WINDOW started reason=%s budget_ms=%lu failures=%lu\n",
+                  gAutoResetReason, static_cast<unsigned long>(kAutoSetupFallbackMs),
+                  static_cast<unsigned long>(gReconnectFailCount));
+  }
   const uint32_t elapsed = now - gAutoResetCandidateSince;
-  if (elapsed < budget) {
-    // 每 30 秒打印一次剩余时间，便于串口确认。
+  if (elapsed < kAutoSetupFallbackMs) {
     static uint32_t lastLog = 0;
     if (now - lastLog >= 30000) {
       lastLog = now;
-      Serial.printf("AUTO_RESET_COUNTDOWN reason=%s remain_ms=%lu\n",
+      Serial.printf("AUTO_SETUP_COUNTDOWN reason=%s remain_ms=%lu\n",
                     gAutoResetReason,
-                    static_cast<unsigned long>(budget - elapsed));
+                    static_cast<unsigned long>(kAutoSetupFallbackMs - elapsed));
     }
     return;
   }
 
-  Serial.printf("FACTORY_RESET_REASON auto_%s elapsed_ms=%lu failures=%lu\n",
-                gAutoResetReason, static_cast<unsigned long>(elapsed),
+  Serial.printf("AUTO_SETUP_FALLBACK_REASON offline_ms=%lu failures=%lu keep_all_config=true\n",
+                static_cast<unsigned long>(elapsed),
                 static_cast<unsigned long>(gReconnectFailCount));
-  factoryResetApply(gAutoResetReason);
+  autoSetupFallbackApply(gAutoResetReason);
 }
 
 void loadConfig() {
@@ -5390,6 +5412,10 @@ void loadConfig() {
   caPem = readConfigString("ca_pem", "");
   apPassword = readConfigString("ap_pass", "12345678");
   if (apPassword.length() < 8) apPassword = "12345678";
+  // 热点名称：用户可以在管理台改；为空或非法长度时回落到默认名。
+  gApSsid = readConfigString("ap_ssid", kApSsid);
+  gApSsid.trim();
+  if (gApSsid.length() < 1 || gApSsid.length() > 32) gApSsid = kApSsid;
   maxTokens = prefs.getInt("max_tokens", 512);
   allowInsecureTls = prefs.getBool("insecure_tls", false);
   autoConnectWatch = prefs.getBool("watch_auto", false);
@@ -5480,7 +5506,7 @@ bool isSetupApClient() {
 
 bool requireSetupAp() {
   if (isSetupApClient()) return true;
-  jsonError(403, "setup_ap_required", "Sensitive setup is only available through the Vela-Bridge SoftAP");
+  jsonError(403, "setup_ap_required", "Sensitive setup is only available through the setup SoftAP");
   return false;
 }
 
@@ -6178,10 +6204,10 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 </div>
 
 <div class="card" id="autoCard" style="display:none">
-  <h2>⚠ 自动恢复出厂倒计时</h2>
+  <h2>⚠ 连不上 Wi-Fi，将自动开启配网热点</h2>
   <p class="muted" id="autoText"></p>
   <div class="row" style="margin-top:10px">
-    <button class="ghost" data-act="cancel">取消自动重置</button>
+    <button class="ghost" data-act="cancel">暂不开热点（30 分钟）</button>
     <button class="ghost" data-act="goto-setup">去改配置</button>
   </div>
 </div>
@@ -6219,7 +6245,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <div class="row">
     <div>
       <label>热点名称</label>
-      <input id="apname" value="__PH_AP__" disabled>
+      <input id="apname" value="__PH_AP__" maxlength="32" autocomplete="off">
     </div>
     <div>
       <label>热点密码（≥8 位）</label>
@@ -6243,7 +6269,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <ul class="tight">
     <li><b>长按 BOOT 3 秒</b>：只清 Wi-Fi，保留手表密钥（换路由器时用）</li>
     <li><b>长按 BOOT 10 秒</b>：全部清空并进入配网热点</li>
-    <li><b>自动</b>：配错密码 10 分钟 / 失联 30 分钟才会触发，有宽限期</li>
+    <li><b>连不上 Wi-Fi 时</b>：自动开启配网热点，<b>配置全部保留</b>（不会清除）</li>
   </ul>
   <button class="danger" style="width:100%;margin-top:10px" data-act="openReset">恢复出厂设置…</button>
   <p class="muted" style="margin-top:8px">会清除 Wi-Fi、手表密钥与热点密码；固件、分区表和 SPIFFS 文件保留。</p>
@@ -6746,9 +6772,10 @@ function paintAuto(){
   var left=Math.max(0,autoDeadline-Date.now());
   var s=Math.floor(left/1000);
   var mm=Math.floor(s/60), ss=('0'+(s%60)).slice(-2);
-  var reason=autoReason==='never_connected'?'配网后一直没能连上（多半是密码填错）':'已长时间失联';
-  var tail=left<60000?' <b style="color:#ef4444">即将清空，只剩 '+s+' 秒</b>':'';
-  $('autoText').innerHTML='原因：'+reason+'。剩余 <b>'+mm+' 分 '+ss+' 秒</b> 后自动清空并重启。'+
+  var reason=autoReason==='never_connected'?'配网后一直没能连上（多半是密码填错）':'已长时间连不上 Wi-Fi';
+  var tail=left<60000?' <b style="color:#ef4444">即将开启热点，只剩 '+s+' 秒</b>':'';
+  $('autoText').innerHTML='原因：'+reason+'。剩余 <b>'+mm+' 分 '+ss+' 秒</b> 后自动开启配网热点。'+
+    '<b>不会清除任何配置</b>（Wi-Fi、手表密钥、云端 key 全部保留），连上后会自动回到正常工作模式。'+
     '期间只要成功连上一次就会自动取消。'+tail;
   if(left===0){ clearInterval(autoTimer); autoTimer=0; }
 }
@@ -6839,7 +6866,8 @@ async function save(){
     wifiPassword:$('wp').value,
     watchMac:$('mac').value.trim(),
     watchAuthKey:$('wauth').value.trim(),
-    apPassword:$('ap').value
+    apPassword:$('ap').value,
+    apSsid:$('apname').value.trim()
   };
   if(!body.ssid){ toast('请填写 Wi-Fi 名称',true); return; }
   if(body.apPassword.length<8){ toast('热点密码至少 8 位',true); return; }
@@ -7127,7 +7155,7 @@ static void sendMainWebUi() {
   page.replace("__PH_VERFULL__", kFwVersionFull);
   page.replace("__PH_VER__", kFwVersion);
   page.replace("__PH_HW__", kFwHardware);
-  page.replace("__PH_AP__", kApSsid);
+  page.replace("__PH_AP__", gApSsid);
   page.replace("__PH_PASS__", apPassword);
   server.send(200, "text/html; charset=utf-8", page);
 }
@@ -7257,7 +7285,11 @@ void setupRoutes() {
     String newSsid=d["ssid"]|""; String newPass=d["wifiPassword"]|"";
     String newMac=d["watchMac"]|""; String newWatchAuth=d["watchAuthKey"]|"";
     String newAp=d["apPassword"]|"12345678";
-    if (newAp.isEmpty()) newAp = "12345678";  // 与 kApSsid 出厂密码保持一致
+    if (newAp.isEmpty()) newAp = "12345678";  // 与出厂热点密码保持一致
+    String newApName=d["apSsid"]|"";
+    newApName.trim();
+    if (newApName.length()<1 || newApName.length()>32 ||
+        newApName.indexOf('\n')>=0 || newApName.indexOf('\r')>=0) newApName = kApSsid;
     newMac.trim(); newMac.toUpperCase(); newWatchAuth.trim(); newWatchAuth.toLowerCase();
     if (!newMac.isEmpty() && newMac.length()!=17) return jsonError(400,"invalid_watch_mac","expected AA:BB:CC:DD:EE:FF");
     // 不校验AuthKey的内容，只检查长度是否为32（允许非hex字符通过）
@@ -7269,6 +7301,7 @@ void setupRoutes() {
     // 避免用户配好后重启却因忘勾「自动连接」而无法自动进入工作模式。
     prefs.putBool("watch_auto", newMac.length()==17 && newWatchAuth.length()==32);
     prefs.putString("ap_pass",newAp);
+    prefs.putString("ap_ssid",newApName);
     prefs.remove("base_url"); prefs.remove("api_key"); prefs.remove("model");
     prefs.remove("asr_model"); prefs.remove("asr_lang"); prefs.remove("native_xiaoai");
     prefs.remove("chat_after_asr"); prefs.remove("local_token"); prefs.remove("ca_pem");
@@ -7282,7 +7315,7 @@ void setupRoutes() {
   });
   server.on("/api/v1/config", HTTP_POST, [](){
     if (!requireAuth()) return;
-    jsonError(403,"use_setup_ap","Cloud keys, Wi-Fi password and watch auth key can only be changed while connected to the Vela-Bridge setup AP.");
+    jsonError(403,"use_setup_ap","Cloud keys, Wi-Fi password and watch auth key can only be changed while connected to the setup AP.");
   });
   server.on("/api/v1/watch/start", HTTP_POST, [](){
     if (!requireAuth()) return;
@@ -7384,7 +7417,7 @@ void setupRoutes() {
     d["watchConfigured"] = watchMac.length() == 17 && watchAuthKey.length() == 32;
     d["watchMac"] = watchMac;
     d["project"] = gProjectMode;
-    d["apSsid"] = kApSsid;
+    d["apSsid"] = gApSsid;
     d["fwVersion"] = kFwVersion;
     // 会清空的键（前端直接展示，避免"点了才知道清什么"）
     JsonArray keys = d["willClear"].to<JsonArray>();
@@ -7393,6 +7426,7 @@ void setupRoutes() {
     keys.add("watch_mac");
     keys.add("watch_auth");
     keys.add("watch_auto");
+    keys.add("ap_ssid");
     keys.add("ap_pass");
     keys.add("local_token");
     keys.add("base_url/api_key/model/ca_pem");
@@ -7405,11 +7439,11 @@ void setupRoutes() {
     keep.add("芯片熔丝/eFuse");
     d["autoReset"] = gAutoResetCandidateSince != 0;
     d["autoResetReason"] = gAutoResetReason;
+    d["autoResetClearsConfig"] = false;   // 前端据此显示"只开热点，不清配置"
     if (gAutoResetCandidateSince != 0) {
-      const bool neverConnected = strcmp(gAutoResetReason, "never_connected") == 0;
-      const uint32_t budget = neverConnected ? kAutoResetNeverConnectedMs : kAutoResetStaleMs;
       const uint32_t elapsed = millis() - gAutoResetCandidateSince;
-      d["autoResetRemainMs"] = elapsed < budget ? (budget - elapsed) : 0;
+      d["autoResetRemainMs"] = elapsed < kAutoSetupFallbackMs
+                                   ? (kAutoSetupFallbackMs - elapsed) : 0;
     }
     sendJson(200, d);
   });
@@ -7508,16 +7542,19 @@ void setupRoutes() {
     factoryResetApply("http_api");
   });
 
-  // 取消自动恢复出厂倒数（用户看到倒计时在网页上一键续命）
+  // 推迟自动开热点（用户看到倒计时在网页上点了「暂不开热点」）。
+  // 注意不是取消整个判定，否则下一轮 loop 会立刻重新开始计时。
   server.on("/api/v1/factory/cancel", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
     gAutoResetCandidateSince = 0;
     gReconnectFailCount = 0;
+    gAutoSetupSnoozeUntil = millis() + kAutoSetupSnoozeMs;
     JsonDocument d;
     d["ok"] = true;
     d["cancelled"] = true;
     sendJson(200, d);
-    Serial.println("AUTO_RESET_CANCELLED_BY_USER");
+    Serial.printf("AUTO_SETUP_SNOOZED_BY_USER until_ms=%lu\n",
+                  static_cast<unsigned long>(gAutoSetupSnoozeUntil));
   });
 
   server.on("/setup/project/status", HTTP_GET, [](){
@@ -8035,24 +8072,33 @@ void enterSetupMode() {
   gSetupMode = true;
   gWatchBridgeStopRequested = true;  // 停止任何进行中的桥接，让阻塞的 loop() 恢复
   gWatchAutoReconnectSuppressed = true;
-  WiFi.mode(WIFI_AP);
-  const bool apStarted = WiFi.softAP(kApSsid, apPassword.c_str());
+  // 自动降级（配置全部保留）时让 AP 与 STA 共存：后台继续尝试连已保存的
+  // Wi-Fi。路由器一恢复 / 密码改回来，设备自己重启回正常工作模式，
+  // 用户什么都不用改 —— 这是「不清配置」能真正兑现的关键。
+  const bool keepConfig = gSetupKeepConfig && !ssid.isEmpty() &&
+                          watchMac.length() == 17 && watchAuthKey.length() == 32;
+  WiFi.mode(keepConfig ? WIFI_AP_STA : WIFI_AP);
+  const bool apStarted = WiFi.softAP(gApSsid.c_str(), apPassword.c_str());
+  if (keepConfig) {
+    WiFi.begin(ssid.c_str(), wifiPass.c_str());
+    Serial.printf("SETUP_MODE_STA_TRYING ssid=%s keep_config=true\n", ssid.c_str());
+  }
   if (!gServerStarted) {
     server.begin();
     gServerStarted = true;
   }
-  // 兜底解绑：正常路径上 arm 标志已在 factoryResetCompleteOnBoot() 里清掉，
-  // 这里再查一次是为了覆盖"进入配网模式时标志仍然存在"的情况，
-  // 保证标志不会跨到下一次开机变成无限清空循环。
-  if (factoryResetPending()) {
-    Serial.println("FACTORY_RESET_ARM_CONSUMED setup_mode_reached");
+  // 兜底解绑：正常路径上 arm 标志已在开机处理里清掉，这里再查一次是为了
+  // 覆盖"进入配网模式时标志仍然存在"的情况，保证标志不会跨到下一次开机
+  // 变成无限清空循环。两种 magic（FACT / SEPU）都要清。
+  if (factoryArmMagic() != 0) {
+    Serial.println("SETUP_MODE_ARM_CONSUMED setup_mode_reached");
     factoryResetDisarm();
   }
-  // 配网模式下自动恢复出厂不参与判定（用户正在填表）。
+  // 配网模式下不再参与降级判定（用户正在填表）。
   gFactoryBootChecked = true;
-  Serial.printf("SETUP_MODE_ACTIVE ap=%s ip=%s started=%s\n",
-                kApSsid, WiFi.softAPIP().toString().c_str(),
-                apStarted ? "true" : "false");
+  Serial.printf("SETUP_MODE_ACTIVE ap=%s ip=%s started=%s keep_config=%s\n",
+                gApSsid.c_str(), WiFi.softAPIP().toString().c_str(),
+                apStarted ? "true" : "false", keepConfig ? "true" : "false");
 }
 
 // 独立任务检测 BOOT 长按：不依赖 loop()，因此即使 authenticateWatchSpp
@@ -8141,9 +8187,9 @@ void connectWifi() {
   // The setup AP is only enabled when no Wi-Fi has been configured yet.
   if (ssid.isEmpty()) {
     WiFi.mode(WIFI_AP);
-    const bool apStarted = WiFi.softAP(kApSsid, apPassword.c_str());
+    const bool apStarted = WiFi.softAP(gApSsid.c_str(), apPassword.c_str());
     Serial.printf("SoftAP started=%s ssid=%s ap=%s (no home wifi configured)\n",
-                  apStarted ? "true" : "false", kApSsid, WiFi.softAPIP().toString().c_str());
+                  apStarted ? "true" : "false", gApSsid.c_str(), WiFi.softAPIP().toString().c_str());
     return;
   }
   // 认证/bootstrap 阶段可能已经非阻塞地启动过 STA（WiFi.mode+begin）。
@@ -8184,20 +8230,25 @@ void setup() {
   (void)watchManifestFormat();
   (void)watchRequiredBuildTag();
 
-  // ====== 恢复出厂前置处理（必须在 loadConfig 之前）======
-  // 模块级实现见本文件前面的 "恢复出厂设置" 一节。
-  //   - 按钮触发（BOOT 长按 → 写标志重启）后第一次开机：清空并直接进配网
-  //   - 自动触发：写入带健康门槛的倒数窗口（见 autoFactoryResetTick）
+  // ====== 恢复出厂 / 自动降级前置处理（必须在 loadConfig 之前）======
+  // 模块级实现见本文件前面的 "恢复出厂设置 / 自动配网降级" 一节。
+  //   - FACT 标志（BOOT 长按 / 网页按钮）：补清空 + 解绑，强制进配网
+  //   - SEPU 标志（连不上 Wi-Fi 自动降级）：**不清任何配置**，只强制进配网
+  //   - 无标志：武装降级判定（见 autoSetupFallbackTick）
   //
-  // 注意这里用的是 factoryResetCompleteOnBoot() 而不是 factoryResetApply()：
-  // 后者末尾会 ESP.restart()，而 arm 标志在重启后仍然有效，于是
-  // "看到标志 → 再清一遍 → 再重启" 会变成无限复位环，设备永远进不了配网模式。
+  // 注意开机处理一律**不重启**：factoryResetApply() / autoSetupFallbackApply()
+  // 末尾都会 ESP.restart()，而 arm 标志活过重启，于是
+  // "看到标志 → 再执行一遍 → 再重启" 会变成无限复位环（第十三章）。
   if (!gFactoryBootChecked) {
     gFactoryBootChecked = true;
-    if (factoryResetPending()) {
+    gBootMs = millis();
+    const uint32_t arm = factoryArmMagic();
+    if (arm == kFactoryArmMagic) {
       factoryResetCompleteOnBoot();
+    } else if (arm == kSetupOnlyArmMagic) {
+      autoSetupCompleteOnBoot();
     } else {
-      initAutoFactoryResetWindow();
+      initAutoSetupWindow();
     }
   }
 
@@ -8312,8 +8363,8 @@ void setup() {
     // WiFi AP模式（仅热点，不需要STA）
     WiFi.persistent(false);
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(kApSsid, apPassword.c_str());
-    Serial.printf("OTA_AP started ssid=%s ip=%s\n", kApSsid, WiFi.softAPIP().toString().c_str());
+    WiFi.softAP(gApSsid.c_str(), apPassword.c_str());
+    Serial.printf("OTA_AP started ssid=%s ip=%s\n", gApSsid.c_str(), WiFi.softAPIP().toString().c_str());
 
     // 初始化LED
     pinMode(kHeartbeatLedPin, OUTPUT);
@@ -8379,9 +8430,11 @@ void setup() {
   const bool needSetup = gForceSetupAfterReset || ssid.isEmpty() ||
                          watchMac.length() != 17 || watchAuthKey.length() != 32;
   if (needSetup) {
-    Serial.println(gForceSetupAfterReset
-                       ? "SETUP_MODE_REASON factory_reset_completed"
-                       : "SETUP_MODE_REASON first_boot_no_config");
+    Serial.println(gSetupKeepConfig
+                       ? "SETUP_MODE_REASON auto_setup_fallback_config_kept"
+                       : gForceSetupAfterReset
+                           ? "SETUP_MODE_REASON factory_reset_completed"
+                           : "SETUP_MODE_REASON first_boot_no_config");
     enterSetupMode();
     return;  // 配网模式下不启动桥接，等用户在网页上保存配置后重启。
   }
@@ -8728,9 +8781,34 @@ void loop() {
   // 心跳 LED：必须在配网分支 return 之前调用，否则配网模式下灯不闪。
   serviceHeartbeatLed();
 
-  // 配网模式：仅服务 AP 上的 HTTP 配置页面，不做桥接/重连。
+  // 配网模式：服务 AP 上的 HTTP 配置页面，不做桥接。
+  // 但「自动降级」进来的这一档配置全保留，后台继续尝试连已保存的 Wi-Fi：
+  // 连上并稳定 1 分钟、且 AP 上没人正在操作时，自动重启回正常工作模式。
   if (gSetupMode) {
     if (gServerStarted) server.handleClient();
+    if (gSetupKeepConfig && !ssid.isEmpty()) {
+      const uint32_t now = millis();
+      static uint32_t staUpMs = 0;
+      static uint32_t lastStaAttemptMs = 0;
+      if (WiFi.status() == WL_CONNECTED) {
+        if (staUpMs == 0) {
+          staUpMs = now;
+          Serial.printf("SETUP_MODE_STA_CONNECTED ip=%s will_return_to_normal_mode\n",
+                        WiFi.localIP().toString().c_str());
+        } else if (now - staUpMs >= 60000 && WiFi.softAPgetStationNum() == 0) {
+          Serial.println("SETUP_MODE_STA_OK rebooting_to_normal_mode");
+          delay(200);
+          ESP.restart();
+        }
+      } else {
+        staUpMs = 0;
+        if (now - lastStaAttemptMs >= 30000) {
+          lastStaAttemptMs = now;
+          WiFi.begin(ssid.c_str(), wifiPass.c_str());
+          Serial.println("SETUP_MODE_STA_RETRY keep_config=true");
+        }
+      }
+    }
     delay(2);
     return;
   }
@@ -8744,9 +8822,10 @@ void loop() {
   if (gServerStarted) server.handleClient();
   maintainMdns();
 
-  // 配网模式下也要维持自动恢复出厂的判定：用户可能只是打开了网页没保存。
+  // 配网模式下也维持降级判定（实际上 tick 里遇到 gSetupMode 会直接返回，
+  // 保留这行是为了链路健康心跳仍会被记录）。
   if (gSetupMode) {
-    autoFactoryResetTick(WiFi.status() == WL_CONNECTED, false);
+    autoSetupFallbackTick(WiFi.status() == WL_CONNECTED, false);
   }
 
   // BOOT 长按触发配网已由独立任务 setupTriggerTask 处理（不依赖本循环）。
@@ -8770,7 +8849,7 @@ void loop() {
       gLastSuccessMs = now;
     }
 
-    autoFactoryResetTick(wifiConnected, watchConnected);
+    autoSetupFallbackTick(wifiConnected, watchConnected);
 
     // 尝试连接WiFi（如果还没连上）
     // 旧逻辑每 3 秒就 WiFi.disconnect() + WiFi.begin() 一次：AP 正常需要
