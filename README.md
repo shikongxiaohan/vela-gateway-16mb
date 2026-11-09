@@ -393,6 +393,24 @@ cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app
 
 如果只看到 `flash=4194304`，说明刷进去的还是 4MB 的 bootloader/分区表。
 
+### 串口日志只有 bootloader 阶段、停在 `entry 0x400d0524`？
+
+**那不是我们的固件在跑**（2026-11-09 实测，见 `变更说明.md` 第十六章）。
+
+我们 bootloader.bin 的段表是 `0x3fff0030 / 0x40078000 / 0x40080400`，入口 `0x400805e4`。
+如果日志里是 `load:0x3f400020 / 0x3ffbcf60 / 0x400d0020` + `entry 0x400d0524`，
+说明这块板子上刷的是**别的项目的二级 bootloader**（另一套工具链构建的），
+我们的 app 根本没被加载 —— 所以也不会有任何 app 输出。
+
+先跑读回验证，30 秒出结论：
+
+```bash
+python3 tools/readback_check.py --port COM3
+```
+
+它会直接告诉你设备里的 bootloader 是不是我们这份（比对 entry），
+并打印 bootloader / app 的完整段表可以和串口日志逐项对照。
+
 ### 刷完还是每 2.26 秒复位？（2026-11-09 实测）
 
 **先读回验证，别猜**：

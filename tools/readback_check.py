@@ -72,6 +72,35 @@ def read_flash(cmd, port, offset, size, label):
         Path(out).unlink(missing_ok=True)
 
 
+def _segments(data):
+    """解析 ESP 镜像的段表，返回 [(addr, len), ...]。"""
+    if len(data) < 32 or data[0] != 0xE9:
+        return []
+    out = []
+    off = 24
+    try:
+        for _ in range(data[1]):
+            addr = int.from_bytes(data[off:off + 4], "little")
+            ln = int.from_bytes(data[off + 4:off + 8], "little")
+            out.append((addr, ln))
+            off += 8 + ln
+    except Exception:
+        pass
+    return out
+
+
+def _local_bootloader_entry():
+    """本地 firmware/bootloader.bin 的入口地址（用来判断设备上是不是我们这份）。"""
+    p = Path(__file__).resolve().parent.parent / "firmware" / "bootloader.bin"
+    try:
+        d = p.read_bytes()
+    except OSError:
+        return None
+    if len(d) < 8 or d[0] != 0xE9:
+        return None
+    return int.from_bytes(d[4:8], "little")
+
+
 def check(data, expect, label, report):
     """按期望值检查一段数据，产出 (ok, 描述)。"""
     if data is None:
@@ -96,15 +125,30 @@ def check(data, expect, label, report):
             report.append((False, f"app 镜像头 magic=0x{magic:02x} 不是 0xE9 —— 0x{ADDR_APP:X} 处没有 app"))
             return False
         entry = int.from_bytes(data[4:8], "little")
-        segc = data[23]
+        segc = data[1]          # 段数在偏移 1（偏移 23 是 hash_appended）
+        segs = _segments(data)
         report.append((True, f"app 镜像头有效 magic=0xE9 entry=0x{entry:08x} 段数={segc}"))
+        if segs:
+            report.append((True, "app 段表：" + " / ".join(
+                f"0x{a:08x}:{l}" for a, l in segs)))
         return True
     if expect == "bootloader":
         if data[0] != 0xE9:
             report.append((False, f"bootloader magic=0x{data[0]:02x} 不是 0xE9 —— 0x{ADDR_BOOTLOADER:X} 处没有 bootloader"))
             return False
         entry = int.from_bytes(data[4:8], "little")
-        report.append((True, f"bootloader 有效 entry=0x{entry:08x}"))
+        segs = _segments(data)
+        exp = _local_bootloader_entry()
+        desc = f"bootloader 有效 entry=0x{entry:08x}"
+        if segs:
+            desc += " 段表：" + " / ".join(f"0x{a:08x}:{l}" for a, l in segs)
+        if exp is not None and entry != exp:
+            report.append((False, desc))
+            report.append((False,
+                f"  ↑ 设备里的 bootloader 不是我们这份（本地 firmware/bootloader.bin 的 "
+                f"entry=0x{exp:08x}）—— 0x{ADDR_BOOTLOADER:X} 上是别的项目的二级 bootloader"))
+            return False
+        report.append((True, desc))
         return True
     if expect == "parttable":
         if data[0] != 0xAA:
