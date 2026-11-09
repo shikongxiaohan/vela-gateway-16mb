@@ -1,6 +1,6 @@
 # Vela Gateway — ESP32 手表上网网关（16MB Flash 版）
 
-**v0.0.0.0000 · tech-preview**
+**v0.0.0.1 · tech-preview**
 
 把 ESP32 变成手表 / 手环的 Wi-Fi 上网桥：蓝牙 SPP 连手表，Wi-Fi 连家里路由，
 用 lwIP NAPT 把两者桥起来。本版面向 **16MB Flash** 板子
@@ -9,62 +9,77 @@
 
 | 项 | 值 |
 |----|----|
-| 固件版本 | `v0.0.0.0000` |
+| 固件版本 | `v0.0.0.1` |
 | 发布通道 | `tech-preview`（早期技术预览，协议可能随时变） |
-| 占用 | RAM 22.5%（73,696 / 327,680 B）· Flash 24.9%（1,568,853 / 6,291,456 B） |
+| 占用 | RAM 22.5%（73,696 / 327,680 B）· Flash 24.9%（1,569,657 / 6,291,456 B） |
 | 管理台 | `http://192.168.4.1`（AP 模式）或设备 IP（STA 模式） |
 
 > **本仓库已带编译好的固件**，不用装 PlatformIO 也能刷，**乐鑫官方 Flash Download Tool 也能直接用**：
 >
 > | 文件 | 用途 |
 > |------|------|
-> | `firmware/vela-gateway-v0.0.0.0000-esp32-16mb-factory.bin` | 整片刷写（地址 `0x0`），首次刷这个 |
-> | `firmware/vela-gateway-v0.0.0.0000-esp32-16mb-ota.bin` | 网页 OTA 升级用 |
+> | `firmware/vela-gateway-v0.0.0.1-esp32-16mb-factory.bin` | 整片刷写（地址 `0x0`），首次刷这个 |
+> | `firmware/vela-gateway-v0.0.0.1-esp32-16mb-ota.bin` | 网页 OTA 升级用 |
 > | `firmware/bootloader.bin` / `partitions.bin` / `ota_data_initial.bin` | 分步刷写用 |
 >
 > 详见 [`烧录说明-乐鑫工具.md`](烧录说明-乐鑫工具.md)。
-> 实测大小 1.58MB（分区 6MB，占用 26%），已链接 lwIP NAPT（`ip_napt_enable`）
+> 实测大小 1.57MB（分区 6MB，占用 25%），已链接 lwIP NAPT（`ip_napt_enable`）
 > 与 Bluedroid 蓝牙栈。
 
 ## 版本号规则
 
-当前是**早期技术预览版**，对外版本号 `0.0.0`。semver 里 `0.x` 就是
-"初始开发、协议随时可能变"的约定，比硬凑一个 `1.0.0` 更诚实。
+采用 **`主.次.构建.修订`** 四段式（Windows 文件版本风格），四段全部对外可见：
 
 ```
-对外版本   MAJOR.MINOR.PATCH      0.0.0
-内部版本   四位数字，从 0000 起    0000
-展示形态   v0.0.0.0000
+主版本   MAJOR      0
+次版本   MINOR      0
+构建     BUILD      0
+修订     REVISION   1
+──────────────────────
+完整标识             v0.0.0.1
 ```
 
-| 段 | 含义 | 当前 |
-|----|------|------|
-| MAJOR | 不兼容变更（SPP 帧格式、配置项语义） | `0` |
-| MINOR | 向后兼容的新功能 | `0` |
-| PATCH | 向后兼容的缺陷修复 | `0` |
-| **内部版本** | 技术预览序号，四位补零，不参与 semver 排序 | `0000` |
+| 段 | 含义 | 什么时候动 | 当前 |
+|----|------|------------|------|
+| **主** MAJOR | 架构 / 协议不兼容变更（SPP 帧格式、配置项语义） | 手表侧要跟着改 | `0` |
+| **次** MINOR | 向前兼容的新功能（新接口、新面板） | 加功能 | `0` |
+| **构建** BUILD | 每次对外发布的源码构建 | 打一次发布包 +1 | `0` |
+| **修订** REVISION | 同一构建上的缺陷修复 | 只修 bug +1，前三位不动 | `1` |
 
-内部版本号是**独立计数器**，只在发布物文件名和串口横幅里出现。同一对外版本
-下连发多个内部构建时，用 `0001`、`0002` 区分；对外版本一旦跳到 `0.1.0`，
-内部号可以归零重来。
+前三段都是 `0` 的含义很直白：**协议还没冻结**。这不代表"不能发布"——
+`v0.0.0.1` 就是技术预览版的第一份修订。
 
-* 网页右上角徽章显示 `v0.0.0.0000`，通道标记为 `tech-preview`（黄色）
+和 semver 的区别：semver 用 `-test.4` 这种预发布标识挂在版本号尾巴上，
+而四段式把构建和修订作为**正式段位**，任何工具（含 Windows 文件属性、OTA
+差分、脚本排序）都能直接读懂，不用额外解析连字符。
+
+升级路径举例：
+
+| 场景 | 版本变化 |
+|------|----------|
+| 修个 bug | `v0.0.0.1` → `v0.0.0.2` |
+| 又攒一批修复要发版 | `v0.0.0.2` → `v0.0.1.0`（构建 +1，修订归零） |
+| 加了新面板 | `v0.0.1.0` → `v0.1.0.0`（次版本 +1，后面归零） |
+| 手表协议改成不兼容的 | `v0.1.0.0` → `v1.0.0.0`（主版本 +1，彻底归零） |
+
+* 网页右上角徽章显示 `v0.0.0.1`，通道标记为 `tech-preview`（黄色）
+* 系统页「版本构成」一行拆开显示：`主 0 · 次 0 · 构建 0 · 修订 1`
+* 设备页「主.次.构建.修订」显示纯数字 `0.0.0.1`
 * 串口横幅会打印完整标识，便于按场确认刷的是哪一版
-* 转正式版的时机：手表协议冻结 → 提到 `1.0.0`，去掉内部号
 
 版本号定义在两处，改版本要一起动：
 
 | 位置 | 作用 |
 |------|------|
-| `src/main.cpp` 顶部宏（`VELA_FW_VERSION_*` / `VELA_FW_BUILD`） | 网页徽章、状态接口 `version` 字段、串口横幅 |
-| 项目根 `version.txt`（内容 `v0.0.0.0000`） | ESP-IDF 编译期把它写进镜像里的 **app 描述符**，改文件头里的版本才能被 esptool / OTA 工具读到 |
+| `src/main.cpp` 顶部宏（`VELA_FW_VERSION_MAJOR` / `_MINOR` / `_BUILD` / `_REVISION`） | 网页徽章、状态接口、串口横幅 |
+| 项目根 `version.txt`（内容 `v0.0.0.1`） | ESP-IDF 编译期把它写进镜像里的 **app 描述符**，镜像头里的版本才行被 esptool / OTA 工具读到 |
 
 `version.txt` 是 IDF 的标准机制：根目录有它就自动读取其中的字符串作为
-`PROJECT_VER`；顺手也替换了默认的 `project(source)` 名字来源。改完这两处
-后必须 **clean 后全量重编译**，app 描述符才会更新（增量编译会保留旧值）。
+`PROJECT_VER`。改完这两处后必须 **clean 后全量重编译**，app 描述符才会更新
+（增量编译会保留旧值）。
 
-文件名规则：`vela-gateway-v<版本>.<内部号>-<硬件>-<类型>.bin`
-例：`vela-gateway-v0.0.0.0000-esp32-16mb-ota.bin`
+文件名规则：`vela-gateway-v<主>.<次>.<构建>.<修订>-<硬件>-<类型>.bin`
+例：`vela-gateway-v0.0.0.1-esp32-16mb-ota.bin`
 
 ---
 
@@ -230,8 +245,23 @@ pio run -e yd_esp32_16mb
 # 输出
 .pio/build/yd_esp32_16mb/bootloader.bin
 .pio/build/yd_esp32_16mb/partitions.bin
-.pio/build/yd_esp32_16mb/ota_data_initial.bin   ← 刷到 0xE000（等同 boot_app0.bin）
-.pio/build/yd_esp32_16mb/firmware.bin
+.pio/build/yd_esp32_16mb/ota_data_initial.bin   ← 刷到 0xE000，内容应等同 boot_app0.bin
+                                                （构建后由 tools/pio_verify.py 自动校正）
+.pio/build/yd_esp32_16mb/firmware.bin           ← app 镜像，刷到 0x20000，也是网页 OTA 用的那个
+```
+
+⚠️ **不要相信 `flasher_args.json`**：本工程是 `espidf + arduino` 双框架，
+PlatformIO 生成的 `flasher_args.json` 里写的是 `source.bin`（工程名 `project(source)`
+带来的），但实际产物叫 `firmware.bin`，按 json 刷会报文件不存在。手工刷请按上表
+文件名对照。
+
+生成 0x0 整包镜像（和 `firmware/*-factory.bin` 等价）：
+
+```bash
+cd .pio/build/yd_esp32_16mb
+python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32 merge_bin \
+  -o merged_factory.bin --flash_mode dio --flash_freq 80m --flash_size 16MB \
+  0x1000 bootloader.bin 0x8000 partitions.bin 0xe000 ota_data_initial.bin 0x20000 firmware.bin
 ```
 
 需要还原 4MB 版本时：
@@ -245,13 +275,14 @@ pio run -e legacy_4mb
 本工程已在 **ESP-IDF v4.4.4 + Arduino core 2.0.7 + espressif32@6.1.0** 下完整编译通过：
 
 ```
-RAM:   [===       ]  26.0% (used 85232 bytes from 327680 bytes)
-Flash: [===       ]  26.8% (used 1688421 bytes from 6291456 bytes)
-SUCCESS 00:01:07
+RAM:   [==        ]  22.5% (used 73696 bytes from 327680 bytes)
+Flash: [==        ]  24.9% (used 1569657 bytes from 6291456 bytes)
+SUCCESS 00:01:09
 ```
 
-* 静态 RAM 只占 1/4，剩下约 240KB 堆给蓝牙 + lwIP + SPP 缓冲；
-* 固件 1.56MB，6MB 槽占用 26%，两个 OTA 槽都能容纳完整镜像；
+* 静态 RAM 占 22.5%，剩下约 248KB 堆给蓝牙 + lwIP + SPP 缓冲；
+* 固件 1.57MB，6MB 槽占用 25%，两个 OTA 槽都能容纳完整镜像；
+* 裸机跑只剩网关这一条业务线后，RAM 比多项目共存时少 11,536 B（-13.5%）；
 * 链接结果已确认包含 `ip_napt_enable`（NAPT 真正编进去了，不是只在 sdkconfig 里写着）。
 
 ---
@@ -268,7 +299,7 @@ SUCCESS 00:01:07
 | mDNS 主机名 | `vela-gateway.local` | `setupMdns()` |
 | 非敏感接口 token 头 | `X-Vela-Token` | `requireLocalToken()` |
 | NVS 命名空间 | `vela`（业务）/ `vela-fac`（恢复出厂标志） | 各处 `prefs.begin()` |
-| 固件版本 | `v0.0.0.0000` | `VELA_FW_*` 宏 |
+| 固件版本 | `v0.0.0.1` | `VELA_FW_*` 宏 |
 
 > **手表端协议常量不要改**：包名、manifest 格式标识、能力上报里的 buildTag
 > 属于设备间通信契约（手表上的快应用按固定值匹配），固件只负责按约定生成和
@@ -302,7 +333,7 @@ Linux / macOS：
 ```bash
 esptool.py --chip esp32 -p /dev/ttyUSB0 -b 921600 write_flash --erase-all -z \
   --flash_mode dio --flash_freq 80m --flash_size 16MB \
-  0x0 firmware/vela-gateway-v0.0.0.0000-esp32-16mb-factory.bin
+  0x0 firmware/vela-gateway-v0.0.0.1-esp32-16mb-factory.bin
 ```
 
 `--erase-all` 先整片擦除（换分区表必须），`0x0` 是官方 Factory 镜像写法。
@@ -312,7 +343,7 @@ esptool.py --chip esp32 -p /dev/ttyUSB0 -b 921600 write_flash --erase-all -z \
 |------|------|------|
 | 0x1000 | `bootloader.bin` | 17 KB |
 | 0x8000 | `partitions.bin` | 3 KB |
-| 0xE000 | `boot_app0.bin`（otadata 初始 0xFF） | 8 KB |
+| 0xE000 | `ota_data_initial.bin`（otadata，**必须是含 ota_seq=1 记录的文件，不能是全 0xFF**） | 8 KB |
 | 0x20000 | `firmware.bin` | 1.6 MB |
 
 如果只想分步刷，注意 **固件偏移是 0x20000**（4MB 版是 0x10000），写错会启动到空白分区。
@@ -320,13 +351,42 @@ esptool.py --chip esp32 -p /dev/ttyUSB0 -b 921600 write_flash --erase-all -z \
 
 ### 刷完怎么确认
 
-串口（2M 波特）应看到：
+串口（**921600** 波特）应看到：
 
 ```
 === Vela Gateway boot ===
 BOOT chip=ESP32-D0WD-V3 rev=3 cores=2 flash=16777216 bytes (16.0 MB) heap=...
 BOOT app_partition=ota_0 addr=0x00020000 size=6291456 next_ota=ota_1 spiffs=spiffs size=4063232
 ```
+
+> 波特率定在 921600 是因为**网页版串口监视器最高只到这一档**（之前的 2000000
+> 在那些工具里选不出来，日志全是乱码）。要用满速就加 `-DVELA_SERIAL_BAUD=2000000`
+> 重新编译，同时把 `platformio.ini` 的 `monitor_speed` 一起改掉。
+
+### 刷完只会在 2 秒内反复复位？
+
+先跑一遍镜像校验：
+
+```bash
+python3 tools/verify_firmware.py firmware
+# 或
+pio run -e yd_esp32_16mb -t check-images
+```
+
+如果提示 **`otadata 全 0xFF（未初始化）`**，说明 `ota_data_initial.bin` 是空的。
+本项目的分区表没有 factory 分区，bootloader 读不到 otadata 记录就会拒绝启动，
+表现就是串口只有 bootloader 那几行、然后每 2 秒 `rst:0xc` 一次。
+
+修复：
+
+```bash
+cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
+   firmware/ota_data_initial.bin
+# 然后用它重新合并整包（见上面的 merge_bin 命令）
+```
+
+正常构建时这个修复由 `tools/pio_verify.py` 自动完成，`flash_16mb.sh` 也会
+在烧录前校验，不通过直接中止。
 
 * `flash=16777216` → Flash 识别为 16MB
 * `app_partition_size=6291456` → 6MB 的 OTA 槽生效
@@ -341,7 +401,7 @@ BOOT app_partition=ota_0 addr=0x00020000 size=6291456 next_ota=ota_1 spiffs=spif
 2. 浏览器打开 `http://192.168.4.1` → 系统页 → 「进入空中升级」
 3. 升级页先看「刷写前自检」，确认 `Flash：16.00 MB ✅`
 4. 点「选择固件并升级」，选 `firmware/*-ota.bin`
-5. 进度条走完，设备自动重启并回到项目 1（手表网关）
+5. 进度条走完，设备自动重启并回到手表网关模式
 
 OTA 模式下刷新固件走 A/B 分区：写入另一个槽，重启后新固件要稳定运行 30 秒
 才会被标记为有效，否则 bootloader 自动回滚。
@@ -366,7 +426,7 @@ OTA 模式下刷新固件走 A/B 分区：写入另一个槽，重启后新固�
 1. 上电后 ESP32 开热点 `Vela-Bridge` / `12345678`
 2. 手机连热点，浏览器打开 `http://192.168.4.1`
 3. 选家里 Wi-Fi、填密码；填手表 MAC 和 AuthKey
-4. 保存后自动重启，进入项目 1（手表网关）
+4. 保存后自动重启，进入手表网关模式
 
 ### 管理台（本次重写）
 
@@ -381,19 +441,24 @@ OTA 模式下刷新固件走 A/B 分区：写入另一个槽，重启后新固�
 | 家庭 Wi-Fi | 扫描列表点击填入，或手动填 SSID |
 | 手表蓝牙 | 扫描 + 连接测试，MAC 自动填 |
 | 热点与安全 | 当前热点名 / 改密码 |
-| 项目模式 | 6 个模式两列网格，切前二次确认 |
+| 运行模式 | 单个「进入空中升级」按钮（其余模式已剥离） |
 | 恢复出厂 | 说明三种触发方式 + 带 `RESET` 二次确认的弹窗 |
-| 设备信息 | 固件版本 / 通道 / 内部版本 / Flash / 分区 / SPIFFS |
+| 设备信息 | 固件版本 / 通道 / 主.次.构建.修订 / 构建日期 / Flash / 分区 / SPIFFS |
+
+七个标签（运行 / 性能 / 网络 / 手表 / 设备 / 工具 / 系统）横向可滑，
+390px 宽下不会换行挤压。
 
 实现要点：
 
-* 版本号不写死两份：HTML 里放 `__PH_VER__` 占位符，发送时用 `String::replace` 注入，
-  改版本只改 `main.cpp` 顶部一处
+* 版本号不写死两份：HTML 里放 `__PH_VERFULL__` / `__PH_VER__` / `__PH_HW__` 占位符，
+  发送时用 `String::replace` 注入，改版本只改 `main.cpp` 顶部宏 + `version.txt`
 * 所有按钮改成 `data-act` + 事件委托，避免内联 `onclick` 的引号嵌套问题
   （C++ 原始字符串 `R"HTML(...)HTML"` 遇到 `)"` 会提前截断，这是个真实踩过的坑）
 * 状态卡用 `repeat(auto-fit, minmax(min(132px,100%),1fr))`，390px → 2 列、360px → 2 列，
   数字再长也不会把页面顶出屏幕（实测 `scrollWidth == innerWidth`）
-* 页面总量 ~24.5KB，仍走 `PROGMEM`，打开网页时临时多占约 16KB 堆，不影响转发
+* 页面总量约 55KB（管理台 47.5KB + 升级页 13.9KB），走 `PROGMEM` 不占 RAM；
+  打开网页时用 `String + replace` 生成一份副本，峰值临时多占约 60KB 堆，
+  页面关掉即释放，不影响转发路径
 
 ### 恢复出厂设置（本次重写）
 
@@ -467,7 +532,7 @@ pio run -e yd_esp32_16mb -t menuconfig
 ## 8. 已知限制
 
 * 首次从 4MB 换到 16MB 必须 USB 整片擦除，OTA 无法完成分区布局迁移。
-* 当前是 **技术预览版 `v0.0.0.0000`**，自动恢复出厂的判定阈值（3 分钟宽限 / 10 分钟 / 30 分钟）
+* 当前是 **技术预览版 `v0.0.0.1`**，自动恢复出厂的判定阈值（3 分钟宽限 / 10 分钟 / 30 分钟）
   是经验值，实际用下来如果觉得太激进或太保守，改 `kAutoReset*` 常量重新编译即可。
 * 长按 BOOT 超过 180 秒视为「想进下载模式」，固件会主动放弃重置，避免误清配置。
 * 语音 ASR 链路在早期版本里已被硬编码关闭（`ch3` 音频直接忽略），

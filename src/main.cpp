@@ -139,44 +139,57 @@ static const char* watchRequiredBuildTag() {
 constexpr char kApSsid[] = "Vela-Bridge";
 
 // ==================== 固件版本号 ====================
-// 采用 semver + 预发布标识的通行写法：
+// 采用「主.次.构建.修订」四段式（Windows 文件版本风格）：
 //
-//   MAJOR.MINOR.PATCH[-prerelease][+build]
+//   MAJOR.MINOR.BUILD.REVISION
 //
-//   MAJOR  架构/协议不兼容变更（手表 SPP 帧格式、配置项语义）
-//   MINOR  向前兼容的新功能（新项目模式、新接口）
-//   PATCH  向后兼容的缺陷修复
+//   主版本  MAJOR     架构/协议不兼容变更（手表 SPP 帧格式、配置项语义）
+//   次版本  MINOR     向前兼容的新功能（新接口、新面板）
+//   构建    BUILD     每次对外发布源码构建 +1
+//   修订    REVISION  同一构建上的缺陷修复 +1，不动前三位
 //
-// 当前是**早期技术预览版**，对外版本号 0.0.0（semver 里 0.x 即"初始开发、
-// 随时可能改协议"的约定）。真正用来区分构建的是末尾四位内部版本号，
-// 从 0000 起递增，不参与 semver 排序，只在发布物和串口横幅里出现。
+// 当前是**早期技术预览版**，四段对外可见、都要写出来：
 //
-// 展示形态：v0.0.0.0000
-// 文件名   ：<项目>-v<主>.<次>.<修订>.<内部号>-<硬件>-<类型>.bin
-#define VELA_FW_VERSION_MAJOR  0
-#define VELA_FW_VERSION_MINOR  0
-#define VELA_FW_VERSION_PATCH  0
-#define VELA_FW_BUILD          "0000"        // 四位内部版本号（技术预览序号）
-#define VELA_FW_BUILD_DATE     "20261108"    // 实际构建日期 YYYYMMDD
+//   展示形态：v0.0.0.1     （网页徽章、串口横幅、固件文件名）
+//
+// 与 semver 的区别：semver 的 0.x 会把"未发布"当特殊状态，而四段式的
+// 0.0.0.1 含义是直白的——主/次/构建都还是 0，这是第 1 个修订。
+// 前三段为 0 只说明"协议未冻结"，不代表不能发布。
+//
+// 文件名   ：<项目>-v<主>.<次>.<构建>.<修订>-<硬件>-<类型>.bin
+#define VELA_FW_VERSION_MAJOR     0
+#define VELA_FW_VERSION_MINOR     0
+#define VELA_FW_VERSION_BUILD     0
+#define VELA_FW_VERSION_REVISION  1
+#define VELA_FW_BUILD_DATE        "20261108"    // 实际构建日期 YYYYMMDD
 
 #define VELA_STR2(x) #x
 #define VELA_STR(x)  VELA_STR2(x)
-// 对外版本："0.0.0"
+// 完整标识："v0.0.0.1"
+#define VELA_FW_VERSION_FULL \
+  "v" VELA_STR(VELA_FW_VERSION_MAJOR) "." \
+      VELA_STR(VELA_FW_VERSION_MINOR) "." \
+      VELA_STR(VELA_FW_VERSION_BUILD) "." \
+      VELA_STR(VELA_FW_VERSION_REVISION)
+// 不带 v 的数字部分："0.0.0.1"，给 status 接口和文件名用
 #define VELA_FW_VERSION \
   VELA_STR(VELA_FW_VERSION_MAJOR) "." \
   VELA_STR(VELA_FW_VERSION_MINOR) "." \
-  VELA_STR(VELA_FW_VERSION_PATCH)
-// 完整标识："v0.0.0.0000"
-#define VELA_FW_VERSION_FULL "v" VELA_FW_VERSION "." VELA_FW_BUILD
+  VELA_STR(VELA_FW_VERSION_BUILD) "." \
+  VELA_STR(VELA_FW_VERSION_REVISION)
 // 硬件与目标板标签，和文件名保持一致
 #define VELA_FW_HARDWARE "esp32-16mb"
 #define VELA_FW_CHANNEL  "tech-preview"
 
-constexpr char kFwVersion[] = VELA_FW_VERSION;
-constexpr char kFwVersionFull[] = VELA_FW_VERSION_FULL;
+constexpr char kFwVersion[] = VELA_FW_VERSION;          // "0.0.0.1"
+constexpr char kFwVersionFull[] = VELA_FW_VERSION_FULL; // "v0.0.0.1"
 constexpr char kFwChannel[] = VELA_FW_CHANNEL;
 constexpr char kFwHardware[] = VELA_FW_HARDWARE;
-constexpr char kFwBuild[] = VELA_FW_BUILD;
+// 四段分别单独暴露，供状态接口/网页分字段展示
+constexpr int kFwVerMajor = VELA_FW_VERSION_MAJOR;
+constexpr int kFwVerMinor = VELA_FW_VERSION_MINOR;
+constexpr int kFwVerBuild = VELA_FW_VERSION_BUILD;
+constexpr int kFwVerRevision = VELA_FW_VERSION_REVISION;
 constexpr char kFwBuildDate[] = VELA_FW_BUILD_DATE;
 
 constexpr uint8_t kSetupWifiScanMaxResults = 20;
@@ -5136,11 +5149,14 @@ static const FactoryKey kFactoryKeys[] = {
   {"vela", "chat_after_asr"},  {"vela", "local_token"},
   {"vela", "ca_pem"},          {"vela", "max_tokens"},
   {"vela", "insecure_tls"},    {"vela", "capture_ch8"},
-  {"vela", "project"},         {"vela", "project2"},
-  {"vela", "force_setup"},     {"vela", "p5_ssid"},
-  {"vela", "p5_pass"},         {"vela", "p4_bt_addr"},
-  {"vela", "p4_bt_name"},      {"vela", "p4_bt_key"},
-  {"vela", "p4_package"},
+  {"vela", "ntp_tz"},          {"vela", "led_mode"},
+  {"vela", "pref_log"},        {"vela", "pref_compact"},
+  {"vela", "last_ok_ms"},      {"vela", "project"},
+  {"vela", "project2"},        {"vela", "force_setup"},
+  // 已删除的项目 4/5 遗留键，老设备升级上来可能还在，一并清掉
+  {"vela", "p5_ssid"},         {"vela", "p5_pass"},
+  {"vela", "p4_bt_addr"},      {"vela", "p4_bt_name"},
+  {"vela", "p4_bt_key"},       {"vela", "p4_package"},
 };
 
 static void factoryClearNvs() {
@@ -6085,7 +6101,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 <header>
   <div>
     <h1>Vela Gateway</h1>
-    <p class="sub">ESP32 手表上网网关 · <span class="tag test" id="fwTag">__PH_VER__</span></p>
+    <p class="sub">ESP32 手表上网网关 · <span class="tag test" id="fwTag">__PH_VERFULL__</span></p>
   </div>
   <button class="ghost" style="width:auto;padding:8px 12px;font-size:13px" data-act="refresh">刷新</button>
 </header>
@@ -6217,7 +6233,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 <div class="card">
   <h2>固件与升级</h2>
   <div class="mini"><b>当前版本</b><span id="yVer">—</span></div>
-  <div class="mini"><b>内部版本</b><span id="yBuild">—</span></div>
+  <div class="mini"><b>版本构成</b><span id="yBuild">—</span></div>
   <div class="mini"><b>发布通道</b><span id="yChan">—</span></div>
   <div class="row" style="margin-top:10px">
     <button class="ghost" data-act="switchProj" data-arg="6">进入空中升级</button>
@@ -6241,7 +6257,8 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <div class="grid kv-grid" id="devInfo">
     <div class="kv"><b>固件</b><span id="dFw">—</span></div>
     <div class="kv"><b>通道</b><span id="dCh">—</span></div>
-    <div class="kv"><b>内部版本</b><span id="dBu">—</span></div>
+    <div class="kv"><b>主.次.构建.修订</b><span id="dBu">—</span></div>
+    <div class="kv"><b>构建日期</b><span id="dDate">—</span></div>
     <div class="kv"><b>Flash</b><span id="dFl">—</span></div>
     <div class="kv"><b>应用分区</b><span id="dAp">—</span></div>
     <div class="kv"><b>SPIFFS</b><span id="dSp">—</span></div>
@@ -6640,12 +6657,17 @@ async function runChecks(){
   var bad=rows.filter(function(r){return !r.ok}).length;
   toast(bad?bad+' 项异常':'全部通过', bad>0);
 }
+/* 把四段拆成"主 0 · 次 0 · 构建 0 · 修订 1"，字段缺失时退回完整字符串 */
+function verParts(d){
+  if(d.fwVerMajor===undefined) return d.fwVersion||'—';
+  return '主 '+d.fwVerMajor+' · 次 '+d.fwVerMinor+' · 构建 '+d.fwVerBuild+' · 修订 '+d.fwVerRevision;
+}
 /* ---------- 系统 ---------- */
 async function loadSys(){
   var d=await api('/api/v1/status');
   if(!d||d.ok===false) return;
-  $('yVer').textContent=d.fwVersion||'—';
-  $('yBuild').textContent=d.fwBuild||'—';
+  $('yVer').textContent=d.fwVersionFull||d.fwVersion||'—';
+  $('yBuild').textContent=verParts(d);
   $('yChan').textContent=d.fwChannel||'—';
 }
 /* ---------- 状态轮询 ---------- */
@@ -6680,13 +6702,14 @@ async function refresh(){
   }
   $('sPart').textContent = '分区 '+(d.appPartition||'?')+' @0x'+(d.appPartitionAddr||0).toString(16).toUpperCase()+
     ' · Flash '+Math.round((d.flashSize||0)/1048576)+' MB';
-  $('dFw').textContent=d.fwVersion||'—';
+  $('dFw').textContent=d.fwVersionFull||d.fwVersion||'—';
   $('dCh').textContent=d.fwChannel||'—';
-  $('dBu').textContent=d.fwBuild||'—';
+  $('dBu').textContent=d.fwVerMajor===undefined?'—':(d.fwVerMajor+'.'+d.fwVerMinor+'.'+d.fwVerBuild+'.'+d.fwVerRevision);
+  $('dDate').textContent=d.fwBuildDate||'—';
   $('dFl').textContent=d.flashSize?Math.round(d.flashSize/1048576)+' MB':'—';
   $('dAp').textContent=d.appPartitionSize?Math.round(d.appPartitionSize/1024)+' KB':'—';
   $('dSp').textContent=d.spiffsPartitionSize?Math.round(d.spiffsPartitionSize/1024)+' KB':'—';
-  if(d.fwVersion) $('fwTag').textContent=d.fwVersion;
+  if(d.fwVersionFull||d.fwVersion) $('fwTag').textContent=d.fwVersionFull||d.fwVersion;
   if(d.autoReset!==undefined) renderAuto(d);
   $('pollHint').textContent = '· '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
 }
@@ -6911,7 +6934,7 @@ setTimeout(function(){ showTab('dash'); loadTraffic(); },300);
 setInterval(loadTraffic,4000);
 refresh();
 setInterval(refresh,3000);
-log('页面已加载 · 固件 __PH_VER__');
+log('页面已加载 · 固件 __PH_VERFULL__');
 </script>
 </body>
 </html>
@@ -7004,11 +7027,15 @@ void handleStatus(bool publicSetup) {
   d["ok"] = true;
   d["bridge"] = "vela-gateway";
   d["version"] = 3;                       // 历史字段，保留兼容旧脚本
-  d["fwVersion"] = kFwVersion;            // "1.0.0-test.1"
-  d["fwVersionFull"] = kFwVersionFull;    // "v0.0.0.0000"
+  d["fwVersion"] = kFwVersion;            // "0.0.0.1"
+  d["fwVersionFull"] = kFwVersionFull;    // "v0.0.0.1"
   d["fwChannel"] = kFwChannel;            // tech-preview / stable
   d["fwHardware"] = kFwHardware;          // esp32-16mb
-  d["fwBuild"] = kFwBuild;                // 0000（四位内部版本号）
+  // 四段拆开给前端：分字段展示 + 版本比较（字典序对多位数会错）
+  d["fwVerMajor"] = kFwVerMajor;
+  d["fwVerMinor"] = kFwVerMinor;
+  d["fwVerBuild"] = kFwVerBuild;
+  d["fwVerRevision"] = kFwVerRevision;
   d["fwBuildDate"] = kFwBuildDate;        // 20261108
   d["fwName"] = String("vela-gateway-") + kFwVersion + "-" + kFwHardware;
   // Flash / 分区信息：用来一眼确认刷进去的到底是不是 16MB 版本。
@@ -7342,8 +7369,8 @@ void setupRoutes() {
     keys.add("ap_pass");
     keys.add("local_token");
     keys.add("base_url/api_key/model/ca_pem");
-    keys.add("项目模式 project/project2");
-    keys.add("p4_*/p5_* 各项目缓存");
+    keys.add("运行模式 project");
+    keys.add("旧版本遗留的 p4_*/p5_* 缓存");
     JsonArray keep = d["willKeep"].to<JsonArray>();
     keep.add("firmware");
     keep.add("分区表");
@@ -7730,7 +7757,7 @@ void setupRoutes() {
     Serial.printf("OTA_UPLOAD_SUCCESS file=%s addr=0x%08X size=%u firmware=%d\n",
                   s_otaFileName.c_str(), s_otaFlashAddr, s_otaTotalWritten, s_otaIsFirmware);
 
-    // 固件升级完成后自动回到项目1（手表网关）。
+    // 固件升级完成后自动回到手表网关模式。
     // 旧逻辑不带这个动作：升级完设备仍停留在 OTA 模式，热点虽在但没有
     // 桥接功能，用户会以为"刷完就坏了"。要留在 OTA 模式可传 keep_ota=1。
     if (s_otaIsFirmware && server.arg("keep_ota") != "1") {
@@ -8111,8 +8138,16 @@ void connectWifi() {
 }
 }
 
+// 调试串口波特率。
+// 默认 921600 而不是 2000000，原因是网页版串口监视器（flasher.welinklab.com
+// 等）的下拉框最高只到 921600，2000000 会让日志全变成乱码。
+// 需要满速时在 platformio.ini 里加 -DVELA_SERIAL_BAUD=2000000 即可。
+#ifndef VELA_SERIAL_BAUD
+#define VELA_SERIAL_BAUD 921600
+#endif
+
 void setup() {
-  Serial.begin(2000000);
+  Serial.begin(VELA_SERIAL_BAUD);
   delay(120);
 
   // 协议常量在这里一次性解码（此时还没起任务，避免多任务首次并发解码）。
@@ -8196,8 +8231,8 @@ void setup() {
 
   // BOOT长按触发的强制配网：在任何项目模式下都优先处理
   // 注意：这里只重置项目号 + 记录请求，不能把 force_setup 标志在这里清掉。
-  // 旧代码在开头 putBool(false)，后面项目1分支再 getBool() 永远是 false，
-  // 结果长按 BOOT 只是切回项目1，并不会真的进入配网模式。
+  // 旧代码在开头 putBool(false)，后面网关分支再 getBool() 永远是 false，
+  // 结果长按 BOOT 只是切回网关，并不会真的进入配网模式。
   const bool forceSetupRequested = prefs.getBool("force_setup", false);
   if (forceSetupRequested) {
     prefs.putBool("force_setup", false);
