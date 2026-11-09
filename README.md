@@ -297,7 +297,7 @@ SUCCESS 00:01:09
 | 热点默认密码 | `12345678` | `setup()` / `/setup` 保存逻辑 |
 | 蓝牙 SPP 本地名 | `Vela-Gateway` | `src/main.cpp` → `kBtLocalName` |
 | mDNS 主机名 | `vela-gateway.local` | `setupMdns()` |
-| 非敏感接口 token 头 | `X-Vela-Token` | `requireLocalToken()` |
+| 非敏感接口 token 头 | `X-Vela-Token`（管理台自动携带，页面下发） | `authorized()` / `requireAuth()` |
 | NVS 命名空间 | `vela`（业务）/ `vela-fac`（恢复出厂标志） | 各处 `prefs.begin()` |
 | 固件版本 | `v0.0.0.1` | `VELA_FW_*` 宏 |
 
@@ -472,7 +472,7 @@ func: esp_vfs_lwip_sockets_register
 **怎么确认设备上跑的是新固件**：串口日志里会打印 app 镜像的 ELF 指纹，
 
 ```
-ELF file SHA256: 46d75bc26ddf59de     ← 本次新固件（AP 名可配 + 恢复出厂拆分）
+ELF file SHA256: d267bfd2dd65aeef     ← 本次新固件（修复 LAN 进不了后台）
 ELF file SHA256: 716ad3ffd8e9232a     ← 修复 tcpip_init 那一版
 ELF file SHA256: 7d1c587dc0562e5b     ← 修复前那一版
 ```
@@ -538,6 +538,11 @@ OTA 模式下刷新固件走 A/B 分区：写入另一个槽，重启后新固�
 
 * 版本号不写死两份：HTML 里放 `__PH_VERFULL__` / `__PH_VER__` / `__PH_HW__` 占位符，
   发送时用 `String::replace` 注入，改版本只改 `main.cpp` 顶部宏 + `version.txt`
+* 本地令牌同样随页面下发（`__PH_TOKEN__` → `sanitizeWebToken(localToken)`），
+  前端 `api()` 自动放进 `X-Vela-Token` 头。这样**用路由器里的 LAN IP 打开后台
+  也能正常使用**——早期版本前端不带令牌，LAN 访问时 `/api/v1/*` 全 401，
+  页面永远显示「设备暂未响应」（在配网热点上却正常，因为 SoftAP 客户端豁免鉴权）。
+  详见 `变更说明.md` 第十八章
 * 所有按钮改成 `data-act` + 事件委托，避免内联 `onclick` 的引号嵌套问题
   （C++ 原始字符串 `R"HTML(...)HTML"` 遇到 `)"` 会提前截断，这是个真实踩过的坑）
 * 状态卡用 `repeat(auto-fit, minmax(min(132px,100%),1fr))`，390px → 2 列、360px → 2 列，

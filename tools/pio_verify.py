@@ -97,6 +97,16 @@ def fix_otadata(source, target, env):
             print("[factory-reset] 恢复出厂状态机回归测试未通过 —— "
                   "检查 setup() 里的 arm 标志处理逻辑")
 
+    # 局域网访问后台的鉴权回归测试（防 LAN 打开后台全 401 回归）
+    lt = Path(env.subst("$PROJECT_DIR")) / "tools" / "test_lan_admin_access.py"
+    if lt.exists():
+        r = subprocess.run(["python3", str(lt)], capture_output=True, text=True)
+        print(r.stdout.rstrip())
+        if r.returncode != 0:
+            print(r.stderr.rstrip())
+            print("[lan-admin] 局域网访问后台的鉴权回归测试未通过 —— "
+                  "检查令牌下发（__PH_TOKEN__）与前端 api() 是否带上 X-Vela-Token")
+
 
 # 挂到最终固件目标上。不同 PlatformIO 版本里目标名不一样
 # （$BUILD_DIR/firmware.bin、$BUILD_DIR/${PROGNAME}.bin 都见过），

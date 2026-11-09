@@ -5429,11 +5429,28 @@ void loadConfig() {
   if (gNtpTz.isEmpty()) gNtpTz = "CST-8";
 }
 
+// 本地令牌要塞进 HTML 的 JS 字符串里，必须过滤掉引号/反斜杠/尖括号，
+// 免得 NVS 里被改坏的令牌把页面脚本撑破。
+String sanitizeWebToken(const String& raw) {
+  String out;
+  out.reserve(raw.length());
+  for (size_t i = 0; i < raw.length(); ++i) {
+    const char c = raw[i];
+    const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '-' || c == '_';
+    out += safe ? c : '_';
+  }
+  if (out.isEmpty()) out = "vela-local";
+  return out;
+}
+
 bool authorized() {
   if (localToken.isEmpty()) return true;
   String h = server.header("Authorization");
   if (h == "Bearer " + localToken) return true;
-  return server.header("X-Vela-Token") == localToken;
+  if (server.header("X-Vela-Token") == localToken) return true;
+  // 页面里下发的是过滤后的令牌，客户端回传的就是过滤后的值。
+  return server.header("X-Vela-Token") == sanitizeWebToken(localToken);
 }
 
 void jsonError(int code, const char* err, const String& message) {
@@ -5504,9 +5521,14 @@ bool isSetupApClient() {
   return server.client().localIP() == WiFi.softAPIP();
 }
 
+// 敏感配置（改 Wi-Fi / 恢复出厂 / 蓝牙扫描）原先只允许从配网 SoftAP 发起，
+// 于是「已经连上家用路由器、用 LAN IP 打开后台」时这些功能一律 403。
+// 现在放行两种来源：配网热点客户端，或带对了本地令牌的请求。
 bool requireSetupAp() {
   if (isSetupApClient()) return true;
-  jsonError(403, "setup_ap_required", "Sensitive setup is only available through the setup SoftAP");
+  if (authorized()) return true;
+  jsonError(403, "setup_ap_required",
+            "setup is available from the setup SoftAP, or with a valid X-Vela-Token header");
   return false;
 }
 
@@ -6482,6 +6504,9 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 
 <script>
 var $=function(id){return document.getElementById(id)};
+// 本地令牌：随页面一起下发，api() 自动放进 X-Vela-Token 头。
+// 没有它，局域网访问（用路由器里的 LAN IP 打开后台）时所有 /api/v1/* 都会 401。
+var VELA_TOKEN='__PH_TOKEN__';
 var toastT=0;
 function toast(msg,err){
   var t=$('toast'); t.textContent=msg; t.className='toast on'+(err?' err':'');
@@ -6495,7 +6520,13 @@ function log(msg){
 }
 async function api(path,opt){
   try{
-    var r=await fetch(path,opt||{});
+    opt=opt||{};
+    // 局域网管理接口要求带本地令牌（X-Vela-Token）。令牌随页面一起下发，
+    // 前端自动带上；否则连上家用路由器后用 LAN IP 打开后台会全部 401。
+    var h={'X-Vela-Token':VELA_TOKEN};
+    if(opt.headers){ for(var k in opt.headers){ h[k]=opt.headers[k]; } }
+    var o={}; for(var kk in opt){ o[kk]=opt[kk]; } o.headers=h;
+    var r=await fetch(path,o);
     var txt=await r.text();
     try{ var j=JSON.parse(txt); if(j && j.ok===false && j.error) log('ERR '+(j.error)+(j.message?' · '+j.message:'')); return j; }
     catch(e){ return {ok:r.ok,raw:txt}; }
@@ -7157,6 +7188,11 @@ static void sendMainWebUi() {
   page.replace("__PH_HW__", kFwHardware);
   page.replace("__PH_AP__", gApSsid);
   page.replace("__PH_PASS__", apPassword);
+  // 本地令牌随页面下发：管理台 JS 会自动把它放进 X-Vela-Token 头。
+  // 不这样做的后果：「用路由器里查到的 LAN IP 打开后台」时 /api/v1/* 全部 401，
+  // 页面永远显示"设备暂未响应"（在配网热点上访问时因为 isSetupApClient() 而豁免）。
+  // 页面里本来就已经带着热点密码 __PH_PASS__，因此这里不引入新的暴露面。
+  page.replace("__PH_TOKEN__", sanitizeWebToken(localToken));
   server.send(200, "text/html; charset=utf-8", page);
 }
 
