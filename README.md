@@ -11,7 +11,7 @@
 |----|----|
 | 固件版本 | `v0.0.0.1` |
 | 发布通道 | `tech-preview`（早期技术预览，协议可能随时变） |
-| 占用 | RAM 22.5%（73,696 / 327,680 B）· Flash 24.9%（1,569,657 / 6,291,456 B） |
+| 占用 | RAM 22.5%（73,696 / 327,680 B）· Flash 25.0%（1,569,785 / 6,291,456 B） |
 | 管理台 | `http://192.168.4.1`（AP 模式）或设备 IP（STA 模式） |
 
 > **本仓库已带编译好的固件**，不用装 PlatformIO 也能刷，**乐鑫官方 Flash Download Tool 也能直接用**：
@@ -276,7 +276,7 @@ pio run -e legacy_4mb
 
 ```
 RAM:   [==        ]  22.5% (used 73696 bytes from 327680 bytes)
-Flash: [==        ]  24.9% (used 1569657 bytes from 6291456 bytes)
+Flash: [==        ]  25.0% (used 1569785 bytes from 6291456 bytes)
 SUCCESS 00:01:09
 ```
 
@@ -392,6 +392,31 @@ cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app
 * `app_partition_size=6291456` → 6MB 的 OTA 槽生效
 
 如果只看到 `flash=4194304`，说明刷进去的还是 4MB 的 bootloader/分区表。
+
+### 恢复出厂之后一直重启，进不去配网？
+
+**2026-11-09 已修复**（见 `变更说明.md` 第十三章）。旧版本有个致命缺陷：
+恢复出厂的 arm 标志存在独立 NVS 命名空间里，重启后仍然有效，
+而 `setup()` 看到标志就再执行一次恢复出厂——于是"清空 → 重启 → 再清空
+→ 再重启"变成无限循环，设备永远起不了配网热点，只能用 USB 重刷才能救。
+
+判断方法（看串口）：
+
+```
+FACTORY_RESET_BEGIN reason=boot_pending_flag     ← 这个 reason 反复出现 = 无限环
+FACTORY_RESET_DONE rebooting_into_setup_mode
+```
+
+修复后只会出现一次 `reason=boot_pending_flag`，紧接着就打印
+`SETUP_MODE_REASON factory_reset_completed` 和 `SETUP_MODE_ACTIVE`。
+
+回归测试：
+
+```bash
+python3 tools/test_factory_reset.py
+```
+
+这个测试已经挂进构建钩子，每次 `pio run` 都会自动跑。
 
 ---
 

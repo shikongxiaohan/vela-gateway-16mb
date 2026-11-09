@@ -5125,6 +5125,8 @@ constexpr uint32_t kFactoryArmMagic = 0x46414354u;        // "FACT"
 constexpr char kFactoryArmNs[] = "vela-fac";           // 独立 NVS 命名空间
 
 static bool gFactoryBootChecked = false;
+// 开机时发现 arm 标志 → 已完成补清空 → 强制进配网模式（不依赖 NVS 恰好被清空）。
+static bool gForceSetupAfterReset = false;
 static uint32_t gAutoResetCandidateSince = 0;   // 0 = 未进入候选
 static const char* gAutoResetReason = "";
 static bool gAutoResetPaused = false;
@@ -5196,8 +5198,11 @@ static void factoryResetApply(const char* reason) {
 
   factoryClearNvs();
 
-  // 清完再写一次 arm 标志（factoryClearNvs 里 nvs_flash_deinit 会刷缓存，
-  // 顺序上放后面更保险），重启后由 loadConfig 之后的逻辑进入配网。
+  // 清完再写一次 arm 标志。arm 标志在独立命名空间 "vela-fac"，
+  // factoryClearNvs() 只清 "vela"，所以第一次写的标志本来就在；
+  // 这里补写一次是为了兜住 Preferences 缓存刷写时机，防止第一次写没落盘。
+  // 重启后由 setup() 里的 factoryResetCompleteOnBoot() 补清空 + 解绑，
+  // 那条路径不会再重启（否则会变成无限复位环）。
   {
     Preferences arm;
     if (arm.begin(kFactoryArmNs, false)) {
@@ -5226,6 +5231,27 @@ static void factoryResetDisarm() {
   arm.remove("magic");
   arm.remove("reason");
   arm.end();
+}
+
+// 开机时发现 arm 标志 → 说明上一次恢复出厂流程在"清 NVS"这一步被断电/复位打断，
+// 或者刚刚由 factoryResetApply() 重启过来。在这里把"清空"这一步补做完（幂等），
+// 然后**不重启**，让启动流程继续往下走：
+//   loadConfig() 会读到空的 ssid / watch_mac
+//   → needSetup 判定为真 → enterSetupMode()
+//   → enterSetupMode() 里的 factoryResetDisarm() 消费掉 arm 标志
+//
+// 旧实现在这里调用 factoryResetApply("boot_pending_flag")，而那个函数末尾会
+// ESP.restart()，并且重启前又把 arm 标志写回一次。于是"看到标志 → 再清一遍 → 重启"
+// 变成无限循环：设备永远进不了配网模式，只能用 USB 重新刷机才能救回来。
+// 三个入口（BOOT 长按 10 秒 / 网页恢复出厂 / 自动恢复出厂）全部中招。
+static void factoryResetCompleteOnBoot() {
+  Serial.println("FACTORY_RESET_PENDING completing_clear_on_boot");
+  factoryClearNvs();
+  // 清空成功之后再解绑标志：万一在清空过程中掉电，标志还在，
+  // 下次开机还能再清一遍（幂等）。
+  factoryResetDisarm();
+  // 清完不重启，直接走下面的 needSetup → enterSetupMode()。
+  gForceSetupAfterReset = true;
 }
 
 // 开机时决定是否需要开始"自动恢复出厂"倒数。
@@ -8014,8 +8040,9 @@ void enterSetupMode() {
     server.begin();
     gServerStarted = true;
   }
-  // 恢复出厂后重启进入配网：这里是 arm 标志唯一被消费的地方，
-  // 走到这一步说明配置已经清干净、AP 已经起来了，可以解除 arm。
+  // 兜底解绑：正常路径上 arm 标志已在 factoryResetCompleteOnBoot() 里清掉，
+  // 这里再查一次是为了覆盖"进入配网模式时标志仍然存在"的情况，
+  // 保证标志不会跨到下一次开机变成无限清空循环。
   if (factoryResetPending()) {
     Serial.println("FACTORY_RESET_ARM_CONSUMED setup_mode_reached");
     factoryResetDisarm();
@@ -8157,14 +8184,17 @@ void setup() {
   (void)watchRequiredBuildTag();
 
   // ====== 恢复出厂前置处理（必须在 loadConfig 之前）======
-  // 模块级实现见文件后部 "恢复出厂设置" 一节；这里先声明是因为
-  // setup() 出现在那些函数定义之前。
-  //   - 按钮触发（BOOT 长按 → 写标志重启）后第一次开机：清空并进入配网
+  // 模块级实现见本文件前面的 "恢复出厂设置" 一节。
+  //   - 按钮触发（BOOT 长按 → 写标志重启）后第一次开机：清空并直接进配网
   //   - 自动触发：写入带健康门槛的倒数窗口（见 autoFactoryResetTick）
+  //
+  // 注意这里用的是 factoryResetCompleteOnBoot() 而不是 factoryResetApply()：
+  // 后者末尾会 ESP.restart()，而 arm 标志在重启后仍然有效，于是
+  // "看到标志 → 再清一遍 → 再重启" 会变成无限复位环，设备永远进不了配网模式。
   if (!gFactoryBootChecked) {
     gFactoryBootChecked = true;
     if (factoryResetPending()) {
-      factoryResetApply("boot_pending_flag");
+      factoryResetCompleteOnBoot();
     } else {
       initAutoFactoryResetWindow();
     }
@@ -8336,9 +8366,13 @@ void setup() {
   }
 
   // 首次配网：完全没有 Wi-Fi 配置（或缺少手表 key）时，直接进入 SoftAP 配网模式。
-  const bool needSetup = ssid.isEmpty() || watchMac.length() != 17 || watchAuthKey.length() != 32;
+  // gForceSetupAfterReset：刚补完恢复出厂清空，强制进配网，不看 NVS 残留。
+  const bool needSetup = gForceSetupAfterReset || ssid.isEmpty() ||
+                         watchMac.length() != 17 || watchAuthKey.length() != 32;
   if (needSetup) {
-    Serial.println("SETUP_MODE_REASON first_boot_no_config");
+    Serial.println(gForceSetupAfterReset
+                       ? "SETUP_MODE_REASON factory_reset_completed"
+                       : "SETUP_MODE_REASON first_boot_no_config");
     enterSetupMode();
     return;  // 配网模式下不启动桥接，等用户在网页上保存配置后重启。
   }

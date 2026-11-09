@@ -66,6 +66,16 @@ def fix_otadata(source, target, env):
         if r.returncode != 0:
             print(r.stderr.rstrip())
 
+    # 恢复出厂状态机回归测试（防无限复位环回归）
+    st = Path(env.subst("$PROJECT_DIR")) / "tools" / "test_factory_reset.py"
+    if st.exists():
+        r = subprocess.run(["python3", str(st)], capture_output=True, text=True)
+        print(r.stdout.rstrip())
+        if r.returncode != 0:
+            print(r.stderr.rstrip())
+            print("[factory-reset] 恢复出厂状态机回归测试未通过 —— "
+                  "检查 setup() 里的 arm 标志处理逻辑")
+
 
 # 挂到最终固件目标上。不同 PlatformIO 版本里目标名不一样
 # （$BUILD_DIR/firmware.bin、$BUILD_DIR/${PROGNAME}.bin 都见过），
