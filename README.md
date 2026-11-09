@@ -393,6 +393,21 @@ cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app
 
 如果只看到 `flash=4194304`，说明刷进去的还是 4MB 的 bootloader/分区表。
 
+### 刷完还是每 2.26 秒复位？（2026-11-09 实测）
+
+**先读回验证，别猜**：
+
+```bash
+python3 tools/readback_check.py --port COM3          # Windows
+python3 tools/readback_check.py --port /dev/ttyUSB0   # Linux/macOS
+```
+
+它把设备里的 bootloader / 分区表 / otadata / app 四个关键扇区读回来对照，
+只读不写，30 秒出结果。四项全绿说明 flash 内容没问题，那就要往别的方向查
+（波特率、接线、设备本身）；报出具体哪一项不对，就按提示处理。
+
+诊断细节见 `变更说明.md` 第十四章。
+
 ### 恢复出厂之后一直重启，进不去配网？
 
 **2026-11-09 已修复**（见 `变更说明.md` 第十三章）。旧版本有个致命缺陷：
