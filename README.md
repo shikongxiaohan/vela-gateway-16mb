@@ -72,7 +72,7 @@
 | 位置 | 作用 |
 |------|------|
 | `src/main.cpp` 顶部宏（`VELA_FW_VERSION_MAJOR` / `_MINOR` / `_BUILD` / `_REVISION`） | 网页徽章、状态接口、串口横幅 |
-| 项目根 `version.txt`（内容 `v0.0.0.1`） | ESP-IDF 编译期把它写进镜像里的 **app 描述符**，镜像头里的版本才行被 esptool / OTA 工具读到 |
+| 项目根 `version.txt`（内容 `v0.0.0.1`） | ESP-IDF 编译期把它写进镜像里的 **app 描述符**，镜像头里的版本才能被 esptool / OTA 工具读到 |
 
 `version.txt` 是 IDF 的标准机制：根目录有它就自动读取其中的字符串作为
 `PROJECT_VER`。改完这两处后必须 **clean 后全量重编译**，app 描述符才会更新
