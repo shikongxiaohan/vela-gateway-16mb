@@ -40,6 +40,7 @@
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 #include <esp_timer.h>
+#include <esp_netif.h>
 #include <time.h>
 #include <sys/time.h>
 #include <Update.h>
@@ -8240,7 +8241,15 @@ void setup() {
   // The tcpip thread is needed for tcpip_callback() used by the network bridge
   // (setupWatchNetworkProxy), which is called during Bluetooth auth, before
   // WiFi is connected. Without this, tcpip_callback asserts "Invalid mbox".
-  tcpip_init(NULL, NULL);
+  //
+  // ⚠️ 这里必须用 esp_netif_init()，绝对不要直接调 tcpip_init()。
+  // IDF 的 esp_netif_init() 内部已经会调一次 tcpip_init()，而 lwip_init()
+  // 没有任何幂等保护 → 第二次会再跑一遍 sys_init() → 第二次调用
+  // esp_vfs_lwip_sockets_register()。socket 的 fd 区间（FD_SETSIZE-8 .. FD_SETSIZE-1）
+  // 在 esp_vfs 里是「永久占用」的，第二次注册必然撞车返回 ESP_ERR_INVALID_ARG (0x102)，
+  // 撞上 vfs_lwip.c 里的 ESP_ERROR_CHECK → abort() → 无限重启。
+  // esp_netif_init() 自带 tcpip_initialized 保护，重复调用是安全的。
+  esp_netif_init();
 #ifndef VELA_DISABLE_LWIP_OVERRIDE
   vela_lwip_napt_override_marker();
 #endif

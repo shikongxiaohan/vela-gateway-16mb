@@ -27,6 +27,27 @@ def _otadata_all_ff(path: Path) -> bool:
     return len(data) == 0 or all(b == 0xFF for b in data)
 
 
+def check_no_tcpip_init(target, source, env):
+    """构建前的静态门禁：源码里不得直接调用 tcpip_init()。
+
+    直接调 tcpip_init() 会和 IDF esp_netif_init() 内部那次重复，
+    导致 socket fd 区间二次注册 → ESP_ERR_INVALID_ARG → abort() 无限重启。
+    详见 变更说明.md 第十五章。
+    """
+    script = Path(env.subst("$PROJECT_DIR")) / "tools" / "check_no_tcpip_init.py"
+    if not script.exists():
+        return
+    r = subprocess.run(["python3", str(script)], capture_output=True, text=True)
+    out = (r.stdout or "").rstrip()
+    if out:
+        print(out)
+    if r.returncode != 0:
+        raise SystemExit(
+            "[tcpip-init] 构建中止：检测到直接调用 tcpip_init()，"
+            "刷机后会在进配网模式里 abort 无限重启。改用 esp_netif_init()。"
+        )
+
+
 def fix_otadata(source, target, env):
     build_dir = Path(env.subst("$BUILD_DIR"))
     ota = build_dir / "ota_data_initial.bin"
@@ -83,6 +104,10 @@ def fix_otadata(source, target, env):
 for tgt in ("$BUILD_DIR/${PROGNAME}.bin", "$BUILD_DIR/firmware.bin"):
     try:
         env.AddPostAction(tgt, fix_otadata)  # noqa: F821
+    except Exception:
+        pass
+    try:
+        env.AddPreAction(tgt, check_no_tcpip_init)  # noqa: F821
     except Exception:
         pass
 

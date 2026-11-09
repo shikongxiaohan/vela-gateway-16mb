@@ -433,6 +433,33 @@ python3 tools/test_factory_reset.py
 
 这个测试已经挂进构建钩子，每次 `pio run` 都会自动跑。
 
+### 进配网热点时每 2.6 秒重启一次？（2026-11-09 实测）
+
+**2026-11-09 已修复**（见 `变更说明.md` 第十五章）。旧版本有个致命缺陷：
+`setup()` 里手写了一次 `tcpip_init()`，而 IDF 的 `esp_netif_init()` 内部还会再调一次，
+`lwip_init()` 没有幂等保护 → socket 的 fd 区间被注册两次 → 第二次撞车
+`ESP_ERR_INVALID_ARG (0x102)` → `ESP_ERROR_CHECK` → `abort()` → 无限重启。
+
+判断方法（看串口）：
+
+```
+SETUP_MODE_REASON first_boot_no_config
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG)
+file: "IDF/components/lwip/port/esp32/vfs_lwip.c" line 108
+func: esp_vfs_lwip_sockets_register
+```
+
+修复后 `setup()` 里改用 `esp_netif_init()`（自带幂等保护）。
+
+**怎么确认设备上跑的是新固件**：串口日志里会打印 app 镜像的 ELF 指纹，
+
+```
+ELF file SHA256: 716ad3ffd8e9232a     ← 新固件
+ELF file SHA256: 7d1c587dc0562e5b     ← 修复前那一版
+```
+
+对照不上就是刷了旧镜像。
+
 ---
 
 ## 5. 后续升级（手机就能刷）
