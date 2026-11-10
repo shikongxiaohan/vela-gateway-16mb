@@ -1,8 +1,0 @@
-# OTA partition table for ESP32 4MB flash
-# Supports A/B OTA with automatic rollback
-# Each OTA partition is ~2MB (enough for 1.7MB firmware)
-nvs,      data, nvs,     0x9000,  0x4000,
-otadata,  data, ota,     0xd000,  0x2000,
-phy_init, data, phy,     0xf000,  0x1000,
-ota_0,    app,  ota_0,   0x10000, 0x1F0000,
-ota_1,    app,  ota_1,   0x200000,0x1F0000,
