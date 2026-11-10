@@ -4,3 +4,5 @@ a14280051c19bc24052382cfe1593ce4  vela-gateway-v0.0.0.2-esp32-16mb-factory.bin
 b086746abd0163030ef4af5fc500ec6f  vela-gateway-v0.0.0.2-esp32-16mb-ota.bin
 9615f78708ff8e86a00def5dacb562f0  vela-gateway-v0.0.0.3-esp32-16mb-factory.bin
 e64c4243da2e5741b7af4548a8c65062  vela-gateway-v0.0.0.3-esp32-16mb-ota.bin
+0482d9f24f3953aec264aa4ff2773395  vela-gateway-v0.0.0.4-esp32-16mb-factory.bin
+39158e7a48d9619d136724eb05372716  vela-gateway-v0.0.0.4-esp32-16mb-ota.bin

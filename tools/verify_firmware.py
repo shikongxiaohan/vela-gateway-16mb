@@ -107,7 +107,13 @@ def main():
 
     # 整包
     print("\n[整包镜像]")
-    factory = next(root.glob("*factory.bin"), None)
+    # 目录里可能同时留着旧版本产物（归档后没删），按 mtime 取最新的那一份，
+    # 否则一旦有旧版本残留在前，校验会去比对错的镜像。
+    def _newest(pattern):
+        hits = [p for p in root.glob(pattern) if p.is_file()]
+        return max(hits, key=lambda p: p.stat().st_mtime) if hits else None
+
+    factory = _newest("*factory.bin")
     if factory:
         b = factory.read_bytes()
         good(f"{factory.name}  {len(b):>10,} B")
@@ -129,7 +135,7 @@ def main():
 
     # app 镜像
     print("\n[OTA / app 镜像]")
-    ota_img = next(root.glob("*ota.bin"), None)
+    ota_img = _newest("*ota.bin")
     desc_ver = None
     if ota_img:
         b = ota_img.read_bytes()

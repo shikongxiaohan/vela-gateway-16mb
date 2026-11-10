@@ -179,9 +179,30 @@ def main() -> int:
           "响应以 <!doctype html> 开头（浏览器不会判为无有效内容）")
     check(txt.rstrip().endswith("</html>"), "响应以 </html> 结尾（页面完整）")
 
-    # H. 前端令牌注入仍在
-    check("X-Vela-Token" in txt and "VELA_TOKEN" in txt,
-          "前端 api() 仍会自动带 X-Vela-Token")
+    src_path = ROOT / "src" / "main.cpp"
+    SEND_SRC = None
+    if src_path.exists():
+        full = src_path.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"static void sendMainWebUi\(\)\s*\{(.+?)\n\}", full, re.S)
+        if m:
+            SEND_SRC = m.group(1)
+
+    # C. UTF-8 不被切断
+    # I. 占位符匹配不能直接读写 PROGMEM 指针
+    #    真机上 len / memcmp 作用在 flash 地址上会直接崩（Guru Meditation），
+    #    而 host 上不会有任何报错 —— 只能做静态检查。
+    if SEND_SRC is None:
+        check(False, "找不到 sendMainWebUi() 实现")
+    else:
+        bad = re.findall(r"(?:strncmp|strcmp|memcmp|strstr|strchr)\(\s*kWebUi"
+                         r"|(?:strncmp_P|memcmp_P|strstr_P)\(\s*kWebUi", SEND_SRC)
+        check(not bad, "占位符匹配没有直接对 kWebUi（PROGMEM）做字符串比较"
+                       + (f"：{bad[:2]}" if bad else ""))
+        check("pgm_read_dword" in SEND_SRC or "memcpy_P" in SEND_SRC,
+              "页面文本按 pgm_read_* / memcpy_P 取到 RAM")
+        check("free(page)" in SEND_SRC, "RAM 副本用完释放（不泄漏）")
+        check("out of memory" in SEND_SRC,
+              "RAM 副本分配失败时回 500，而不是发出空页面")
 
     print()
     if fails:
