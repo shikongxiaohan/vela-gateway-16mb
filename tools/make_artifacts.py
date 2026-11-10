@@ -68,6 +68,24 @@ def main() -> int:
         t = vu.read_version()
 
     base = vu.artifact_basename(t, HARDWARE)
+    archive_dir = root / "firmware-history"
+
+    # 0) 同版本号已经归档过 → 直接复用归档那份，不重新生成。
+    #    原因：同一份源码编译两次，字节会因为编译时间戳不同而不一样。
+    #    如果版本号没变（源码没改），却重新编译并覆盖 firmware/，
+    #    就会出现「firmware/ 里的 v0.0.0.3 和 Release / 归档里的 v0.0.0.3
+    #    不是同一份字节」的情况，刷机时无法用 md5 核对，非常坑。
+    #    所以：版本号已存在就认归档那份为准。
+    archived = (archive_dir / f"{base}-factory.bin", archive_dir / f"{base}-ota.bin")
+    if all(p.exists() for p in archived):
+        for src in archived:
+            dst = fw_dir / src.name
+            if not dst.exists() or dst.read_bytes() != src.read_bytes():
+                shutil.copyfile(src, dst)
+                print(f"✓ {src.name}  （复用归档版本，字节与已发布产物一致）")
+            else:
+                print(f"✓ {src.name}  （已是最新）")
+        return 0
 
     # 1) app 镜像 → ota
     app = build_dir / "firmware.bin"
@@ -113,7 +131,6 @@ def main() -> int:
     #    早期实现是"删掉旧版本产物"，结果回滚时发现历史固件没了 ——
     #    固件是二进制、不可重建（同样的源码在不同工具链/依赖下出的字节不同），
     #    所以必须每个版本都留着，宁可多占几 MB。
-    archive_dir = root / "firmware-history"
     archive_dir.mkdir(exist_ok=True)
     for src, dst in ((factory_out, archive_dir / factory_out.name),
                      (ota_out, archive_dir / ota_out.name)):

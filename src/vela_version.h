@@ -14,4 +14,4 @@
 // 修订号的字符串形式（最多 4 位，前导 0 不补），用于版本展示和产物文件名
 #define VELA_FW_REVISION_STR      "3"
 // 实际构建日期 YYYYMMDD
-#define VELA_FW_BUILD_DATE        "20261110"
+#define VELA_FW_BUILD_DATE        "20261111"
