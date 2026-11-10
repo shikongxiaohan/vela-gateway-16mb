@@ -25,3 +25,4 @@ void generatePacket(const AppleDevice& device, uint8_t* buffer, size_t& outLengt
       memcpy(buffer + 14, suffix, 9);
   }
 }
+

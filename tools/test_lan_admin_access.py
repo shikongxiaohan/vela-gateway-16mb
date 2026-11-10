@@ -45,10 +45,23 @@ def check_static(src):
     problems = []
 
     # 页面里必须有令牌占位符，并且 sendMainWebUi() 会替换它。
+    # 注意：sendMainWebUi() 已改成流式发送，替换不再是 page.replace(...)，
+    # 而是查一张 Subst 表（token → 替换值）。所以这里按"语义"检查：
+    #   1) 表里有 "__PH_TOKEN__" 这一项
+    #   2) 它的值来自 sanitizeWebToken(localToken)
     if "__PH_TOKEN__" not in src:
         problems.append("页面缺少 __PH_TOKEN__ 占位符：令牌无法下发到前端")
-    if 'page.replace("__PH_TOKEN__"' not in src:
-        problems.append("sendMainWebUi() 没有替换 __PH_TOKEN__：下发的是空令牌")
+    else:
+        import re as _re
+        m = _re.search(r'\{?\s*"__PH_TOKEN__"\s*,\s*([^}]+)\}', src)
+        if not m:
+            problems.append("sendMainWebUi() 的替换表里没有 __PH_TOKEN__ 项：下发的是空令牌")
+        else:
+            value_expr = m.group(1)
+            if "sanitizeWebToken" not in value_expr or "localToken" not in value_expr:
+                problems.append(
+                    "sendMainWebUi() 里 __PH_TOKEN__ 的替换值不是 sanitizeWebToken(localToken)"
+                    f"（实际是 {value_expr.strip()}）：前端会拿到不可用的令牌")
 
     # 前端 api() 必须自动注入令牌头。
     if "X-Vela-Token" not in src:

@@ -158,33 +158,41 @@ constexpr char kApSsid[] = "Vela-Setup";
 // 0.0.0.1 含义是直白的——主/次/构建都还是 0，这是第 1 个修订。
 // 前三段为 0 只说明"协议未冻结"，不代表不能发布。
 //
+// 修订号**最多 4 位，前导 0 省略**：v0.0.0.1 → v0.0.0.9 → v0.0.0.10
+// …… 最大 v0.0.0.9999，再往上进位到构建号。它是整数，不是定长字段，
+// 所以 1 写成 "1" 而不是 "0001"。
+//
+// 这个修订号是**自动递进**的：
+//   真源是根目录 version.txt，版本号在构建时由 tools/bump_version.py 递增，
+//   再由 tools/version_util.py 生成下面这个头文件。
+//   所以这里不再手写数字——手写的话下次构建就被覆盖了。
+//
 // 文件名   ：<项目>-v<主>.<次>.<构建>.<修订>-<硬件>-<类型>.bin
-#define VELA_FW_VERSION_MAJOR     0
-#define VELA_FW_VERSION_MINOR     0
-#define VELA_FW_VERSION_BUILD     0
-#define VELA_FW_VERSION_REVISION  1
-#define VELA_FW_BUILD_DATE        "20261108"    // 实际构建日期 YYYYMMDD
+//         例：vela-gateway-v0.0.0.2-esp32-16mb-factory.bin
+#include "vela_version.h"
 
 #define VELA_STR2(x) #x
 #define VELA_STR(x)  VELA_STR2(x)
-// 完整标识："v0.0.0.1"
+// 完整标识："v0.0.0.2"
+// 第四段用生成好的字符串，这样修订号能安全地跟三位数字拼在一起
+// （也便于以后需要时再补零，不用动这里的拼接逻辑）
 #define VELA_FW_VERSION_FULL \
   "v" VELA_STR(VELA_FW_VERSION_MAJOR) "." \
       VELA_STR(VELA_FW_VERSION_MINOR) "." \
       VELA_STR(VELA_FW_VERSION_BUILD) "." \
-      VELA_STR(VELA_FW_VERSION_REVISION)
-// 不带 v 的数字部分："0.0.0.1"，给 status 接口和文件名用
+      VELA_FW_REVISION_STR
+// 不带 v 的数字部分："0.0.0.2"，给 status 接口和文件名用
 #define VELA_FW_VERSION \
   VELA_STR(VELA_FW_VERSION_MAJOR) "." \
   VELA_STR(VELA_FW_VERSION_MINOR) "." \
   VELA_STR(VELA_FW_VERSION_BUILD) "." \
-  VELA_STR(VELA_FW_VERSION_REVISION)
+  VELA_FW_REVISION_STR
 // 硬件与目标板标签，和文件名保持一致
 #define VELA_FW_HARDWARE "esp32-16mb"
 #define VELA_FW_CHANNEL  "tech-preview"
 
-constexpr char kFwVersion[] = VELA_FW_VERSION;          // "0.0.0.1"
-constexpr char kFwVersionFull[] = VELA_FW_VERSION_FULL; // "v0.0.0.1"
+constexpr char kFwVersion[] = VELA_FW_VERSION;          // "0.0.0.2"
+constexpr char kFwVersionFull[] = VELA_FW_VERSION_FULL; // "v0.0.0.2"
 constexpr char kFwChannel[] = VELA_FW_CHANNEL;
 constexpr char kFwHardware[] = VELA_FW_HARDWARE;
 // 四段分别单独暴露，供状态接口/网页分字段展示
@@ -7113,8 +7121,8 @@ void handleStatus(bool publicSetup) {
   d["ok"] = true;
   d["bridge"] = "vela-gateway";
   d["version"] = 3;                       // 历史字段，保留兼容旧脚本
-  d["fwVersion"] = kFwVersion;            // "0.0.0.1"
-  d["fwVersionFull"] = kFwVersionFull;    // "v0.0.0.1"
+  d["fwVersion"] = kFwVersion;            // "0.0.0.2"
+  d["fwVersionFull"] = kFwVersionFull;    // "v0.0.0.2"
   d["fwChannel"] = kFwChannel;            // tech-preview / stable
   d["fwHardware"] = kFwHardware;          // esp32-16mb
   // 四段拆开给前端：分字段展示 + 版本比较（字典序对多位数会错）
@@ -7179,21 +7187,115 @@ void handleStatus(bool publicSetup) {
 
 // 新版管理台：HTML 里保留 __PH_xxx__ 占位符，发送时按当前运行状态替换，
 // 这样版本号 / 热点名 / 热点密码不用在固件里写死两份。
-//   - 一次 String::replace 只多占约 10 KB 堆（页面 ~16 KB），
-//     只在打开网页时发生，对转发路径没有影响。
+//
+// ⚠️ 这个页面有 49 KB。早期实现是 `String page(kWebUi)` 整串替换后再 send()：
+//    - 堆上要同时存在 49KB 原文 + 49KB 替换副本，替换过程还要反复 realloc，
+//      ESP32 只有 ~100KB 可用堆，压到极限时 String 分配失败会退化成空串，
+//      于是发出去的只是一个没有响应体的 200 ——
+//      手机浏览器（尤其 Android Chrome）就显示「该站点没有有效内容」。
+//    - 就算分配成功，一次性 WiFiClient.write(49KB) 在手机慢速接收下也可能
+//      写超时、只发出一部分，客户端拿到的是截断的 HTML。
+//
+// 现在改成**流式发送**：先把占位符替换结果算成一小组小片段，
+// 逐块 sendContent 出去（每块 ≤ 1KB），既不在堆上留整页副本，
+// 也不会一次性压 49KB 给 TCP。堆占用从 ~100KB 降到几 KB。
 static void sendMainWebUi() {
-  String page(kWebUi);
-  page.replace("__PH_VERFULL__", kFwVersionFull);
-  page.replace("__PH_VER__", kFwVersion);
-  page.replace("__PH_HW__", kFwHardware);
-  page.replace("__PH_AP__", gApSsid);
-  page.replace("__PH_PASS__", apPassword);
-  // 本地令牌随页面下发：管理台 JS 会自动把它放进 X-Vela-Token 头。
-  // 不这样做的后果：「用路由器里查到的 LAN IP 打开后台」时 /api/v1/* 全部 401，
-  // 页面永远显示"设备暂未响应"（在配网热点上访问时因为 isSetupApClient() 而豁免）。
-  // 页面里本来就已经带着热点密码 __PH_PASS__，因此这里不引入新的暴露面。
-  page.replace("__PH_TOKEN__", sanitizeWebToken(localToken));
-  server.send(200, "text/html; charset=utf-8", page);
+  const size_t total = strlen_P(kWebUi);
+  if (total == 0) {
+    server.send(500, "text/plain; charset=utf-8", "web ui missing");
+    return;
+  }
+
+  // 占位符替换表。顺序即扫描顺序，越长的放越前面（__PH_VERFULL__ 不能被
+  // __PH_VER__ 抢先匹配到前 10 个字符）。
+  struct Subst { const char* token; String value; };
+  Subst subs[] = {
+    {"__PH_VERFULL__", String(kFwVersionFull)},
+    {"__PH_VER__",     String(kFwVersion)},
+    {"__PH_HW__",      String(kFwHardware)},
+    {"__PH_AP__",      gApSsid},
+    {"__PH_PASS__",    apPassword},
+    // 本地令牌随页面下发：管理台 JS 会自动把它放进 X-Vela-Token 头。
+    // 不这样做的后果：「用路由器里查到的 LAN IP 打开后台」时 /api/v1/* 全部 401，
+    // 页面永远显示"设备暂未响应"（在配网热点上访问时因为 isSetupApClient() 而豁免）。
+    // 页面里本来就已经带着热点密码 __PH_PASS__，因此这里不引入新的暴露面。
+    {"__PH_TOKEN__",   sanitizeWebToken(localToken)},
+  };
+  const size_t kSubCount = sizeof(subs) / sizeof(subs[0]);
+
+  // 先算出替换后的总长度，好发准确的 Content-Length。
+  // 这一步只做计数，不分配整页缓冲。
+  size_t outLen = 0;
+  {
+    const char* p = kWebUi;
+    const size_t n = total;
+    size_t i = 0;
+    while (i < n) {
+      bool hit = false;
+      for (size_t k = 0; k < kSubCount; ++k) {
+        const size_t tlen = strlen(subs[k].token);
+        if (i + tlen <= n && memcmp_P(p + i, subs[k].token, tlen) == 0) {
+          outLen += subs[k].value.length();
+          i += tlen;
+          hit = true;
+          break;
+        }
+      }
+      if (!hit) { ++i; ++outLen; }
+    }
+  }
+
+  server.setContentLength(outLen);
+  server.send(200, "text/html; charset=utf-8", "");
+
+  // 逐块发送：把连续的普通字符攒到一块再写，遇到占位符就先把攒的块刷出去。
+  // 切块时**不能切开 UTF-8 多字节字符**（中文 3 字节）：虽然 HTTP 是字节流、
+  // 浏览器理论上能自行重组，但中间过一层不带 Content-Length 的代理、
+  // 或者某些手机浏览器的容错逻辑会把它当成非法字节，于是显示乱码/空白。
+  // 做法：切块前看当前字节是不是 UTF-8 的续字节（10xxxxxx），
+  // 是就往前退到字符起始位置。
+  static const size_t kChunkCap = 1024;
+  char buf[kChunkCap + 4];
+  size_t used = 0;
+  auto flush = [&]() {
+    if (used > 0) {
+      server.sendContent(buf, used);
+      used = 0;
+    }
+  };
+
+  size_t i = 0;
+  while (i < total) {
+    bool hit = false;
+    for (size_t k = 0; k < kSubCount; ++k) {
+      const size_t tlen = strlen(subs[k].token);
+      if (i + tlen <= total && memcmp_P(kWebUi + i, subs[k].token, tlen) == 0) {
+        flush();     // 占位符值单独发，可能会超过缓冲
+        const String& v = subs[k].value;
+        if (v.length() > 0) server.sendContent(v.c_str(), v.length());
+        i += tlen;
+        hit = true;
+        break;
+      }
+    }
+    if (hit) continue;
+    if (used >= kChunkCap) {
+      // 回退到字符边界：UTF-8 续字节形如 10xxxxxx
+      size_t cut = used;
+      while (cut > 0 && (static_cast<uint8_t>(buf[cut]) & 0xC0) == 0x80) --cut;
+      if (cut > 0 && cut < used) {
+        server.sendContent(buf, cut);
+        const size_t rest = used - cut;
+        memmove(buf, buf + cut, rest);
+        used = rest;
+      } else {
+        flush();
+      }
+    }
+    buf[used++] = static_cast<char>(pgm_read_byte(kWebUi + i));
+    ++i;
+  }
+  flush();
 }
 
 void setupRoutes() {
@@ -7760,6 +7862,14 @@ void setupRoutes() {
     }
     d["capacity"] = kLogRingLines;
     sendJson(200, d);
+  });
+
+  // 手机浏览器打开任何页面都会顺手请求 /favicon.ico。
+  // 之前它落到 onNotFound：非配网模式下回一段 JSON 404，
+  // 有些手机浏览器会把这个 404 当成"站点内容异常"的判据之一，
+  // 干脆回一个 204 让它彻底闭嘴（不产生"缺图标"提示，也不进 404 日志）。
+  server.on("/favicon.ico", HTTP_GET, [](){
+    server.send(204, "image/x-icon", "");
   });
 
   // 配网模式下作为 captive portal：把手机连上热点后自动弹出的探测请求

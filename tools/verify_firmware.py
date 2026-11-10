@@ -12,6 +12,9 @@ import struct
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import version_util as vu  # noqa: E402
+
 APP_DESC_MAGIC = 0xABCD5432
 PART_MAGIC = 0x50AA
 
@@ -127,15 +130,17 @@ def main():
     # app 镜像
     print("\n[OTA / app 镜像]")
     ota_img = next(root.glob("*ota.bin"), None)
+    desc_ver = None
     if ota_img:
         b = ota_img.read_bytes()
         good(f"{ota_img.name}  {len(b):>10,} B")
         if b[0] != 0xE9:
-            fail(f"首字节 {b[0]:#04x}，不是 0xE9")
+            fail("首字节 {:#04x}，不是 0xE9".format(b[0]))
         if len(b) >= 0x24:
             magic = struct.unpack_from("<I", b, 0x20)[0]
             if magic == APP_DESC_MAGIC:
                 ver = b[0x30:0x50].split(b"\x00")[0].decode(errors="replace")
+                desc_ver = ver
                 good(f"  app 描述符 magic={magic:#010x} 版本={ver or '<空>'}")
                 if not ver:
                     fail("app 描述符里版本为空（检查 version.txt 并 clean 重编译）")
@@ -143,6 +148,31 @@ def main():
                 fail(f"  app 描述符 magic={magic:#010x}，期望 {APP_DESC_MAGIC:#010x}")
     else:
         fail("找不到 *ota.bin")
+
+    # 版本号一致性：version.txt / 产物文件名 / app 描述符 三者必须一致
+    print("\n[版本号一致性]")
+    try:
+        expect = vu.format_version(vu.read_version())
+        good(f"version.txt = {expect}")
+    except Exception as e:
+        fail(f"读 version.txt 失败：{e}")
+        expect = None
+
+    if expect:
+        base = vu.artifact_basename()
+        for f in (factory, ota_img):
+            if f is None:
+                continue
+            if f.name.startswith(base):
+                good(f"  {f.name} 文件名版本号一致")
+            else:
+                fail(f"  {f.name} 文件名版本号与 {expect} 不符（应为 {base}-*.bin）")
+        if desc_ver:
+            if desc_ver == expect:
+                good(f"  app 描述符版本 {desc_ver} 与 version.txt 一致")
+            else:
+                fail(f"  app 描述符版本 {desc_ver} 与 version.txt 的 {expect} 不一致"
+                     "（改了 version.txt 后需要重新 cmake 配置：pio run -t clean 或删 .pio/build）")
 
     print()
     if ok:

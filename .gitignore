@@ -5,3 +5,6 @@
 __pycache__/
 sdkconfig
 sdkconfig.old
+
+# 构建状态文件（版本自动递进用来判断源码是否变化）
+.pio/.vela_version_state.json

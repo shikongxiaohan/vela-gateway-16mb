@@ -14,6 +14,7 @@
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 Import("env")  # noqa: F821  (PlatformIO 注入)
@@ -78,6 +79,17 @@ def fix_otadata(source, target, env):
         if src.exists():
             shutil.copyfile(src, fw_dir / name)
 
+    # 生成带版本号的产物（factory 整包 + ota app），文件名跟版本号走。
+    # 必须放在镜像校验**之前**：校验要读的就是刚生成的这批文件，
+    # 顺序反了会拿上一版的产物来比，版本号必然对不上。
+    ma = Path(env.subst("$PROJECT_DIR")) / "tools" / "make_artifacts.py"
+    if ma.exists():
+        r = subprocess.run(["python3", str(ma)], capture_output=True, text=True)
+        print(r.stdout.rstrip())
+        if r.returncode != 0:
+            print(r.stderr.rstrip())
+            print("[artifacts] 生成 factory/ota 产物失败")
+
     # 完整校验
     script = Path(env.subst("$PROJECT_DIR")) / "tools" / "verify_firmware.py"
     if script.exists():
@@ -106,6 +118,34 @@ def fix_otadata(source, target, env):
             print(r.stderr.rstrip())
             print("[lan-admin] 局域网访问后台的鉴权回归测试未通过 —— "
                   "检查令牌下发（__PH_TOKEN__）与前端 api() 是否带上 X-Vela-Token")
+
+    # 版本号自动递进机制的回归测试（防 4 位零填充/跳号/进位回归）
+    vt = Path(env.subst("$PROJECT_DIR")) / "tools" / "test_version_bump.py"
+    if vt.exists():
+        r = subprocess.run(["python3", str(vt)], capture_output=True, text=True)
+        print(r.stdout.rstrip())
+        if r.returncode != 0:
+            print(r.stderr.rstrip())
+            print("[version-bump] 版本号递进回归测试未通过 —— "
+                  "检查 tools/version_util.py 的零填充与进位逻辑")
+
+    # 管理台页面发送逻辑的回归测试（防 49KB 整页发送导致"站点没有有效内容"）
+    wt = Path(env.subst("$PROJECT_DIR")) / "tools" / "test_webui_send.py"
+    if wt.exists():
+        r = subprocess.run(["python3", str(wt)], capture_output=True, text=True)
+        print(r.stdout.rstrip())
+        if r.returncode != 0:
+            print(r.stderr.rstrip())
+            print("[webui] 管理台页面发送回归测试未通过 —— "
+                  "检查 sendMainWebUi() 的流式发送与 UTF-8 切块边界")
+
+    # 标记这次版本已出包（下次源码不变就不会再递进版本号）
+    sys.path.insert(0, str(Path(env.subst("$PROJECT_DIR")) / "tools"))
+    try:
+        import version_util as vu
+        vu.mark_built(Path(env.subst("$PROJECT_DIR")))
+    except Exception as e:
+        print(f"[version] 警告：标记构建状态失败（{e}）")
 
 
 # 挂到最终固件目标上。不同 PlatformIO 版本里目标名不一样
