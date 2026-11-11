@@ -4,7 +4,7 @@
 
 面向 **16MB Flash** 的 ESP32（ESP32-WROVER-E N16R8 / YD-ESP32-B）。管理台是手机能直接用的网页，连上就能配置 Wi-Fi、刷固件、看状态。
 
-**当前版本 `v0.0.0.13`** · 技术预览 · Flash 25.4%（1,599,856 / 6,291,456 B）
+**当前版本 `v0.0.0.14`** · 技术预览 · RAM 22.6%（74,088 / 327,680 B）· Flash 25.5%（1,605,145 / 6,291,456 B）
 
 ---
 
@@ -14,8 +14,8 @@
 
 | 场景 | 文件 | 地址 |
 |---|---|---|
-| **首次 / 救砖** | [`firmware/vela-gateway-v0.0.0.13-esp32-16mb-factory.bin`](firmware/) | `0x0` |
-| 网页 OTA 升级 | [`firmware/vela-gateway-v0.0.0.13-esp32-16mb-ota.bin`](firmware/) | `0x20000` |
+| **首次 / 救砖** | [`firmware/vela-gateway-v0.0.0.14-esp32-16mb-factory.bin`](firmware/) | `0x0` |
+| 网页 OTA 升级 | [`firmware/vela-gateway-v0.0.0.14-esp32-16mb-ota.bin`](firmware/) | `0x20000` |
 
 factory 是整包（bootloader + 分区表 + otadata + app），**只刷这一个、地址填 `0x0`**，分区表不用管。
 
@@ -29,6 +29,12 @@ factory 是整包（bootloader + 分区表 + otadata + app），**只刷这一�
 4. 连上后改用路由器分配的 IP 打开同一个管理台（路由器后台能查到）
 
 热点名和密码都能在管理台里改。
+
+### 升级固件
+
+系统页「固件升级」：选 `-ota.bin` 传进设备，列表里点一行选中，再点「升级到选中版本」。设备会自己校验镜像、写进备用分区、重启切过去；新固件起不来会自动退回旧版。
+
+整包 `-factory.bin` 网页刷不了（第一个字节是空白 Flash，不是 app 镜像），必须用数据线。
 
 ### 装表盘 / 快应用
 

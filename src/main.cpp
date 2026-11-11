@@ -6342,23 +6342,32 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 
 <section class="panel" id="p-sys">
 <div class="card">
-  <h2>固件与升级</h2>
+  <h2>版本</h2>
   <div class="mini"><b>当前版本</b><span id="yVer">—</span></div>
   <div class="mini"><b>版本构成</b><span id="yBuild">—</span></div>
   <div class="mini"><b>发布通道</b><span id="yChan">—</span></div>
+</div>
+
+<!-- 固件升级只在这一个地方：先把固件传进设备，再从列表里点升级。
+     旧版这里有两个「重启设备」和两个进 OTA 的按钮，点固件升级只是跳去 OTA 页，
+     用户看不到设备里到底有没有固件，就觉得点了没反应。 -->
+<div class="card">
+  <h2>固件升级</h2>
+  <p class="sub">先把 <code>-ota.bin</code> 传到设备，再点「升级」。整包 <code>-factory.bin</code> 网页刷不了，要用数据线。</p>
+  <input type="file" id="fwFile" accept=".bin">
+  <div id="fwBar" class="muted" style="margin-top:10px">未选择文件</div>
+  <div class="list" id="fwList" style="margin-top:10px"><div class="muted">加载中…</div></div>
   <div class="row" style="margin-top:10px">
-    <button class="ghost" data-act="switchProj" data-arg="6">进入空中升级</button>
-    <button class="ghost" data-act="reboot">重启设备</button>
+    <button class="ghost" data-act="fwRefresh">刷新</button>
+    <button data-act="fwInstall" id="fwInstallBtn" disabled>升级到选中版本</button>
   </div>
+  <p class="hint" style="margin-top:10px">升级会重启设备，约 15 秒后回来；配置和手表密钥不受影响。传错了的固件点「删除」就行。</p>
 </div>
 
 <div class="card">
   <h2>设备动作</h2>
-  <div class="row">
-    <button class="ghost" data-act="reboot">重启设备</button>
-    <button class="ghost" data-act="goto-upgrade">固件升级</button>
-  </div>
-  <p class="hint" style="margin-top:10px">升级会重启设备，约 15 秒后热点重新出现；配置和手表密钥不受影响。</p>
+  <button class="ghost" style="width:100%" data-act="reboot">重启设备</button>
+  <p class="hint" style="margin-top:10px">重启只断电重启，不改任何配置；要换固件请用上面的升级。</p>
 </div>
 </section>
 
@@ -6821,6 +6830,7 @@ async function loadSys(){
   $('yVer').textContent=d.fwVersionFull||d.fwVersion||'—';
   $('yBuild').textContent=verParts(d);
   $('yChan').textContent=d.fwChannel||'—';
+  loadFw();
 }
 /* ---------- 状态轮询 ---------- */
 var lastRx=0,lastTx=0;
@@ -7113,12 +7123,105 @@ function pollInst(){
 
 document.addEventListener('change',function(ev){
   if(ev.target && (ev.target.id==='wfFile'||ev.target.id==='appFile')) uploadRes(ev.target);
+  if(ev.target && ev.target.id==='fwFile') uploadFw(ev.target);
 });
+
+/* ---------- 固件库 ---------------------------------------------------------
+   为什么要先传再升级：原来是「点了固件升级 → 跳到 OTA 页 → 还得再选一次文件」，
+   中间那一步看着就像没反应。现在上传和安装拆成两件事，设备里有什么一目了然。 */
+var fwSel=null;
+var FW_MAGIC=0xABCD5432;
+
+function fwEsc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+
+function fwSize(n){ n=n||0; return n>=1024*1024 ? (n/1048576).toFixed(2)+' MB' : Math.round(n/1024)+' KB'; }
+
+function uploadFw(input){
+  var f=input.files&&input.files[0];
+  if(!f) return;
+  var bar=$('fwBar');
+  var fd=new FormData(); fd.append('file',f,f.name);
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/v1/firmware/upload');
+  xhr.setRequestHeader('X-Vela-Token',VELA_TOKEN);
+  bar.textContent='上传中 0%';
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable) bar.textContent='上传中 '+Math.round(e.loaded/e.total*100)+'%';
+  };
+  xhr.onload=function(){
+    var j={}; try{ j=JSON.parse(xhr.responseText); }catch(e){}
+    if(j.ok){ bar.textContent='已存进设备：'+fwEsc(j.name||f.name); input.value=''; loadFw(); }
+    else { bar.textContent='没存进去：'+fwEsc(j.error||('HTTP '+xhr.status))+(j.hint?(' — '+fwEsc(j.hint)):''); input.value=''; }
+  };
+  xhr.onerror=function(){ bar.textContent='上传中断（连接断了），重新选一次文件'; input.value=''; };
+  xhr.send(fd);
+}
+
+async function loadFw(){
+  var d=await api('/api/v1/firmware/list');
+  if(!d||d.ok===false){ $('fwList').innerHTML='<div class="muted">读取失败</div>'; return; }
+  var cur=d.current||'';
+  var items=d.items||[];
+  var keep=false;
+  items.forEach(function(it){ if(it.name===fwSel) keep=true; });
+  if(!keep) fwSel=null;
+  if(!items.length){
+    $('fwList').innerHTML='<div class="muted">设备里还没有固件，先选上面那个文件</div>';
+    $('fwInstallBtn').disabled=true;
+    return;
+  }
+  $('fwList').innerHTML=items.map(function(it){
+    var isCur = it.name===cur;
+    var on = it.name===fwSel;
+    return '<div class="item" style="cursor:pointer'+(on?';box-shadow:inset 0 0 0 1px var(--accent)':'')+'" data-fwpick="'+fwEsc(it.name)+'">'+
+      '<div style="min-width:0"><div style="overflow:hidden;text-overflow:ellipsis">'+(on?'● ':'○ ')+fwEsc(it.name)+'</div>'+
+      '<small>'+fwSize(it.bytes)+(isCur?' · 正在运行':'')+'</small></div>'+
+      '<div style="display:flex;gap:6px;flex:0 0 auto">'+
+      '<button class="ghost" style="padding:8px 10px;font-size:12.5px" data-act="fwDelete" data-arg="'+fwEsc(it.name)+'">删除</button>'+
+      '</div></div>';
+  }).join('');
+  $('fwInstallBtn').disabled = !fwSel;
+}
+
+document.addEventListener('click',function(ev){
+  var it=ev.target.closest('[data-fwpick]');
+  if(!it || ev.target.closest('[data-act]')) return;
+  fwSel=it.dataset.fwpick;
+  $('fwBar').textContent='已选中 '+fwSel+'，点下面的按钮开始升级';
+  loadFw();
+});
+
+async function fwDelete(name){
+  if(!confirm('删除设备里的 '+name+' ？')) return;
+  var d=await api('/api/v1/firmware/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})});
+  if(!d||d.ok===false) toast('删不掉：'+((d&&(d.error||d.message))||''),true);
+  if(fwSel===name) fwSel=null;
+  loadFw();
+}
+
+async function installFw(){
+  if(!fwSel){ toast('先点一行选中固件',true); return; }
+  if(!confirm('把设备刷成 '+fwSel+' ？\n\n设备会重启，约 15 秒后回来。\n刷完如果新固件起不来，会自动退回现在这个版本。')) return;
+  var bar=$('fwBar');
+  bar.textContent='正在写入并校验…';
+  var d=await api('/api/v1/firmware/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:fwSel})});
+  if(!d||d.ok===false){
+    bar.textContent='升级失败：'+((d&&(d.error||d.message))||'');
+    return;
+  }
+  bar.textContent='已开始写入，设备马上重启';
+  document.body.innerHTML='<div style="text-align:center;padding:60px 20px">'+
+    '<h2>正在升级</h2><p>约 15 秒后设备重启完成。<br>记得把手机重新连回原来的 Wi-Fi 再看后台。</p></div>';
+}
 
 // 统一事件委托：所有按钮用 data-act，避免内联 onclick 的引号地狱
 document.addEventListener('click',function(ev){
   var b=ev.target.closest('[data-act]');
   if(!b) return;
+  // disabled 的按钮浏览器不会派发 click，但这里再挡一层，
+  // 免得以后有人把它改成 <a> 或 div 就漏了
+  if(b.disabled) return;
   var act=b.dataset.act;
   if(act==='refresh') refresh();
   else if(act==='scanWifi') scanWifi();
@@ -7143,6 +7246,9 @@ document.addEventListener('click',function(ev){
   }
   else if(act==='runChecks') runChecks();
   else if(act==='resRefresh') loadRes();
+  else if(act==='fwRefresh') loadFw();
+  else if(act==='fwInstall') installFw();
+  else if(act==='fwDelete') fwDelete(b.dataset.arg);
   else if(act==='resInstall') installRes(b.dataset.arg);
   else if(act==='resDelete') delRes(b.dataset.arg);
   else if(act==='resCancel') cancelRes();
@@ -8394,6 +8500,110 @@ bool parseRpkManifest(const char* path, char* outPkg, size_t pkgCap,
 
 }  // namespace wfi
 
+// ===========================================================================
+// 固件库：把 -ota.bin 先存进 SPIFFS，再从网页上点"升级"写进 OTA 分区。
+//
+// 为什么要有这一层：
+//   旧流程是「系统页点固件升级 → 跳到 OTA 页 → 在 OTA 页再选一次文件」。
+//   中间那次跳转在用户看来就是"点了没反应"，而且设备里到底有没有固件、
+//   有没有正在下载，完全看不见。拆成"先传后升"之后：
+//     · 传的东西留在设备里，刷新页面还在，选哪一行装哪一行；
+//     · 写入前先用 Update 校验镜像头，不合格当场报错，不用等重启才发现；
+//     · 写入和 ESP.restart 放在请求返回之后做，浏览器不会因为连接被掐而报网络错误。
+// 固件体积 1.6 MB 左右，SPIFFS 有 3.875 MB，够放一份；放两份就可能挤掉表盘。
+// ===========================================================================
+namespace fwlib {
+
+constexpr const char* kDir = "/fw";
+constexpr const char* kName = "/fw/new.bin";
+// 单份固件上限：再大就超出 OTA 分区（6 MB）也没意义，同时挡住乱传的大文件
+constexpr size_t kMaxFirmware = 6U * 1024U * 1024U;
+// 给日志/表盘预留的空间
+constexpr size_t kReserve = 128U * 1024U;
+
+struct Pending {
+  bool armed = false;
+  uint32_t atMs = 0;
+};
+
+static Pending gPending;
+static File gUpload;
+static bool gUploadFailed = true;
+
+bool pendingWrite() { return gPending.armed; }
+
+// 由 loop() 调用：延时到点才真正提交 + 重启，让 HTTP 响应先发出去
+void servicePending() {
+  if (!gPending.armed) return;
+  if (static_cast<int32_t>(millis() - gPending.atMs) < 0) return;
+  gPending.armed = false;
+
+  File f = SPIFFS.open(kName, FILE_READ);
+  if (!f) {
+    Serial.println("FW_LIB_INSTALL_FAILED open_missing");
+    return;
+  }
+  const size_t size = f.size();
+  Serial.printf("FW_LIB_INSTALL_BEGIN size=%u\n", static_cast<unsigned>(size));
+
+  if (!Update.begin(size)) {
+    Serial.printf("FW_LIB_INSTALL_FAILED begin=%s\n", Update.errorString());
+    f.close();
+    return;
+  }
+  const size_t written = Update.writeStream(f);
+  f.close();
+  if (written != size) {
+    Serial.printf("FW_LIB_INSTALL_FAILED write=%u/%u err=%s\n",
+                  static_cast<unsigned>(written), static_cast<unsigned>(size),
+                  Update.errorString());
+    Update.abort();
+    return;
+  }
+  if (!Update.end(true)) {
+    Serial.printf("FW_LIB_INSTALL_FAILED end=%s\n", Update.errorString());
+    return;
+  }
+  Serial.println("FW_LIB_INSTALL_OK written_to_ota_partition");
+  // 升级完自动回到手表网关模式，别把用户留在只有一个网页的模式里
+  prefs.putInt("project", 1);
+  prefs.putBool("project2", false);
+  delay(300);
+  ESP.restart();
+}
+
+// 只在 /fw 目录里找文件，不接受外部拼路径
+bool resolve(const String& rawName, String& path) {
+  if (rawName.isEmpty() || rawName.length() > 40) return false;
+  if (rawName.indexOf('/') >= 0 || rawName.indexOf('\\') >= 0) return false;
+  if (rawName.indexOf("..") >= 0) return false;
+  path = String(kDir) + "/" + rawName;
+  return SPIFFS.exists(path);
+}
+
+void listItems(JsonArray& items, const String& current) {
+  File dir = SPIFFS.open(kDir);
+  if (!dir || !dir.isDirectory()) return;
+  File f = dir.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      const String full = f.name();
+      const char* base = full.c_str();
+      const char* slash = strrchr(base, '/');
+      if (slash) base = slash + 1;
+      JsonObject o = items.add<JsonObject>();
+      o["name"] = base;
+      o["bytes"] = static_cast<uint32_t>(f.size());
+      o["running"] = (current == base);
+    }
+    f.close();
+    f = dir.openNextFile();
+  }
+  dir.close();
+}
+
+}  // namespace fwlib
+
 void setupRoutes() {
   const char* keys[] = {"Authorization", "X-Vela-Token"};
   server.collectHeaders(keys, 2);
@@ -8679,6 +8889,149 @@ void setupRoutes() {
       d["autoResetRemainMs"] = elapsed < kAutoSetupFallbackMs
                                    ? (kAutoSetupFallbackMs - elapsed) : 0;
     }
+    sendJson(200, d);
+  });
+
+  // ==================== 固件库 ====================
+  // 上传 → 列表 → 选中安装 → 删除。安装只是「标记 + 延时」，真正写 OTA 分区
+  // 在 loop() 里做（fwlib::servicePending），这样 HTTP 响应能先回给浏览器。
+  server.on("/api/v1/firmware/upload", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    JsonDocument d;
+    if (fwlib::gUploadFailed) {
+      d["ok"] = false;
+      d["error"] = "upload_failed";
+      d["hint"] = "只接受 .bin；网页升级要用 -ota 那个，整包 -factory 只能数据线刷；空间不够也会失败";
+      sendJson(200, d);
+      return;
+    }
+    File done = SPIFFS.open(fwlib::kName, FILE_READ);
+    uint32_t size = done ? static_cast<uint32_t>(done.size()) : 0;
+    uint8_t magic = 0;
+    if (done) {
+      done.seek(0);
+      magic = static_cast<uint8_t>(done.read());
+      done.close();
+    }
+    if (magic != 0xE9) {
+      // app 镜像必须以 0xE9 开头（ESP 镜像魔数）。整包 -factory.bin 的第一个
+      // 字节是 0xFF，直接拦下来，别等写入时才发现。
+      SPIFFS.remove(fwlib::kName);
+      d["ok"] = false;
+      d["error"] = "not_app_image";
+      d["hint"] = "这不是 app 镜像。网页升级要用文件名带 -ota 的那个；整包 -factory 请用数据线刷。";
+      sendJson(200, d);
+      return;
+    }
+    d["ok"] = true;
+    d["name"] = "new.bin";
+    d["bytes"] = size;
+    sendJson(200, d);
+  }, [](){
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      fwlib::gUploadFailed = true;
+      if (!SPIFFS.exists(fwlib::kDir)) SPIFFS.mkdir(fwlib::kDir);
+      const size_t freeBytes = SPIFFS.totalBytes() - SPIFFS.usedBytes();
+      if (upload.totalSize > 0 &&
+          (upload.totalSize + fwlib::kReserve > freeBytes ||
+           upload.totalSize > fwlib::kMaxFirmware)) {
+        Serial.printf("FW_LIB_UPLOAD_REJECT no_space need=%u free=%u\n",
+                      static_cast<unsigned>(upload.totalSize),
+                      static_cast<unsigned>(freeBytes));
+        return;
+      }
+      SPIFFS.remove(fwlib::kName);
+      fwlib::gUpload = SPIFFS.open(fwlib::kName, FILE_WRITE);
+      if (!fwlib::gUpload) {
+        Serial.println("FW_LIB_UPLOAD_REJECT open_failed");
+        return;
+      }
+      Serial.printf("FW_LIB_UPLOAD_START name=%s size=%u\n",
+                    upload.filename.c_str(), static_cast<unsigned>(upload.totalSize));
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (!fwlib::gUpload) return;
+      if (fwlib::gUpload.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Serial.println("FW_LIB_UPLOAD_WRITE_FAILED");
+        return;
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (fwlib::gUpload) {
+        fwlib::gUpload.flush();
+        fwlib::gUpload.close();
+      }
+      fwlib::gUploadFailed = false;
+      Serial.println("FW_LIB_UPLOAD_DONE");
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+      if (fwlib::gUpload) fwlib::gUpload.close();
+      SPIFFS.remove(fwlib::kName);
+      Serial.println("FW_LIB_UPLOAD_ABORTED");
+    }
+  });
+
+  server.on("/api/v1/firmware/list", HTTP_GET, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    JsonDocument d;
+    d["ok"] = true;
+    d["current"] = kFwVersionFull;
+    JsonObject usage = d["usage"].to<JsonObject>();
+    usage["total"] = static_cast<uint32_t>(SPIFFS.totalBytes());
+    usage["used"] = static_cast<uint32_t>(SPIFFS.usedBytes());
+    JsonArray items = d["items"].to<JsonArray>();
+    fwlib::listItems(items, "new.bin");
+    sendJson(200, d);
+  });
+
+  server.on("/api/v1/firmware/install", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    const String b = body();
+    JsonDocument in;
+    if (!b.isEmpty()) deserializeJson(in, b);
+    const String name = in["name"] | "new.bin";
+    String path;
+    if (!fwlib::resolve(name, path)) {
+      jsonError(404, "not_found", "设备里没有这个文件");
+      return;
+    }
+    File f = SPIFFS.open(path, FILE_READ);
+    if (!f) {
+      jsonError(500, "open_failed", "文件打不开");
+      return;
+    }
+    // Update.begin() 只校验镜像头、不写 Flash，可以在这里先试一遍：
+    // 传错了当场报错，不用等重启后才发现进了回滚。
+    if (!Update.begin(f.size())) {
+      const String err = Update.errorString();
+      f.close();
+      jsonError(400, "bad_image", err);
+      return;
+    }
+    Update.abort();
+    f.close();
+    fwlib::gPending.armed = true;
+    fwlib::gPending.atMs = millis() + 800;
+    Serial.printf("FW_LIB_INSTALL_ARMED name=%s\n", name.c_str());
+    JsonDocument d;
+    d["ok"] = true;
+    d["installing"] = name;
+    d["msg"] = "校验通过，正在写入，设备马上重启";
+    sendJson(200, d);
+  });
+
+  server.on("/api/v1/firmware/delete", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    const String b = body();
+    JsonDocument in;
+    if (!b.isEmpty()) deserializeJson(in, b);
+    String path;
+    if (!fwlib::resolve(String(in["name"] | ""), path)) {
+      jsonError(404, "not_found", "设备里没有这个文件");
+      return;
+    }
+    SPIFFS.remove(path);
+    Serial.printf("FW_LIB_DELETE %s\n", path.c_str());
+    JsonDocument d;
+    d["ok"] = true;
     sendJson(200, d);
   });
 
@@ -10277,6 +10630,10 @@ void loop() {
     delay(2);
     return;
   }
+
+  // 固件库的"延时安装"：网页那边已经回了 200，这里再把文件写进 OTA 分区并重启。
+  // 不能放在 HTTP 回调里做 —— 1.6 MB 写 Flash 要好几秒，浏览器早超时了。
+  fwlib::servicePending();
 
   handleWatchProbeSerial();
 
