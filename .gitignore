@@ -5,3 +5,4 @@
 __pycache__/
 sdkconfig
 sdkconfig.old
+firmware-history/

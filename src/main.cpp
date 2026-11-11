@@ -38,6 +38,9 @@
 #include <esp_system.h>
 #include <esp_spi_flash.h>
 #include <esp_partition.h>
+#include <esp_rom_crc.h>
+#include <mbedtls/md5.h>
+#include <esp32/rom/miniz.h>
 #include <esp_ota_ops.h>
 #include <esp_timer.h>
 #include <esp_netif.h>
@@ -949,6 +952,18 @@ struct SppV2Frame {
 // Keep a single decoded 4 KiB frame workspace instead of one per helper.
 static SppV2Frame gSharedSppFrame;
 
+// 表盘 / 快应用安装（wfi 命名空间的实现见文件后半段）。
+// 这里先声明接口：SPP 读循环和网络回包路径都在它前面定义。
+namespace wfi {
+bool networkPaused();
+void notePausedDrop();
+void pump(uint8_t& sequence, const uint8_t encKey[16]);
+void onAck(uint8_t sequence);
+void onProto(uint32_t type, uint32_t id, const uint8_t* pb, size_t len);
+bool busy();
+}  // namespace wfi
+
+
 // Large protocol workspaces live on the heap to keep static DRAM usage
 // within the ESP32 default .bss/.data region (the firmware previously
 // overflowed dram0_0_seg by ~24 KB). Allocated in setup().
@@ -1702,6 +1717,12 @@ bool writeSppV2Frame(uint8_t type, uint8_t sequence, const uint8_t* payload, siz
 static constexpr bool kNetTrace = VELA_NET_TRACE != 0;
 
 err_t watchNetworkOutput(struct netif*, struct pbuf* packet, const ip4_addr_t*) {
+  // 安装表盘/快应用时 Mass 通道独占 SPP，回程包先丢掉；
+  // 手表侧 TCP 会重传，几十秒的窗口可以接受。
+  if (wfi::networkPaused()) {
+    wfi::notePausedDrop();
+    return ERR_BUF;
+  }
   if (!gWatchNetworkTxQueue || !gWatchNetworkTxEnqueueScratch || !packet ||
       packet->tot_len == 0 || packet->tot_len > kWatchNetworkPacketMax) {
     ++gWatchNetworkDroppedPackets;
@@ -4457,12 +4478,17 @@ void authenticateWatchSpp(String target, String secretText) {
       }
 
       // Never let a 250 ms read timeout destroy the Round-4 deadlines.
+      // 表盘/快应用安装：每轮最多发一片，靠设备 ACK 驱动下一片。
+      // 放在读帧之前，读超时也能继续推进（否则空闲时进度会卡住）。
+      wfi::pump(outgoingSequence, encKey);
+
       const uint32_t sppReadTimeoutMs = r4GateActive ? 2u : 250u;
       if (!readSppV2Frame(frame, sppReadTimeoutMs)) {
         delay(2);
         continue;
       }
       emitWatchRawTrace(frame);
+      if (frame.type == 1) wfi::onAck(frame.sequence);
       const size_t encryptedLength = frame.payloadLength;
       const uint8_t rawChannel = frame.payloadLength >= 1 ? (frame.payload[0] & 0x0f) : 0xff;
       const uint8_t rawOpcode = frame.payloadLength >= 2 ? frame.payload[1] : 0xff;
@@ -4530,6 +4556,7 @@ void authenticateWatchSpp(String target, String secretText) {
       if (decrypted) {
         protoVarintField(pb, pbLength, 1, pbType);
         protoVarintField(pb, pbLength, 2, pbId);
+        if (wfi::busy()) wfi::onProto(pbType, pbId, pb, pbLength);
 
         if (pbType == 20 && pbId == 0 && !r4Seen20) {
           r4Seen20 = true;
@@ -6194,6 +6221,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <button data-act="tab" data-arg="perf"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5M4 19h16"/><path d="M8 15l4-5 3 3 4-6"/></svg>性能</button>
   <button data-act="tab" data-arg="net"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 8a16 16 0 0 1 20 0M5.5 11.5a11 11 0 0 1 13 0M9 15a6 6 0 0 1 6 0"/><circle cx="12" cy="19" r="1.4"/></svg>网络</button>
   <button data-act="tab" data-arg="bt"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18l5-4-10-8 10-4-5-4"/></svg>手表</button>
+  <button data-act="tab" data-arg="res"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 19h16"/></svg>资源</button>
   <button data-act="tab" data-arg="dev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 9h6v6H9z"/></svg>设备</button>
   <button data-act="tab" data-arg="tools"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a4 4 0 0 0 5 5l-9.4 9.4a2.8 2.8 0 0 1-4-4z"/><path d="M14.7 6.3 17 4"/></svg>工具</button>
   <button data-act="tab" data-arg="sys"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>系统</button>
@@ -6331,6 +6359,37 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
     <button class="ghost" data-act="goto-upgrade">固件升级</button>
   </div>
   <p class="hint" style="margin-top:10px">升级会重启设备，约 15 秒后热点重新出现；配置和手表密钥不受影响。</p>
+</div>
+</section>
+
+<section class="panel" id="p-res">
+<div class="card">
+  <h2>上传表盘 / 快应用</h2>
+  <p class="sub">表盘支持 <code>.bin</code> / <code>.face</code>，快应用支持 <code>.rpk</code>。文件先存进设备（3.8 MB 空间），再通过蓝牙推到手表。</p>
+  <label>表盘文件</label>
+  <input type="file" id="wfFile" accept=".bin,.face">
+  <label>快应用包</label>
+  <input type="file" id="appFile" accept=".rpk">
+  <div id="upBar" class="muted" style="margin-top:10px"></div>
+</div>
+<div class="card">
+  <h2>已上传 <span class="muted" id="resUsage" style="font-weight:400"></span></h2>
+  <div class="list" id="resList"><div class="muted">加载中…</div></div>
+</div>
+<div class="card">
+  <h2>安装进度</h2>
+  <div class="grid kv-grid">
+    <div class="kv"><b>状态</b><span id="instState">—</span></div>
+    <div class="kv"><b>分片</b><span id="instProg">—</span></div>
+  </div>
+  <div style="height:8px;background:#0d141d;border-radius:99px;margin-top:10px;overflow:hidden">
+    <div id="instBar" style="height:100%;width:0;background:var(--accent);transition:width .2s"></div>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button class="ghost" data-act="resRefresh">刷新列表</button>
+    <button class="danger" data-act="resCancel">取消安装</button>
+  </div>
+  <p class="sub" style="margin-top:10px">安装期间回程网络包会被丢弃（Mass 通道独占蓝牙），手表上的 TCP 会自动重传。</p>
 </div>
 </section>
 
@@ -6545,7 +6604,7 @@ function setDot(el,state,txt){
 }
 
 /* ---------- 分页导航 ---------- */
-var PANELS=['dash','perf','net','bt','dev','tools','sys'];
+var PANELS=['dash','perf','net','bt','res','dev','tools','sys'];
 var activeTab='dash';
 function showTab(name){
   if(PANELS.indexOf(name)<0) name='dash';
@@ -6562,6 +6621,7 @@ function showTab(name){
   else if(name==='dev') loadPerf();   // 设备信息/链路质量由 loadPerf 一并填充
   else if(name==='net') loadNet();
   else if(name==='bt') loadWatch();
+  else if(name==='res') loadRes();
   else if(name==='tools'){ loadPrefs(); }
   else if(name==='sys') loadSys();
 }
@@ -6958,6 +7018,103 @@ async function doReset(){
   }
 }
 
+// ===== 资源（表盘 / 快应用）=====
+var resTimer=null;
+function resEsc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+function renderInst(i){
+  var map={idle:'空闲',wf_prepare:'准备表盘',mass_prepare:'准备传输',sending:'传输中',
+           wait_result:'等待安装结果',done:'完成',failed:'失败'};
+  var st=map[i.state]||i.state||'—';
+  if(i.message && i.message!=='sending') st+=' · '+i.message;
+  $('instState').textContent=st;
+  var pct=Math.round((i.progress||0)*100);
+  $('instProg').textContent = i.totalParts ? (i.ackedParts+' / '+i.totalParts+' 片 · '+pct+'%') : '—';
+  $('instBar').style.width=pct+'%';
+  if(i.busy) pollInst();
+}
+
+async function loadRes(){
+  var d=await api('/api/v1/resource/list');
+  if(!d||d.ok===false){ $('resList').innerHTML='<div class="muted">读取失败</div>'; return; }
+  var u=d.usage||{};
+  $('resUsage').textContent=Math.round((u.used||0)/1024)+' KB / '+Math.round((u.total||0)/1024)+' KB';
+  var items=d.items||[];
+  if(!items.length){
+    $('resList').innerHTML='<div class="muted">还没有上传任何文件</div>';
+  }else{
+    $('resList').innerHTML=items.map(function(it){
+      var kb=Math.round((it.bytes||0)/1024)+' KB';
+      var kind=(it.kind==='watchface')?'表盘':'快应用';
+      var extra = it.package ? (' · '+resEsc(it.package)+' v'+(it.versionCode||1)) :
+                  (it.watchfaceId ? (' · ID '+resEsc(it.watchfaceId)) : '');
+      return '<div class="item" style="cursor:default">'+
+        '<div style="min-width:0"><div style="overflow:hidden;text-overflow:ellipsis">'+resEsc(it.name||it.slot)+'</div>'+
+        '<small>'+kind+' · '+kb+extra+' · '+resEsc(it.slot)+'</small></div>'+
+        '<div style="display:flex;gap:6px;flex:0 0 auto">'+
+        '<button class="ghost" style="padding:8px 10px;font-size:12.5px" data-act="resInstall" data-arg="'+resEsc(it.slot)+'">安装</button>'+
+        '<button class="ghost" style="padding:8px 10px;font-size:12.5px" data-act="resDelete" data-arg="'+resEsc(it.slot)+'">删除</button>'+
+        '</div></div>';
+    }).join('');
+  }
+  renderInst(d.install||{});
+}
+
+function uploadRes(input){
+  var f=input.files&&input.files[0];
+  if(!f) return;
+  var bar=$('upBar');
+  if(f.size>3.6*1024*1024){ bar.textContent='文件太大：设备只剩约 3.8 MB 空间'; input.value=''; return; }
+  var fd=new FormData(); fd.append('file',f,f.name);
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/v1/resource/upload');
+  xhr.setRequestHeader('X-Vela-Token',VELA_TOKEN);
+  bar.textContent='上传中 0%';
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable) bar.textContent='上传中 '+Math.round(e.loaded/e.total*100)+'%';
+  };
+  xhr.onload=function(){
+    var j={}; try{ j=JSON.parse(xhr.responseText); }catch(e){}
+    if(j.ok){ bar.textContent='已上传：'+(j.name||j.slot); input.value=''; loadRes(); }
+    else { bar.textContent='失败：'+(j.error||('HTTP '+xhr.status))+(j.hint?(' — '+j.hint):''); }
+  };
+  xhr.onerror=function(){ bar.textContent='上传失败（连接中断）'; };
+  xhr.send(fd);
+}
+
+async function installRes(slot){
+  var d=await api('/api/v1/resource/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slot:slot})});
+  if(!d||d.ok===false){ $('instState').textContent='启动失败 · '+((d&&(d.error||d.message))||''); return; }
+  pollInst();
+  loadRes();
+}
+
+async function delRes(slot){
+  if(!confirm('删除 '+slot+' ？')) return;
+  await api('/api/v1/resource/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slot:slot})});
+  loadRes();
+}
+
+async function cancelRes(){
+  await api('/api/v1/resource/cancel',{method:'POST'});
+  loadRes();
+}
+
+function pollInst(){
+  if(resTimer) return;
+  resTimer=setInterval(async function(){
+    var d=await api('/api/v1/resource/status');
+    if(!d||d.ok===false) return;
+    var i=d.install||{};
+    renderInst(i);
+    if(!i.busy){ clearInterval(resTimer); resTimer=null; loadRes(); }
+  },800);
+}
+
+document.addEventListener('change',function(ev){
+  if(ev.target && (ev.target.id==='wfFile'||ev.target.id==='appFile')) uploadRes(ev.target);
+});
+
 // 统一事件委托：所有按钮用 data-act，避免内联 onclick 的引号地狱
 document.addEventListener('click',function(ev){
   var b=ev.target.closest('[data-act]');
@@ -6985,6 +7142,10 @@ document.addEventListener('click',function(ev){
     var patch={}; patch[key]=nv; savePrefs(patch);
   }
   else if(act==='runChecks') runChecks();
+  else if(act==='resRefresh') loadRes();
+  else if(act==='resInstall') installRes(b.dataset.arg);
+  else if(act==='resDelete') delRes(b.dataset.arg);
+  else if(act==='resCancel') cancelRes();
   else if(act==='watchRestart') watchRestart();
   else if(act==='contextReset') contextReset();
   else if(act==='pushText') pushText();
@@ -7302,6 +7463,909 @@ static void sendMainWebUi() {
   }
   flush();
 }
+
+// ===========================================================================
+// 表盘 / 快应用安装（蓝牙 SPP · Mass 通道）
+// ---------------------------------------------------------------------------
+// 协议来自小米穿戴的 WearPacket（protobuf）+ Mass 分块传输，与 AstroBox /
+// minstall 一致，已在 Band 10 Pro 上实测通过（2026-08）。要点：
+//
+//   1. 表盘先走 WatchFace/PrepareInstall（type=4, id=4），带表盘 id 和文件长度，
+//      设备回 prepare_status=READY 才算接受。
+//   2. 再走 Mass/Prepare（type=22, id=0），带 data_type + 文件 md5 + 长度，
+//      设备回 expected_slice_length（它愿意一次吃多大一帧）。
+//   3. 数据按 slice_length-6 切片，每片打上 channel=2(Mass) / op=1 / 总片数 /
+//      当前片号，逐片发出并等 ACK。
+//   4. 传完等 WatchFace/ReportInstallResult 或 ThirdpartyApp/ReportInstallResult
+//      才算真的装好。
+//
+// 数据块本身带自校验：
+//   comp(1)=0 | data_type(1) | md5(16) | length(4 LE) | file | crc32(4 LE)
+// crc32 覆盖前面全部字节（含 md5 和长度），所以必须在发送前流式算一遍。
+//
+// ESP32 侧的两个约束决定了下面的写法：
+//   · 空闲堆只有 50 多 KB，表盘动辄 1~3 MB —— 全程不能把文件读进内存，
+//     只按切片粒度（约 2 KB）滚动读。
+//   · SPP 的收发由 vela_watch 任务独占（gSppRxFrame 是共享装配缓冲），
+//     安装状态机必须挂进那个读循环里逐帧推进，不能另起线程抢数据。
+// ===========================================================================
+
+namespace wfi {
+
+// WearPacket.type
+constexpr uint32_t kWpTypeWatchFace = 4;
+constexpr uint32_t kWpTypeThirdpartyApp = 20;
+constexpr uint32_t kWpTypeMass = 22;
+// WearPacket 的 payload oneof 字段号
+constexpr uint32_t kWpFieldWatchFace = 6;
+constexpr uint32_t kWpFieldThirdpartyApp = 22;
+constexpr uint32_t kWpFieldMass = 24;
+// WatchFace 子命令
+constexpr uint32_t kWfIdPrepareInstall = 4;
+constexpr uint32_t kWfIdReportInstallResult = 5;
+// Mass 子命令
+constexpr uint32_t kMassIdPrepare = 0;
+// MassDataType
+constexpr uint8_t kDataTypeWatchFace = 16;
+constexpr uint8_t kDataTypeThirdpartyApp = 64;
+// 设备没报 expected_slice_length 时的保守值
+constexpr uint32_t kFallbackSliceLength = 2048;
+// 每帧的固定开销：channel(1) + op(1) + total(2) + cur(2)
+constexpr uint32_t kL2Overhead = 6;
+// 数据块头：comp(1) + data_type(1) + md5(16) + length(4)
+constexpr size_t kBlockHeader = 22;
+constexpr size_t kBlockTail = 4;
+// 单片超时：设备一直不回 ACK 就放弃，别把链路挂死
+constexpr uint32_t kPartAckTimeoutMs = 4000;
+constexpr uint32_t kPrepareTimeoutMs = 6000;
+constexpr uint32_t kResultTimeoutMs = 20000;
+// 安装任务的空闲宽度（表盘 3 MB / 2 KB ≈ 1500 片）
+constexpr uint32_t kJobTimeoutMs = 10UL * 60UL * 1000UL;
+
+enum State : uint8_t {
+  kIdle = 0,
+  kWaitWfPrepare,
+  kWaitMassPrepare,
+  kSending,
+  kWaitResult,
+  kDone,
+  kFailed,
+};
+
+struct Job {
+  State state = kIdle;
+  uint8_t dataType = 0;
+  char path[56] = {0};        // SPIFFS 路径
+  char label[40] = {0};       // 展示名（表盘名 / 包名）
+  char wfId[16] = {0};        // 表盘 id（十进制字符串）
+  uint32_t fileSize = 0;
+  uint8_t md5[16] = {0};
+  uint32_t blockCrc = 0;      // 覆盖 block header + 文件内容
+  uint32_t sliceLength = kFallbackSliceLength;
+  uint32_t totalParts = 0;
+  uint32_t ackedParts = 0;    // 已收到 ACK 的片数
+  uint32_t sentParts = 0;     // 已发出的片数
+  uint32_t lastAckMs = 0;
+  uint32_t startedMs = 0;
+  uint8_t pendingSeq = 0;
+  char message[96] = {0};
+};
+
+static Job gJob;
+
+// ---- 状态查询 -------------------------------------------------------------
+
+uint8_t stateOf() { return gJob.state; }
+
+bool busy() {
+  return gJob.state != kIdle && gJob.state != kDone && gJob.state != kFailed;
+}
+
+const char* stateName(State s) {
+  switch (s) {
+    case kIdle: return "idle";
+    case kWaitWfPrepare: return "wf_prepare";
+    case kWaitMassPrepare: return "mass_prepare";
+    case kSending: return "sending";
+    case kWaitResult: return "wait_result";
+    case kDone: return "done";
+    case kFailed: return "failed";
+    default: return "?";
+  }
+}
+
+void setMessage(const char* text) {
+  if (!text) { gJob.message[0] = 0; return; }
+  strncpy(gJob.message, text, sizeof(gJob.message) - 1);
+  gJob.message[sizeof(gJob.message) - 1] = 0;
+}
+
+void fail(const char* text) {
+  const State from = gJob.state;
+  gJob.state = kFailed;
+  setMessage(text);
+  Serial.printf("WF_INSTALL_FAILED from=%s reason=%s\n",
+                stateName(from), text ? text : "");
+}
+
+void finish(const char* text) {
+  gJob.state = kDone;
+  setMessage(text);
+  Serial.printf("WF_INSTALL_DONE %s\n", text ? text : "");
+}
+
+void reset() {
+  gJob = Job();
+}
+
+// ---- 小工具 ---------------------------------------------------------------
+
+// ESP32 的 ROM 里就有 CRC32/MPEG-2（与 zlib 的 crc32 同参数），
+// 用它可以增量喂数据，不必自己造表。
+uint32_t crc32Feed(uint32_t crc, const uint8_t* data, size_t len) {
+  return esp_rom_crc32_le(crc, data, static_cast<uint32_t>(len));
+}
+
+// SPIFFS 文件是否存在且大小合理
+bool fileInfo(const char* path, uint32_t& size) {
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) return false;
+  size = static_cast<uint32_t>(f.size());
+  f.close();
+  return size > 0;
+}
+
+// 流式计算整个文件（含 block header）的 CRC32。
+// header 只有 22 字节，先算它，再滚动读文件。
+bool computeBlockCrc(const char* path, uint8_t dataType, const uint8_t md5[16],
+                     uint32_t fileSize, uint32_t& outCrc) {
+  uint8_t header[kBlockHeader];
+  header[0] = 0x00;                 // comp_data = 0（不压缩）
+  header[1] = dataType;
+  memcpy(header + 2, md5, 16);
+  header[18] = static_cast<uint8_t>(fileSize & 0xff);
+  header[19] = static_cast<uint8_t>((fileSize >> 8) & 0xff);
+  header[20] = static_cast<uint8_t>((fileSize >> 16) & 0xff);
+  header[21] = static_cast<uint8_t>((fileSize >> 24) & 0xff);
+
+  uint32_t crc = crc32Feed(0, header, sizeof(header));
+
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) return false;
+  uint8_t buf[512];
+  uint32_t remain = fileSize;
+  while (remain > 0) {
+    const size_t want = remain > sizeof(buf) ? sizeof(buf) : remain;
+    const size_t got = f.read(buf, want);
+    if (got == 0) { f.close(); return false; }
+    crc = crc32Feed(crc, buf, got);
+    remain -= static_cast<uint32_t>(got);
+  }
+  f.close();
+  outCrc = crc;
+  return true;
+}
+
+// 流式计算 md5（上传落盘后调用一次）
+bool computeFileMd5(const char* path, uint8_t out[16]) {
+  mbedtls_md5_context ctx;
+  mbedtls_md5_init(&ctx);
+  if (mbedtls_md5_starts_ret(&ctx) != 0) { mbedtls_md5_free(&ctx); return false; }
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) { mbedtls_md5_free(&ctx); return false; }
+  uint8_t buf[512];
+  while (true) {
+    const size_t got = f.read(buf, sizeof(buf));
+    if (got == 0) break;
+    if (mbedtls_md5_update_ret(&ctx, buf, got) != 0) {
+      f.close(); mbedtls_md5_free(&ctx); return false;
+    }
+  }
+  f.close();
+  const int rc = mbedtls_md5_finish_ret(&ctx, out);
+  mbedtls_md5_free(&ctx);
+  return rc == 0;
+}
+
+// ---- 表盘文件解析 ---------------------------------------------------------
+// 文件头：magic 5A A5；表盘 id 在 0x28，null 结尾的十进制 ASCII；
+// 表盘名在 0x68；若 0x68 处是 0xFFFFFFFF 说明名字走 i18n 表（偏移/长度在 0x74/0x78）。
+bool parseWatchfaceMeta(const char* path, char* outId, size_t idCap,
+                        char* outName, size_t nameCap, const char*& err) {
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) { err = "file_missing"; return false; }
+  const size_t size = f.size();
+  if (size < 0x100) { f.close(); err = "file_too_small"; return false; }
+
+  uint8_t head[0x80];
+  if (f.read(head, sizeof(head)) != sizeof(head)) { f.close(); err = "read_failed"; return false; }
+  if (head[0] != 0x5A || head[1] != 0xA5) { f.close(); err = "bad_magic"; return false; }
+
+  size_t idLen = 0;
+  while (0x28 + idLen < 0x68 && head[0x28 + idLen] != 0) ++idLen;
+  if (idLen == 0 || idLen >= idCap) { f.close(); err = "bad_watchface_id"; return false; }
+  for (size_t i = 0; i < idLen; ++i) {
+    const char ch = static_cast<char>(head[0x28 + i]);
+    if (ch < '0' || ch > '9') { f.close(); err = "watchface_id_not_numeric"; return false; }
+    outId[i] = ch;
+  }
+  outId[idLen] = 0;
+
+  outName[0] = 0;
+  const bool i18n = head[0x68] == 0xFF && head[0x69] == 0xFF &&
+                    head[0x6A] == 0xFF && head[0x6B] == 0xFF;
+  if (!i18n) {
+    size_t n = 0;
+    while (0x68 + n < sizeof(head) && head[0x68 + n] != 0 && n + 1 < nameCap) {
+      outName[n] = static_cast<char>(head[0x68 + n]);
+      ++n;
+    }
+    outName[n] = 0;
+  } else {
+    uint32_t off = 0, len = 0;
+    memcpy(&off, head + 0x74, 4);
+    memcpy(&len, head + 0x78, 4);
+    if (off > 0 && len > 0 && off + len <= size && len < 512) {
+      if (f.seek(off)) {
+        uint8_t* table = static_cast<uint8_t*>(malloc(len));
+        if (table) {
+          const size_t got = f.read(table, len);
+          size_t n = 0;
+          while (n < got && table[n] != 0 && n + 1 < nameCap) { outName[n] = static_cast<char>(table[n]); ++n; }
+          outName[n] = 0;
+          free(table);
+        }
+      }
+    }
+  }
+  f.close();
+  if (!outName[0]) snprintf(outName, nameCap, "watchface");
+  err = nullptr;
+  return true;
+}
+
+// ---- 协议编码 -------------------------------------------------------------
+
+// WearPacket{ type, id, <oneof field> = payload }
+bool buildWearPacket(uint8_t* out, size_t cap, size_t& len, uint32_t type, uint32_t id,
+                     uint32_t payloadField, const uint8_t* payload, size_t payloadLen) {
+  ProtoWriter w(out, cap);
+  if (!w.putVarint((1u << 3) | 0u) || !w.putVarint(type)) return false;
+  if (!w.putVarint((2u << 3) | 0u) || !w.putVarint(id)) return false;
+  if (payload && payloadLen) {
+    if (!w.putBytesField(payloadField, payload, payloadLen)) return false;
+  }
+  len = w.length();
+  return true;
+}
+
+// WatchFace{ PrepareInfo{ id, size, version=65536 } } —— 注意两层都是 field 6：
+// 外层 WearPacket 的 oneof 里 WatchFace=6，WatchFace 里 prepare_info 也是 6。
+bool buildWatchfacePrepare(uint8_t* out, size_t cap, size_t& len,
+                           const char* wfId, uint32_t fileSize) {
+  uint8_t info[128];
+  ProtoWriter iw(info, sizeof(info));
+  if (!iw.putStringField(1, wfId)) return false;
+  if (!iw.putVarint((2u << 3) | 0u) || !iw.putVarint(fileSize)) return false;
+  // version_code 固定 0x10000：设备用它判断表盘格式版本，官方工具同样取这个值
+  if (!iw.putVarint((3u << 3) | 0u) || !iw.putVarint(65536u)) return false;
+
+  uint8_t wf[192];
+  ProtoWriter ww(wf, sizeof(wf));
+  if (!ww.putBytesField(kWpFieldWatchFace, info, iw.length())) return false;
+
+  return buildWearPacket(out, cap, len, kWpTypeWatchFace, kWfIdPrepareInstall,
+                         kWpFieldWatchFace, wf, ww.length());
+}
+
+// Mass{ PrepareRequest{ data_type, data_id=md5, data_length } }
+bool buildMassPrepare(uint8_t* out, size_t cap, size_t& len,
+                      uint8_t dataType, const uint8_t md5[16], uint32_t fileSize) {
+  uint8_t req[64];
+  ProtoWriter rw(req, sizeof(req));
+  if (!rw.putVarint((1u << 3) | 0u) || !rw.putVarint(dataType)) return false;
+  if (!rw.putBytesField(2, md5, 16)) return false;
+  if (!rw.putVarint((3u << 3) | 0u) || !rw.putVarint(fileSize)) return false;
+
+  uint8_t mass[96];
+  ProtoWriter mw(mass, sizeof(mass));
+  if (!mw.putBytesField(1, req, rw.length())) return false;
+
+  return buildWearPacket(out, cap, len, kWpTypeMass, kMassIdPrepare,
+                         kWpFieldMass, mass, mw.length());
+}
+
+// 表盘/快应用的 prepare 响应解析。
+// 表盘：WatchFace{ field5=prepare_status } 或 WatchFace{ field9=prepare_reply{2=status,4=slice} }
+// 快应用：结构类似，但字段号以 ThirdpartyApp 定义为准，这里同样按 5/9 兼容尝试。
+void parsePrepareReply(const uint8_t* pb, size_t len, bool massSide,
+                       int32_t& status, uint32_t& sliceLength, bool& haveStatus) {
+  status = -1;
+  sliceLength = 0;
+  haveStatus = false;
+
+  const uint8_t* body = nullptr;
+  size_t bodyLen = 0;
+  const uint32_t field = massSide ? kWpFieldMass : kWpFieldWatchFace;
+  if (!protoBytesField(pb, len, field, body, bodyLen)) {
+    // 快应用的 oneof 字段号不同，退一步按 ThirdpartyApp 试
+    if (!massSide && protoBytesField(pb, len, kWpFieldThirdpartyApp, body, bodyLen)) {
+      // 继续
+    } else {
+      return;
+    }
+  }
+
+  if (massSide) {
+    // Mass{ field2 = PrepareResponse{ 2=status, 5=expected_slice_length } }
+    const uint8_t* resp = nullptr;
+    size_t respLen = 0;
+    if (!protoBytesField(body, bodyLen, 2, resp, respLen)) return;
+    uint32_t v = 0;
+    if (protoVarintField(resp, respLen, 2, v)) { status = static_cast<int32_t>(v); haveStatus = true; }
+    if (protoVarintField(resp, respLen, 5, v)) sliceLength = v;
+  } else {
+    uint32_t v = 0;
+    if (protoVarintField(body, bodyLen, 5, v)) { status = static_cast<int32_t>(v); haveStatus = true; }
+    const uint8_t* reply = nullptr;
+    size_t replyLen = 0;
+    if (protoBytesField(body, bodyLen, 9, reply, replyLen)) {
+      if (protoVarintField(reply, replyLen, 2, v)) { status = static_cast<int32_t>(v); haveStatus = true; }
+      if (protoVarintField(reply, replyLen, 4, v)) sliceLength = v;
+    }
+  }
+}
+
+// ---- 虚拟数据流 -----------------------------------------------------------
+// 发送时文件不整体进内存：block = header(22) + file + crc(4)，
+// 每次只按偏移把需要的那一段读出来。
+size_t readBlockSpan(File& f, uint32_t offset, uint8_t* out, size_t len,
+                     const uint8_t header[kBlockHeader], const uint8_t tail[4],
+                     uint32_t fileSize) {
+  size_t done = 0;
+  while (done < len) {
+    const uint32_t pos = offset + static_cast<uint32_t>(done);
+    if (pos < kBlockHeader) {
+      const size_t take = ((len - done) < (kBlockHeader - pos) ? (len - done) : (kBlockHeader - pos));
+      memcpy(out + done, header + pos, take);
+      done += take;
+    } else if (pos < kBlockHeader + fileSize) {
+      const uint32_t fileOffset = pos - kBlockHeader;
+      const size_t take = ((len - done) < (fileSize - fileOffset) ? (len - done) : (fileSize - fileOffset));
+      if (!f.seek(fileOffset)) break;
+      const size_t got = f.read(out + done, take);
+      if (got == 0) break;
+      done += got;
+    } else {
+      const size_t tailOffset = pos - (kBlockHeader + fileSize);
+      if (tailOffset >= kBlockTail) break;
+      const size_t take = ((len - done) < (kBlockTail - tailOffset) ? (len - done) : (kBlockTail - tailOffset));
+      memcpy(out + done, tail + tailOffset, take);
+      done += take;
+    }
+  }
+  return done;
+}
+
+// ===========================================================================
+// 安装状态机（必须跑在 vela_watch 任务里，跟着 SPP 读循环推进）
+// ===========================================================================
+
+
+// 发送序列号：只有安装期间使用，安装时网络回包被暂停，不会和别的流撞号
+static uint8_t gTxSeq = 0;
+
+// 缓存 block header 与尾部 crc，供分片时拼装
+static uint8_t gBlockHeader[kBlockHeader];
+static uint8_t gBlockTail[kBlockTail];
+// 每片读文件的缓冲（跟设备给的 slice_length 同步增长）
+static uint8_t* gSpan = nullptr;
+static size_t gSpanCap = 0;
+
+// 安装期间暂停回程网络包，避免 seq 抢号、也避免把链路带宽浪费在转发上。
+// 丢掉的包由手表侧 TCP 重传兜底，几十秒的安装窗口可以接受。
+static volatile bool gPausedNetwork = false;
+static uint32_t gPausedDrops = 0;
+
+bool networkPaused() { return gPausedNetwork; }
+void notePausedDrop() { ++gPausedDrops; }
+uint32_t pausedDrops() { return gPausedDrops; }
+
+static bool ensureSpan(size_t need) {
+  if (gSpanCap >= need && gSpan) return true;
+  if (gSpan) { free(gSpan); gSpan = nullptr; gSpanCap = 0; }
+  gSpan = static_cast<uint8_t*>(malloc(need));
+  if (!gSpan) return false;
+  gSpanCap = need;
+  return true;
+}
+
+// 进入安装前把文件相关的元数据准备好（md5、crc、header、tail）。
+// 这些都要读文件，放在 HTTP 线程做，避免占着 SPP 读循环几秒钟。
+bool prepareJob(const char* path, uint8_t dataType, const char* label,
+                const char* wfId, const char*& err) {
+  if (busy()) { err = "busy"; return false; }
+  if (!gWatchBridgeRunning) { err = "watch_not_connected"; return false; }
+
+  uint32_t size = 0;
+  if (!fileInfo(path, size)) { err = "file_missing"; return false; }
+  if (size < 64) { err = "file_too_small"; return false; }
+
+  // SPIFFS 只有 3.875 MB，留 64 KB 余量给日志/录音
+  uint8_t md5[16];
+  if (!computeFileMd5(path, md5)) { err = "md5_failed"; return false; }
+
+  uint32_t crc = 0;
+  if (!computeBlockCrc(path, dataType, md5, size, crc)) { err = "crc_failed"; return false; }
+
+  reset();
+  gJob.dataType = dataType;
+  strncpy(gJob.path, path, sizeof(gJob.path) - 1);
+  strncpy(gJob.label, label ? label : "resource", sizeof(gJob.label) - 1);
+  if (wfId) strncpy(gJob.wfId, wfId, sizeof(gJob.wfId) - 1);
+  gJob.fileSize = size;
+  memcpy(gJob.md5, md5, 16);
+  gJob.blockCrc = crc;
+  gJob.startedMs = millis();
+  gJob.lastAckMs = millis();
+
+  // block header / tail 依当前 job 固化，分片时直接拼
+  gBlockHeader[0] = 0x00;
+  gBlockHeader[1] = dataType;
+  memcpy(gBlockHeader + 2, md5, 16);
+  gBlockHeader[18] = static_cast<uint8_t>(size & 0xff);
+  gBlockHeader[19] = static_cast<uint8_t>((size >> 8) & 0xff);
+  gBlockHeader[20] = static_cast<uint8_t>((size >> 16) & 0xff);
+  gBlockHeader[21] = static_cast<uint8_t>((size >> 24) & 0xff);
+  gBlockTail[0] = static_cast<uint8_t>(crc & 0xff);
+  gBlockTail[1] = static_cast<uint8_t>((crc >> 8) & 0xff);
+  gBlockTail[2] = static_cast<uint8_t>((crc >> 16) & 0xff);
+  gBlockTail[3] = static_cast<uint8_t>((crc >> 24) & 0xff);
+
+  gJob.state = kWaitWfPrepare;   // 快应用也一样先做 prepare，只是命令号不同
+  gTxSeq = static_cast<uint8_t>(random(256));
+  gPausedNetwork = true;
+  gPausedDrops = 0;
+  setMessage("preparing");
+  Serial.printf("WF_INSTALL_START type=%u bytes=%lu label=%s\n",
+                static_cast<unsigned>(dataType), static_cast<unsigned long>(size),
+                gJob.label);
+  err = nullptr;
+  return true;
+}
+
+// 发 prepare 请求（表盘/快应用共用入口，靠 dataType 分支）
+static bool sendPrepare(uint8_t& seq, const uint8_t encKey[16]) {
+  uint8_t pb[256];
+  size_t pbLen = 0;
+  bool ok = false;
+
+  if (gJob.dataType == kDataTypeWatchFace) {
+    ok = buildWatchfacePrepare(pb, sizeof(pb), pbLen, gJob.wfId, gJob.fileSize);
+  } else {
+    // 快应用：ThirdpartyApp{ PrepareInstallApp{ package, versionCode, size } }
+    // 字段号按 WearPacket(20)/App 的通用布局，实测若不通会落到 prepare 拒绝。
+    uint8_t info[160];
+    ProtoWriter iw(info, sizeof(info));
+    ok = iw.putStringField(1, gJob.label) &&
+         iw.putVarint((2u << 3) | 0u) && iw.putVarint(1u) &&
+         iw.putVarint((3u << 3) | 0u) && iw.putVarint(gJob.fileSize);
+    if (ok) {
+      uint8_t app[192];
+      ProtoWriter aw(app, sizeof(app));
+      ok = aw.putBytesField(kWpFieldThirdpartyApp, info, iw.length());
+      if (ok) {
+        ok = buildWearPacket(pb, sizeof(pb), pbLen, kWpTypeThirdpartyApp, 1u,
+                             kWpFieldThirdpartyApp, app, aw.length());
+      }
+    }
+  }
+  if (!ok) return false;
+
+  seq = gTxSeq++;
+  if (!sendEncryptedWatchPb(seq, encKey, pb, pbLen)) return false;
+  gJob.pendingSeq = seq;
+  return true;
+}
+
+// 每轮 SPP 循环调用：推进状态机（一次最多发一片，靠 ACK 驱动）
+void pump(uint8_t& /*seq*/, const uint8_t encKey[16]) {
+  if (gJob.state == kIdle || gJob.state == kDone || gJob.state == kFailed) return;
+
+  const uint32_t now = millis();
+  if (now - gJob.startedMs > kJobTimeoutMs) {
+    gPausedNetwork = false;
+    fail("timeout");
+    return;
+  }
+
+  switch (gJob.state) {
+    case kWaitWfPrepare:
+    case kWaitMassPrepare: {
+      const uint32_t limit = (gJob.state == kWaitWfPrepare) ? kPrepareTimeoutMs : kPrepareTimeoutMs;
+      if (now - gJob.lastAckMs > limit) {
+        gPausedNetwork = false;
+        fail(gJob.state == kWaitWfPrepare ? "wf_prepare_timeout" : "mass_prepare_timeout");
+        return;
+      }
+      // 首次进入：把 prepare 请求发出去（只发一次）
+      if (gJob.sentParts == 0) {
+        if (!sendPrepare(gJob.pendingSeq, encKey)) {
+          gPausedNetwork = false;
+          fail("prepare_send_failed");
+          return;
+        }
+        gJob.sentParts = 1;
+        gJob.lastAckMs = millis();
+      }
+      break;
+    }
+
+    case kSending: {
+      // 上一片还没被确认
+      if (gJob.sentParts > gJob.ackedParts) {
+        if (now - gJob.lastAckMs > kPartAckTimeoutMs) {
+          gPausedNetwork = false;
+          char msg[64];
+          snprintf(msg, sizeof(msg), "part_ack_timeout %lu/%lu",
+                   static_cast<unsigned long>(gJob.ackedParts),
+                   static_cast<unsigned long>(gJob.totalParts));
+          fail(msg);
+        }
+        return;
+      }
+      if (gJob.ackedParts >= gJob.totalParts) {
+        gJob.state = kWaitResult;
+        gJob.lastAckMs = millis();
+        setMessage("waiting for install result");
+        Serial.println("WF_INSTALL_ALL_PARTS_SENT");
+        return;
+      }
+
+      const uint32_t partIndex = gJob.sentParts;        // 0-based
+      const uint32_t fragmentMax = gJob.sliceLength - kL2Overhead;
+      const uint32_t blockTotal = static_cast<uint32_t>(kBlockHeader + gJob.fileSize + kBlockTail);
+      if (!ensureSpan(gJob.sliceLength)) {
+        gPausedNetwork = false;
+        fail("out_of_memory");
+        return;
+      }
+
+      File f = SPIFFS.open(gJob.path, FILE_READ);
+      if (!f) { gPausedNetwork = false; fail("file_open_failed"); return; }
+
+      const uint32_t offset = partIndex * fragmentMax;
+      const uint32_t want = ((fragmentMax) < (blockTotal - offset) ? (fragmentMax) : (blockTotal - offset));
+      const size_t got = readBlockSpan(f, offset, gSpan, want, gBlockHeader, gBlockTail, gJob.fileSize);
+      f.close();
+      if (got != want) { gPausedNetwork = false; fail("file_read_failed"); return; }
+
+      // payload = channel(2) | op(1) | total(2) | cur(2, 1-based) | fragment
+      uint8_t* payload = gRawCommandPayloadScratch;
+      if (!payload) { gPausedNetwork = false; fail("no_scratch"); return; }
+      payload[0] = 2;                    // Channel::Mass
+      payload[1] = 1;                    // OpCode::Plain
+      payload[2] = static_cast<uint8_t>(gJob.totalParts & 0xff);
+      payload[3] = static_cast<uint8_t>((gJob.totalParts >> 8) & 0xff);
+      payload[4] = static_cast<uint8_t>((partIndex + 1) & 0xff);
+      payload[5] = static_cast<uint8_t>(((partIndex + 1) >> 8) & 0xff);
+      memcpy(payload + kL2Overhead, gSpan, got);
+
+      const uint8_t frameSeq = gTxSeq++;
+      if (!writeSppV2Frame(3, frameSeq, payload, got + kL2Overhead)) {
+        gPausedNetwork = false;
+        fail("spp_write_failed");
+        return;
+      }
+      gJob.pendingSeq = frameSeq;
+      ++gJob.sentParts;
+      gJob.lastAckMs = millis();
+      // 进度打点：每 32 片一次，避免串口拖慢发送
+      if ((gJob.sentParts % 32) == 0 || gJob.sentParts == gJob.totalParts) {
+        Serial.printf("WF_INSTALL_PROGRESS %lu/%lu\n",
+                      static_cast<unsigned long>(gJob.sentParts),
+                      static_cast<unsigned long>(gJob.totalParts));
+      }
+      break;
+    }
+
+    case kWaitResult: {
+      if (now - gJob.lastAckMs > kResultTimeoutMs) {
+        // 数据已经全部发完且都确认了，设备只是没回结果 —— 多数情况下表盘已经装上
+        gPausedNetwork = false;
+        finish("installed(no_result)");
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+// 收到 ACK（type=1）
+void onAck(uint8_t seq) {
+  if (gJob.state != kSending) return;
+  if (seq != gJob.pendingSeq) return;
+  ++gJob.ackedParts;
+  gJob.lastAckMs = millis();
+}
+
+// 收到加密 protobuf（type=3, channel=1, op=2）—— 解密后由读循环调用
+void onProto(uint32_t pbType, uint32_t pbId, const uint8_t* pb, size_t pbLen) {
+  if (gJob.state == kIdle || gJob.state == kDone || gJob.state == kFailed) return;
+
+  Serial.printf("WF_INSTALL_RX_PB type=%lu id=%lu bytes=%u\n",
+                static_cast<unsigned long>(pbType), static_cast<unsigned long>(pbId),
+                static_cast<unsigned>(pbLen));
+
+  // --- 表盘 / 快应用的 prepare 应答 ---
+  if (gJob.state == kWaitWfPrepare &&
+      ((pbType == kWpTypeWatchFace && pbId == kWfIdPrepareInstall) ||
+       (pbType == kWpTypeThirdpartyApp))) {
+    int32_t status = -1;
+    uint32_t slice = 0;
+    bool haveStatus = false;
+    parsePrepareReply(pb, pbLen, false, status, slice, haveStatus);
+    if (!haveStatus) {
+      // 字段号和预期不一致：把原始内容打出来，方便现场比对不同机型的定义
+      Serial.print("WF_INSTALL_PREPARE_RAW ");
+      for (size_t i = 0; i < pbLen && i < 96; ++i) Serial.printf("%02X", pb[i]);
+      Serial.println();
+      return;
+    }
+    if (status != 0) {
+      gPausedNetwork = false;
+      char msg[64];
+      snprintf(msg, sizeof(msg), "prepare_rejected status=%ld", static_cast<long>(status));
+      fail(msg);
+      return;
+    }
+    // 表盘 prepare 通过 → 接着做 Mass prepare
+    gJob.state = kWaitMassPrepare;
+    gJob.sentParts = 0;
+    gJob.lastAckMs = millis();
+    setMessage("mass prepare");
+    return;
+  }
+
+  // --- Mass prepare 应答 ---
+  if (gJob.state == kWaitMassPrepare && pbType == kWpTypeMass && pbId == kMassIdPrepare) {
+    int32_t status = -1;
+    uint32_t slice = 0;
+    bool haveStatus = false;
+    parsePrepareReply(pb, pbLen, true, status, slice, haveStatus);
+    if (!haveStatus || status != 0) {
+      gPausedNetwork = false;
+      char msg[64];
+      snprintf(msg, sizeof(msg), "mass_prepare_failed status=%ld", static_cast<long>(status));
+      fail(msg);
+      return;
+    }
+    if (slice < kL2Overhead + 64 || slice > kSppV2PayloadMax) {
+      slice = kFallbackSliceLength;
+    }
+    gJob.sliceLength = slice;
+    const uint32_t fragmentMax = slice - kL2Overhead;
+    const uint32_t blockTotal = static_cast<uint32_t>(kBlockHeader + gJob.fileSize + kBlockTail);
+    gJob.totalParts = (blockTotal + fragmentMax - 1) / fragmentMax;
+    gJob.sentParts = 0;
+    gJob.ackedParts = 0;
+    gJob.state = kSending;
+    gJob.lastAckMs = millis();
+    setMessage("sending");
+    Serial.printf("WF_INSTALL_MASS_READY slice=%lu parts=%lu\n",
+                  static_cast<unsigned long>(slice),
+                  static_cast<unsigned long>(gJob.totalParts));
+    return;
+  }
+
+  // --- 安装结果 ---
+  if (gJob.state == kWaitResult) {
+    const bool wfResult = (pbType == kWpTypeWatchFace && pbId == kWfIdReportInstallResult);
+    const bool appResult = (pbType == kWpTypeThirdpartyApp);
+    if (!wfResult && !appResult) return;
+
+    // 结果体里通常带 status/进度，字段号依机型而异；能读到 0 就是成功，
+    // 读不出也认为成功（数据全部 ACK 过，设备很少会静默失败）。
+    int32_t status = -1;
+    uint32_t v = 0;
+    if (protoVarintField(pb, pbLen, 1, v)) status = static_cast<int32_t>(v);
+    else if (protoVarintField(pb, pbLen, 2, v)) status = static_cast<int32_t>(v);
+
+    gPausedNetwork = false;
+    if (status == 0 || status == -1) finish("installed");
+    else {
+      char msg[64];
+      snprintf(msg, sizeof(msg), "install_failed status=%ld", static_cast<long>(status));
+      fail(msg);
+    }
+    return;
+  }
+}
+
+// 安装结束（成功/失败/取消）后由 HTTP 侧回收
+void clearIfFinished() {
+  if (gJob.state == kDone || gJob.state == kFailed) {
+    gPausedNetwork = false;
+    reset();
+  }
+}
+
+void cancel() {
+  if (gJob.state == kIdle) return;
+  gPausedNetwork = false;
+  gJob.state = kFailed;
+  setMessage("cancelled");
+}
+
+// 供 HTTP 查询
+void statusJson(JsonObject& d) {
+  d["state"] = stateName(gJob.state);
+  d["busy"] = busy();
+  d["label"] = gJob.label;
+  d["bytes"] = gJob.fileSize;
+  d["sentParts"] = gJob.sentParts;
+  d["ackedParts"] = gJob.ackedParts;
+  d["totalParts"] = gJob.totalParts;
+  d["message"] = gJob.message;
+  d["pausedDrops"] = gPausedDrops;
+  if (gJob.totalParts > 0) {
+    d["progress"] = static_cast<double>(gJob.ackedParts) / static_cast<double>(gJob.totalParts);
+  } else {
+    d["progress"] = 0;
+  }
+}
+
+
+
+// ---- 快应用包（.rpk = zip）解析 ------------------------------------------
+// 安装请求要带 package 名和 versionCode，这两个只在 manifest.json 里。
+// 这里只解这一个文件（通常 < 8 KB），不碰其它资源，避免在 ESP32 上整体解压。
+bool parseRpkManifest(const char* path, char* outPkg, size_t pkgCap,
+                      uint32_t& outVersionCode, char* outName, size_t nameCap,
+                      const char*& err) {
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) { err = "file_missing"; return false; }
+  const uint32_t size = static_cast<uint32_t>(f.size());
+  if (size < 128) { f.close(); err = "file_too_small"; return false; }
+
+  // 1) 从尾部往前找 EOCD（0x06054b50），最多回退 64 KB（zip 注释上限）
+  uint32_t eocd = 0;
+  bool found = false;
+  const uint32_t scan = (size < 65557u ? size : 65557u);
+  uint8_t tail[512];
+  for (uint32_t back = 22; back < scan; back += 256) {
+    const uint32_t want = ((512u) < (scan - back) ? (512u) : (scan - back));
+    const uint32_t off = size - back - want + want;  // 简化：直接按块读
+    (void)off;
+    const uint32_t start = (size >= back + want) ? (size - back - want) : 0;
+    if (!f.seek(start)) break;
+    const size_t got = f.read(tail, want);
+    for (size_t i = got >= 4 ? got - 4 : 0; i + 4 <= got; ++i) {
+      if (tail[i] == 0x50 && tail[i + 1] == 0x4b && tail[i + 2] == 0x05 && tail[i + 3] == 0x06) {
+        eocd = start + static_cast<uint32_t>(i);
+        found = true;
+        break;
+      }
+      if (got < 4) break;
+    }
+    if (found) break;
+  }
+  if (!found) { f.close(); err = "not_a_zip"; return false; }
+
+  uint8_t e[22];
+  if (!f.seek(eocd) || f.read(e, 22) != 22) { f.close(); err = "eocd_read_failed"; return false; }
+  const uint16_t entryCount = static_cast<uint16_t>(e[10] | (e[11] << 8));
+  const uint32_t cdSize = static_cast<uint32_t>(e[12] | (e[13] << 8) | (e[14] << 16) | (e[15] << 24));
+  const uint32_t cdOffset = static_cast<uint32_t>(e[16] | (e[17] << 8) | (e[18] << 16) | (e[19] << 24));
+  if (entryCount == 0 || entryCount > 2048 || cdOffset >= size || cdSize > size) {
+    f.close(); err = "bad_central_dir"; return false;
+  }
+
+  // 2) 遍历中央目录，找 manifest.json
+  uint16_t method = 0xffff;
+  uint32_t compSize = 0, localHeader = 0;
+  uint32_t cursor = cdOffset;
+  char name[96];
+  for (uint16_t i = 0; i < entryCount; ++i) {
+    uint8_t h[46];
+    if (!f.seek(cursor) || f.read(h, 46) != 46) break;
+    if (!(h[0] == 0x50 && h[1] == 0x4b && h[2] == 0x01 && h[3] == 0x02)) break;
+    const uint16_t m = static_cast<uint16_t>(h[10] | (h[11] << 8));
+    const uint32_t cs = static_cast<uint32_t>(h[20] | (h[21] << 8) | (h[22] << 16) | (h[23] << 24));
+    const uint16_t nameLen = static_cast<uint16_t>(h[28] | (h[29] << 8));
+    const uint16_t extraLen = static_cast<uint16_t>(h[30] | (h[31] << 8));
+    const uint16_t commentLen = static_cast<uint16_t>(h[32] | (h[33] << 8));
+    const uint32_t lh = static_cast<uint32_t>(h[42] | (h[43] << 8) | (h[44] << 16) | (h[45] << 24));
+
+    if (nameLen > 0 && nameLen < sizeof(name)) {
+      if (f.read(reinterpret_cast<uint8_t*>(name), nameLen) == nameLen) {
+        name[nameLen] = 0;
+        const char* base = strrchr(name, '/');
+        const char* leaf = base ? base + 1 : name;
+        if (strcmp(leaf, "manifest.json") == 0) {
+          method = m; compSize = cs; localHeader = lh;
+          break;
+        }
+      }
+    }
+    cursor += 46u + nameLen + extraLen + commentLen;
+  }
+  if (method == 0xffff) { f.close(); err = "manifest_missing"; return false; }
+  if (compSize == 0 || compSize > 65536) { f.close(); err = "manifest_too_large"; return false; }
+
+  // 3) 定位真实数据起点（本地头里的名字/扩展长度可能和中央目录不同）
+  uint8_t lh[30];
+  if (!f.seek(localHeader) || f.read(lh, 30) != 30) { f.close(); err = "local_header_failed"; return false; }
+  if (!(lh[0] == 0x50 && lh[1] == 0x4b && lh[2] == 0x03 && lh[3] == 0x04)) {
+    f.close(); err = "bad_local_header"; return false;
+  }
+  const uint16_t lNameLen = static_cast<uint16_t>(lh[26] | (lh[27] << 8));
+  const uint16_t lExtraLen = static_cast<uint16_t>(lh[28] | (lh[29] << 8));
+  const uint32_t dataOffset = localHeader + 30u + lNameLen + lExtraLen;
+  if (dataOffset + compSize > size) { f.close(); err = "manifest_out_of_range"; return false; }
+
+  uint8_t* raw = static_cast<uint8_t*>(malloc(compSize));
+  if (!raw) { f.close(); err = "out_of_memory"; return false; }
+  if (!f.seek(dataOffset) || f.read(raw, compSize) != compSize) {
+    free(raw); f.close(); err = "manifest_read_failed"; return false;
+  }
+  f.close();
+
+  char* text = nullptr;
+  if (method == 0) {
+    text = reinterpret_cast<char*>(raw);
+    raw = nullptr;
+  } else if (method == 8) {
+    // deflate：输出缓冲按 32 KB 预留，manifest 实际远小于这个
+    const size_t outCap = 32768;
+    uint8_t* out = static_cast<uint8_t*>(malloc(outCap));
+    if (!out) { free(raw); err = "out_of_memory"; return false; }
+    const size_t got = tinfl_decompress_mem_to_mem(out, outCap, raw, compSize, 0);
+    free(raw);
+    if (got == 0 || got == static_cast<size_t>(-1)) { free(out); err = "inflate_failed"; return false; }
+    text = reinterpret_cast<char*>(out);
+  } else {
+    free(raw);
+    err = "unsupported_compression";
+    return false;
+  }
+
+  // 4) 取 package / versionCode / name
+  JsonDocument doc;
+  const DeserializationError jerr = deserializeJson(doc, text);
+  if (jerr) { free(text); err = "manifest_json_invalid"; return false; }
+
+  const char* pkg = doc["package"] | "";
+  if (!pkg[0]) { free(text); err = "manifest_package_missing"; return false; }
+  strncpy(outPkg, pkg, pkgCap - 1);
+  outPkg[pkgCap - 1] = 0;
+
+  uint32_t vc = doc["versionCode"] | 0;
+  if (vc == 0) {
+    // 部分包只给 versionName（"1.0.3"），取首段做兜底
+    const char* vn = doc["versionName"] | "";
+    vc = static_cast<uint32_t>(atoi(vn));
+    if (vc == 0) vc = 1;
+  }
+  outVersionCode = vc;
+
+  const char* nm = doc["name"] | "";
+  if (nm[0]) {
+    strncpy(outName, nm, nameCap - 1);
+    outName[nameCap - 1] = 0;
+  } else {
+    strncpy(outName, outPkg, nameCap - 1);
+    outName[nameCap - 1] = 0;
+  }
+
+  free(text);
+  err = nullptr;
+  return true;
+}
+
+}  // namespace wfi
 
 void setupRoutes() {
   const char* keys[] = {"Authorization", "X-Vela-Token"};
@@ -7873,6 +8937,280 @@ void setupRoutes() {
   // 之前它落到 onNotFound：非配网模式下回一段 JSON 404，
   // 有些手机浏览器会把这个 404 当成"站点内容异常"的判据之一，
   // 干脆回一个 204 让它彻底闭嘴（不产生"缺图标"提示，也不进 404 日志）。
+  // =========================================================================
+  // 表盘 / 快应用：上传、列表、安装、进度、删除
+  // -------------------------------------------------------------------------
+  // 文件落 SPIFFS，命名固定成 /W<槽>.bin（表盘）和 /A<槽>.rpk（快应用）。
+  // SPIFFS 的对象名上限很短，所以只用单字符槽位，展示名在列表时现解析
+  // （表盘读 0x68 的名字字段，快应用读 manifest.json 的 name）。
+  // =========================================================================
+  server.on("/api/v1/resource/list", HTTP_GET, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    JsonDocument d;
+    d["ok"] = true;
+    d["bridgeRunning"] = gWatchBridgeRunning;
+
+    JsonObject usage = d["usage"].to<JsonObject>();
+    usage["total"] = static_cast<uint32_t>(SPIFFS.totalBytes());
+    usage["used"] = static_cast<uint32_t>(SPIFFS.usedBytes());
+
+    JsonArray items = d["items"].to<JsonArray>();
+    File root = SPIFFS.open("/");
+    if (root) {
+      File f = root.openNextFile();
+      while (f) {
+        const String name = f.name();
+        const uint32_t size = static_cast<uint32_t>(f.size());
+        f.close();
+        const char* base = name.c_str();
+        if (base[0] == '/') ++base;
+        const bool isWf = base[0] == 'W';
+        const bool isApp = base[0] == 'A';
+        if ((isWf || isApp) && strlen(base) == 5) {
+          JsonObject o = items.add<JsonObject>();
+          o["slot"] = String(base, 2);
+          o["kind"] = isWf ? "watchface" : "app";
+          o["bytes"] = size;
+          char label[40] = {0};
+          if (isWf) {
+            char id[16] = {0};
+            const char* err = nullptr;
+            const String full = String("/") + base;
+            if (wfi::parseWatchfaceMeta(full.c_str(), id, sizeof(id),
+                                        label, sizeof(label), err)) {
+              o["watchfaceId"] = id;
+            }
+          } else {
+            char pkg[48] = {0};
+            uint32_t vc = 0;
+            const char* err = nullptr;
+            const String full = String("/") + base;
+            if (wfi::parseRpkManifest(full.c_str(), pkg, sizeof(pkg), vc,
+                                      label, sizeof(label), err)) {
+              o["package"] = pkg;
+              o["versionCode"] = vc;
+            }
+          }
+          o["name"] = label[0] ? label : base;
+        }
+        f = root.openNextFile();
+      }
+      root.close();
+    }
+    JsonObject inst = d["install"].to<JsonObject>();
+    wfi::statusJson(inst);
+    sendJson(200, d);
+  });
+
+  // 上传：WebServer 把文件切成若干块回调，这里直接落 SPIFFS。
+  // 只接受表盘（.bin/.face）和快应用（.rpk），其它扩展名一律拒绝。
+  static File* wfUploadFile = nullptr;
+  static char wfUploadPath[16] = {0};
+  static bool wfUploadFailed = false;
+
+  WebServer::THandlerFunction wfUploadHandler = []() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      wfUploadFailed = true;   // 只有走到 END 才算成功
+      wfUploadPath[0] = 0;
+      const String name = upload.filename;
+      const bool isApp = name.endsWith(".rpk") || name.endsWith(".RPK");
+      const bool isWf = name.endsWith(".bin") || name.endsWith(".face") ||
+                        name.endsWith(".BIN") || name.endsWith(".FACE");
+      if (!isApp && !isWf) {
+        Serial.printf("WF_UPLOAD_REJECT ext name=%s\n", name.c_str());
+        return;
+      }
+      const char prefix = isApp ? 'A' : 'W';
+      const char* ext = isApp ? ".rpk" : ".bin";
+      // 找一个空槽
+      int slot = -1;
+      for (int i = 0; i < 10; ++i) {
+        char probe[12];
+        snprintf(probe, sizeof(probe), "/%c%d%s", prefix, i, ext);
+        if (!SPIFFS.exists(probe)) { slot = i; break; }
+      }
+      if (slot < 0) {
+        Serial.println("WF_UPLOAD_REJECT no_free_slot");
+        return;
+      }
+      snprintf(wfUploadPath, sizeof(wfUploadPath), "/%c%d%s", prefix, slot, ext);
+
+      // 空间检查：留 96 KB 给日志/录音，别把 SPIFFS 撑满
+      const size_t freeBytes = SPIFFS.totalBytes() - SPIFFS.usedBytes();
+      if (upload.totalSize > 0 && upload.totalSize + 96 * 1024 > freeBytes) {
+        Serial.printf("WF_UPLOAD_REJECT no_space need=%u free=%u\n",
+                      static_cast<unsigned>(upload.totalSize),
+                      static_cast<unsigned>(freeBytes));
+        return;
+      }
+      SPIFFS.remove(wfUploadPath);
+      wfUploadFile = new File(SPIFFS.open(wfUploadPath, FILE_WRITE));
+      if (!wfUploadFile || !*wfUploadFile) {
+        Serial.println("WF_UPLOAD_REJECT open_failed");
+        delete wfUploadFile;
+        wfUploadFile = nullptr;
+        return;
+      }
+      Serial.printf("WF_UPLOAD_START path=%s name=%s\n", wfUploadPath, name.c_str());
+      wfUploadFailed = false;
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (!wfUploadFile || !*wfUploadFile) return;
+      if (wfUploadFile->write(upload.buf, upload.currentSize) != upload.currentSize) {
+        wfUploadFailed = true;
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (wfUploadFile) {
+        wfUploadFile->flush();
+        wfUploadFile->close();
+        delete wfUploadFile;
+        wfUploadFile = nullptr;
+      }
+      if (!wfUploadFailed) {
+        Serial.printf("WF_UPLOAD_DONE path=%s bytes=%u\n", wfUploadPath,
+                      static_cast<unsigned>(upload.totalSize));
+      } else {
+        SPIFFS.remove(wfUploadPath);
+        wfUploadPath[0] = 0;
+      }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+      if (wfUploadFile) {
+        wfUploadFile->close();
+        delete wfUploadFile;
+        wfUploadFile = nullptr;
+      }
+      if (wfUploadPath[0]) SPIFFS.remove(wfUploadPath);
+      wfUploadPath[0] = 0;
+      wfUploadFailed = true;
+      Serial.println("WF_UPLOAD_ABORTED");
+    }
+  };
+
+  server.on("/api/v1/resource/upload", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    JsonDocument d;
+    if (wfUploadFailed || !wfUploadPath[0]) {
+      d["ok"] = false;
+      d["error"] = "upload_failed";
+      d["hint"] = "只接受 .bin/.face（表盘）和 .rpk（快应用）；槽位最多 10 个；检查剩余空间";
+      sendJson(200, d);
+      return;
+    }
+    d["ok"] = true;
+    d["slot"] = String(wfUploadPath + 1, 2);
+    d["path"] = wfUploadPath;
+    uint32_t sz = 0;
+    d["bytes"] = wfi::fileInfo(wfUploadPath, sz) ? sz : 0;
+
+    // 紧随其后把元数据解析出来，前端上传完就能直接显示名字
+    char label[40] = {0};
+    const char* err = nullptr;
+    if (wfUploadPath[1] == 'W') {
+      char id[16] = {0};
+      if (wfi::parseWatchfaceMeta(wfUploadPath, id, sizeof(id), label, sizeof(label), err)) {
+        d["watchfaceId"] = id;
+        d["name"] = label;
+      } else {
+        d["ok"] = false;
+        d["error"] = err ? err : "not_a_watchface";
+        d["hint"] = "不是小米表盘文件（头部 magic 应为 5A A5）";
+        SPIFFS.remove(wfUploadPath);
+        wfUploadPath[0] = 0;
+      }
+    } else {
+      char pkg[48] = {0};
+      uint32_t vc = 0;
+      if (wfi::parseRpkManifest(wfUploadPath, pkg, sizeof(pkg), vc, label, sizeof(label), err)) {
+        d["package"] = pkg;
+        d["versionCode"] = vc;
+        d["name"] = label;
+      } else {
+        d["ok"] = false;
+        d["error"] = err ? err : "not_a_quickapp";
+        d["hint"] = "不是快应用包（应为含 manifest.json 的 .rpk）";
+        SPIFFS.remove(wfUploadPath);
+        wfUploadPath[0] = 0;
+      }
+    }
+    wfUploadPath[0] = 0;
+    sendJson(200, d);
+  }, wfUploadHandler);
+
+  server.on("/api/v1/resource/install", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    if (!requireAuth()) return;
+    JsonDocument in;
+    if (deserializeJson(in, server.arg("plain"))) return jsonError(400, "bad_json", "");
+    const String slot = in["slot"] | "";
+    if (slot.length() != 2) return jsonError(400, "bad_slot", "expected like W0 / A1");
+
+    char path[16];
+    const bool isWf = slot[0] == 'W';
+    snprintf(path, sizeof(path), "/%s%s", slot.c_str(), isWf ? ".bin" : ".rpk");
+    if (!SPIFFS.exists(path)) return jsonError(404, "not_found", path);
+
+    if (wfi::busy()) return jsonError(409, "busy", "已有安装任务在跑");
+
+    char label[40] = {0};
+    const char* err = nullptr;
+    char wfId[16] = {0};
+    if (isWf) {
+      if (!wfi::parseWatchfaceMeta(path, wfId, sizeof(wfId), label, sizeof(label), err)) {
+        return jsonError(400, err ? err : "bad_watchface", "");
+      }
+    } else {
+      char pkg[48] = {0};
+      uint32_t vc = 0;
+      if (!wfi::parseRpkManifest(path, pkg, sizeof(pkg), vc, label, sizeof(label), err)) {
+        return jsonError(400, err ? err : "bad_quickapp", "");
+      }
+      strncpy(label, pkg, sizeof(label) - 1);
+    }
+
+    if (!wfi::prepareJob(path, isWf ? wfi::kDataTypeWatchFace : wfi::kDataTypeThirdpartyApp,
+                         label, isWf ? wfId : nullptr, err)) {
+      return jsonError(err && strcmp(err, "busy") == 0 ? 409 : 400,
+                       err ? err : "prepare_failed", "");
+    }
+
+    JsonDocument d;
+    d["ok"] = true;
+    d["state"] = "preparing";
+    d["label"] = label;
+    sendJson(202, d);
+  });
+
+  server.on("/api/v1/resource/status", HTTP_GET, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    JsonDocument d;
+    d["ok"] = true;
+    JsonObject inst = d["install"].to<JsonObject>();
+    wfi::statusJson(inst);
+    sendJson(200, d);
+  });
+
+  server.on("/api/v1/resource/cancel", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    wfi::cancel();
+    JsonDocument d;
+    d["ok"] = true;
+    sendJson(200, d);
+  });
+
+  server.on("/api/v1/resource/delete", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    JsonDocument in;
+    if (deserializeJson(in, server.arg("plain"))) return jsonError(400, "bad_json", "");
+    const String slot = in["slot"] | "";
+    if (slot.length() != 2) return jsonError(400, "bad_slot", "");
+    char path[16];
+    snprintf(path, sizeof(path), "/%s%s", slot.c_str(), slot[0] == 'W' ? ".bin" : ".rpk");
+    const bool gone = SPIFFS.remove(path);
+    JsonDocument d;
+    d["ok"] = gone;
+    sendJson(200, d);
+  });
+
   server.on("/favicon.ico", HTTP_GET, [](){
     server.send(204, "image/x-icon", "");
   });

@@ -4,7 +4,7 @@
 
 面向 **16MB Flash** 的 ESP32（ESP32-WROVER-E N16R8 / YD-ESP32-B）。管理台是手机能直接用的网页，连上就能配置 Wi-Fi、刷固件、看状态。
 
-**当前版本 `v0.0.0.5`** · 技术预览 · RAM 22.5%（73,720 / 327,680 B）· Flash 25.1%（1,578,448 / 6,291,456 B）
+**当前版本 `v0.0.0.12`** · 技术预览 · Flash 25.4%（1,599,536 / 6,291,456 B）
 
 ---
 
@@ -14,8 +14,8 @@
 
 | 场景 | 文件 | 地址 |
 |---|---|---|
-| **首次 / 救砖** | [`firmware/vela-gateway-v0.0.0.5-esp32-16mb-factory.bin`](firmware/) | `0x0` |
-| 网页 OTA 升级 | [`firmware/vela-gateway-v0.0.0.5-esp32-16mb-ota.bin`](firmware/) | `0x20000` |
+| **首次 / 救砖** | [`firmware/vela-gateway-v0.0.0.12-esp32-16mb-factory.bin`](firmware/) | `0x0` |
+| 网页 OTA 升级 | [`firmware/vela-gateway-v0.0.0.12-esp32-16mb-ota.bin`](firmware/) | `0x20000` |
 
 factory 是整包（bootloader + 分区表 + otadata + app），**只刷这一个、地址填 `0x0`**，分区表不用管。
 
@@ -29,6 +29,12 @@ factory 是整包（bootloader + 分区表 + otadata + app），**只刷这一�
 4. 连上后改用路由器分配的 IP 打开同一个管理台（路由器后台能查到）
 
 热点名和密码都能在管理台里改。
+
+### 装表盘 / 快应用
+
+管理台「资源」标签能把手表表盘（`.bin` / `.face`）和快应用（`.rpk`）装进去：文件先上传到网关 Flash，再由网关走蓝牙 Mass 通道分片推给手表。装的时候回程网络会暂停几秒，手表 TCP 自动重传。
+
+详见 [docs/表盘安装.md](docs/表盘安装.md)。
 
 > 连不上 Wi-Fi 时会自动开热点让你重配，**不会清空已有配置**。要清空得手动点「恢复出厂」。
 
@@ -70,7 +76,7 @@ python3 tools/bump_version.py --set v0.0.0.7
 src/          固件源码
 tools/        构建钩子、校验、回归测试、版本工具
 firmware/     当前版本固件
-docs/         刷写说明、管理台截图
+docs/         刷写说明、表盘安装、管理台截图
 partitions_ota_16mb.csv
 platformio.ini
 version.txt   版本号唯一真源

@@ -139,6 +139,18 @@ def fix_otadata(source, target, env):
             print("[webui] 管理台页面发送回归测试未通过 —— "
                   "检查 sendMainWebUi() 的流式发送与 UTF-8 切块边界")
 
+    # 表盘/快应用安装协议回归测试。
+    # protobuf 字段号写错不会编译报错，只会让手表静默不理你，所以必须靠常量
+    # 级校验把关键数字钉死在这里。
+    wf = Path(env.subst("$PROJECT_DIR")) / "tools" / "test_watchface_install.py"
+    if wf.exists():
+        r = subprocess.run(["python3", str(wf)], capture_output=True, text=True)
+        print(r.stdout.rstrip())
+        if r.returncode != 0:
+            print(r.stderr.rstrip())
+            print("[wfi] 表盘安装协议回归测试未通过 —— "
+                  "检查 namespace wfi 的 WearPacket 字段号与分片算法")
+
     # 标记这次版本已出包（下次源码不变就不会再递进版本号）
     sys.path.insert(0, str(Path(env.subst("$PROJECT_DIR")) / "tools"))
     try:
