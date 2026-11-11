@@ -7816,6 +7816,33 @@ void parsePrepareReply(const uint8_t* pb, size_t len, bool massSide,
   }
 }
 
+// ---- Mass 数据通道应答位置无关探测 ---------------------------------------
+// mass_prepare 的应答只有设备会给，字段号一旦对不上就卡在 mass_prepare_timeout，
+// 看不出是哪一层错。这里把所有候选状态的字节位置都扫出来打一遍，并且刻意
+// **不依赖** Mass{2}/PrepareResponse 这层包装 —— 包装层猜错也能看到线索。
+void dumpPrepareReply(const uint8_t* pb, size_t len, const char* tag) {
+  Serial.printf("WF_INSTALL_PREPARE_RAW %s len=%u ", tag, static_cast<unsigned>(len));
+  for (size_t i = 0; i < len && i < 96; ++i) Serial.printf("%02X", pb[i]);
+  Serial.println();
+
+  const uint32_t fields[] = {kWpFieldWatchFace, kWpFieldThirdpartyApp, kWpFieldMass};
+  for (uint32_t f : fields) {
+    const uint8_t* body = nullptr;
+    size_t bodyLen = 0;
+    if (!protoBytesField(pb, len, f, body, bodyLen)) continue;
+    Serial.printf("WF_INSTALL_PREPARE_SUB field=%u len=%u ",
+                  static_cast<unsigned>(f), static_cast<unsigned>(bodyLen));
+    for (size_t i = 0; i < bodyLen && i < 64; ++i) Serial.printf("%02X", body[i]);
+    Serial.println();
+    // 每个子字节串都当作候选状态源扫一遍，位置无关
+    for (size_t i = 0; i < bodyLen && i < 24; ++i) {
+      Serial.printf("WF_INSTALL_CAND sub=%u off=%u=%u\n",
+                    static_cast<unsigned>(f), static_cast<unsigned>(i),
+                    static_cast<unsigned>(body[i]));
+    }
+  }
+}
+
 // ---- 虚拟数据流 -----------------------------------------------------------
 // 发送时文件不整体进内存：block = header(22) + file + crc(4)，
 // 每次只按偏移把需要的那一段读出来。
@@ -8109,9 +8136,7 @@ void onProto(uint32_t pbType, uint32_t pbId, const uint8_t* pb, size_t pbLen) {
     parsePrepareReply(pb, pbLen, false, status, slice, haveStatus);
     if (!haveStatus) {
       // 字段号和预期不一致：把原始内容打出来，方便现场比对不同机型的定义
-      Serial.print("WF_INSTALL_PREPARE_RAW ");
-      for (size_t i = 0; i < pbLen && i < 96; ++i) Serial.printf("%02X", pb[i]);
-      Serial.println();
+      dumpPrepareReply(pb, pbLen, "wf");
       return;
     }
     if (status != 0) {
@@ -8137,6 +8162,8 @@ void onProto(uint32_t pbType, uint32_t pbId, const uint8_t* pb, size_t pbLen) {
     parsePrepareReply(pb, pbLen, true, status, slice, haveStatus);
     if (!haveStatus || status != 0) {
       gPausedNetwork = false;
+      // 这里是全流程里最可能对不上的一步（字段号靠推的），无条件打原始回包
+      dumpPrepareReply(pb, pbLen, "mass");
       char msg[64];
       snprintf(msg, sizeof(msg), "mass_prepare_failed status=%ld", static_cast<long>(status));
       fail(msg);

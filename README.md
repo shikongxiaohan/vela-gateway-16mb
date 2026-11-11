@@ -4,7 +4,7 @@
 
 面向 **16MB Flash** 的 ESP32（ESP32-WROVER-E N16R8 / YD-ESP32-B）。管理台是手机能直接用的网页，连上就能配置 Wi-Fi、刷固件、看状态。
 
-**当前版本 `v0.0.0.12`** · 技术预览 · Flash 25.4%（1,599,536 / 6,291,456 B）
+**当前版本 `v0.0.0.13`** · 技术预览 · Flash 25.4%（1,599,856 / 6,291,456 B）
 
 ---
 
@@ -14,8 +14,8 @@
 
 | 场景 | 文件 | 地址 |
 |---|---|---|
-| **首次 / 救砖** | [`firmware/vela-gateway-v0.0.0.12-esp32-16mb-factory.bin`](firmware/) | `0x0` |
-| 网页 OTA 升级 | [`firmware/vela-gateway-v0.0.0.12-esp32-16mb-ota.bin`](firmware/) | `0x20000` |
+| **首次 / 救砖** | [`firmware/vela-gateway-v0.0.0.13-esp32-16mb-factory.bin`](firmware/) | `0x0` |
+| 网页 OTA 升级 | [`firmware/vela-gateway-v0.0.0.13-esp32-16mb-ota.bin`](firmware/) | `0x20000` |
 
 factory 是整包（bootloader + 分区表 + otadata + app），**只刷这一个、地址填 `0x0`**，分区表不用管。
 
