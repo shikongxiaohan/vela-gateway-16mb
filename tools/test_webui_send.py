@@ -188,21 +188,20 @@ def main() -> int:
             SEND_SRC = m.group(1)
 
     # C. UTF-8 不被切断
-    # I. 占位符匹配不能直接读写 PROGMEM 指针
-    #    真机上 len / memcmp 作用在 flash 地址上会直接崩（Guru Meditation），
-    #    而 host 上不会有任何报错 —— 只能做静态检查。
+    # I. 不能为了比较占位符而额外分配一整页 RAM 副本
+    #    ESP32 是统一地址空间，PROGMEM 只是空宏，.rodata 直接映射可读，
+    #    所以 memcmp(kWebUi + i, ...) 本来就是合法操作。
+    #    反过来，真去 malloc(total) 拷一份 49KB 副本才是坑：
+    #    实机空闲堆只有 50 多 KB，多占 49KB 会把 WiFi + 蓝牙并发挤爆，
+    #    分配失败就发不出页面了。
     if SEND_SRC is None:
         check(False, "找不到 sendMainWebUi() 实现")
     else:
-        bad = re.findall(r"(?:strncmp|strcmp|memcmp|strstr|strchr)\(\s*kWebUi"
-                         r"|(?:strncmp_P|memcmp_P|strstr_P)\(\s*kWebUi", SEND_SRC)
-        check(not bad, "占位符匹配没有直接对 kWebUi（PROGMEM）做字符串比较"
-                       + (f"：{bad[:2]}" if bad else ""))
-        check("pgm_read_dword" in SEND_SRC or "memcpy_P" in SEND_SRC,
-              "页面文本按 pgm_read_* / memcpy_P 取到 RAM")
-        check("free(page)" in SEND_SRC, "RAM 副本用完释放（不泄漏）")
-        check("out of memory" in SEND_SRC,
-              "RAM 副本分配失败时回 500，而不是发出空页面")
+        page_alloc = re.search(r"malloc\s*\(\s*total", SEND_SRC)
+        check(page_alloc is None,
+              "没有为整页文本 malloc 副本（实机空闲堆仅 50 余 KB，白占 49KB 会挤爆）")
+        check("memcmp(" in SEND_SRC or "memcmp_P(" in SEND_SRC,
+              "占位符比较直接在 kWebUi 上做（ESP32 统一地址空间，无需拷贝）")
 
     print()
     if fails:

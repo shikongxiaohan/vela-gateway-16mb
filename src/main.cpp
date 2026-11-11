@@ -7199,35 +7199,16 @@ void handleStatus(bool publicSetup) {
 // 现在改成**流式发送**：先只读扫描一遍算准 Content-Length，再按 ≤1KB
 // 分块 sendContent，不组装 49KB 的替换结果，也不会一次性压 49KB 给 TCP。
 //
-// kWebUi 在 PROGMEM 上，不能直接 memcmp —— 拿不到映射地址
-// （真机上会把 flash 地址当数据地址读，直接 Guru Meditation）。
-// 页面约 49KB，固件远没有到 flash 上限，所以按需 malloc 一份 RAM 副本。
-// 两个细节：
-//   1) 用 4 字节粒度只读（pgm_read_dword），别让编译器生成 memcpy 去读 flash；
-//   2) 分配失败就直接回 500，别退化成一个空页面 —— 那正是手机显示
-//      「该站点没有有效内容」的样子，宁可报错也不装死。
+// kWebUi 声明成 PROGMEM，但 ESP32 是统一地址空间：PROGMEM 是空宏，
+// .rodata 被直接映射到数据总线可读地址，所以下面把 kWebUi 当普通指针用
+// （memcmp / page[i]）是合法的。AVR 那套 "必须走 pgm_read_*" 的规矩在
+// ESP32 上不成立，别照搬 —— 真按那样改成 malloc 一整页副本，反而会白吃
+// 49KB 堆，把本来就只剩 50 多 KB 的余量压死。
 static void sendMainWebUi() {
   const size_t total = strlen_P(kWebUi);
   if (total == 0) {
     server.send(500, "text/plain; charset=utf-8", "web ui missing");
     return;
-  }
-
-  char* page = static_cast<char*>(malloc(total + 4));
-  if (!page) {
-    server.send(500, "text/plain; charset=utf-8", "web ui: out of memory");
-    Serial.printf("[WEBUI] 页面文本分配失败（%u B），可用堆 %u B\n",
-                  static_cast<unsigned>(total + 4),
-                  static_cast<unsigned>(ESP.getFreeHeap()));
-    return;
-  }
-  {
-    uint32_t* dst = reinterpret_cast<uint32_t*>(page);
-    const size_t words = (total + 3) / 4;
-    for (size_t w = 0; w < words; ++w) {
-      dst[w] = pgm_read_dword(reinterpret_cast<const uint32_t*>(kWebUi) + w);
-    }
-    page[total] = '\0';   // 覆盖 dword 尾部的填充字节
   }
 
   // 占位符替换表。顺序即扫描顺序，越长的放越前面（__PH_VERFULL__ 不能被
@@ -7251,7 +7232,7 @@ static void sendMainWebUi() {
   // 这一步只做计数，不分配整页缓冲。
   size_t outLen = 0;
   {
-    const char* p = page;
+    const char* p = kWebUi;
     const size_t n = total;
     size_t i = 0;
     while (i < n) {
@@ -7293,7 +7274,7 @@ static void sendMainWebUi() {
     bool hit = false;
     for (size_t k = 0; k < kSubCount; ++k) {
       const size_t tlen = strlen(subs[k].token);
-      if (i + tlen <= total && memcmp(page + i, subs[k].token, tlen) == 0) {
+      if (i + tlen <= total && memcmp(kWebUi + i, subs[k].token, tlen) == 0) {
         flush();     // 占位符值单独发，可能会超过缓冲
         const String& v = subs[k].value;
         if (v.length() > 0) server.sendContent(v.c_str(), v.length());
@@ -7316,12 +7297,10 @@ static void sendMainWebUi() {
         flush();
       }
     }
-    buf[used++] = page[i];
+    buf[used++] = static_cast<char>(pgm_read_byte(kWebUi + i));
     ++i;
   }
   flush();
-  free(page);
-  page = nullptr;
 }
 
 void setupRoutes() {
