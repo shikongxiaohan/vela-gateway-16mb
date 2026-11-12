@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""检查「固件升级」与「向手表推一条消息」两个功能不会假装成功。
+"""检查「固件升级」不会假装成功，以及已下线的两个功能没有偷偷回潮。
 
-背景（两个真实踩过的坑）：
-  1. 网页升级出现过「页面说刷写完成，设备重启后版本没变」。原因分两层：
-     路由注册漏掉上传回调时 multipart 数据被静默丢弃；页面在传输结束后立刻
-     显示完成，而设备侧根本没写进去。现在的约定是：镜像头不合格在前端就拦住，
-     中断要报出落在第几个百分点，设备端把上传阶段记下来备查。
-  2. 推送接口以前只要入队就回 ok=true，页面弹「已加入队列」，真正发没发出去
-     只有会话线程知道。现在接口只负责入队，结果由 /api/v1/watch/push/result
-     查询。
+背景：
+  网页升级出现过「页面说刷写完成，设备重启后版本没变」。原因分两层：
+  路由注册漏掉上传回调时 multipart 数据被静默丢弃；页面在传输结束后立刻
+  显示完成，而设备侧根本没写进去。现在的约定是：镜像头不合格在前端就拦住，
+  中断要报出落在第几个百分点，设备端把上传阶段记下来备查。
 
 页面结构在 v0.0.0.31 调整过：系统页的直写升级入口已删除，网页升级统一走
 「设置 → 固件升级 → 进入空中升级」，刷写页面是 kOtaWebUi（POST /ota/upload2）。
 因此前端的镜像头校验、进度、中断提示要在这份页面里检查。
+
+v0.0.0.35 删除了「向手表推一条消息」与板载 RGB 灯配置：前者在手表端没有
+可见效果，后者在这块板子上逐个引脚试过都不亮。这里的反向检查防止它们
+被重新引入。
 
 检查项：
   1. /ota/upload2 与 /api/v1/ota/upload 都注册了上传回调
@@ -21,8 +22,8 @@
   4. 升级页的中断 / 失败 / 进度都有可见文案
   5. 主页面不再有第二条未经校验的固件上传路径
   6. 主页面「重启设备」与升级卡片分开，不随升级入口一起失效
-  7. /api/v1/watch/push 不再返回「入队即成功」，结果单独查询
-  8. 投递函数在成功与失败两条路径上都写结果
+  7. 推送接口、状态机与投递函数均已移除
+  8. 板载 RGB 灯与灯效接口均已移除
 """
 import re
 import sys
@@ -144,23 +145,18 @@ def main() -> int:
         check(upgrade is not None and 'data-arg="6"' in upgrade.group(1),
               "「设置」页保留进入空中升级的入口")
 
-    # ---- 7. 推送不再「入队即成功」 ----
-    mp = re.search(r'server\.on\("/api/v1/watch/push",\s*HTTP_POST.*?\n  \}\);', text, re.S)
-    check(mp is not None, "存在 /api/v1/watch/push")
-    if mp:
-        body = mp.group(0)
-        check("queued" in body, "推送接口只报告是否入队")
-        check("sendEncryptedWatchPb" not in body, "推送接口不在 HTTP 线程里直接发蓝牙帧")
-    check('"/api/v1/watch/push/result"' in text, "存在 /api/v1/watch/push/result 结果查询")
-    check("gPushTaskState" in text, "推送结果用 gPushTaskState 记录")
+    # ---- 7. 推送功能已移除 ----
+    check("/api/v1/watch/push" not in text, "推送接口已移除")
+    check("gPushTaskState" not in text, "推送结果状态机已移除")
+    check("flushPendingWatchText" not in text, "推送投递函数已移除")
+    check("PUSH_QUEUED" not in text, "推送日志标记已移除")
 
-    # ---- 8. 投递函数两条路径都写结果 ----
-    fbody = balanced_body(text, r"bool flushPendingWatchText\([^)]*\)\s*\{")
-    check(fbody is not None, "存在 flushPendingWatchText()")
-    if fbody:
-        check("pushWatchSuccess" in fbody, "投递成功写入结果")
-        check("pushWatchFail" in fbody, "投递失败写入原因")
-        check("gPendingWatchTextReady = true" in fbody, "投递失败保留在队列里重试")
+    # ---- 8. 板载 RGB 灯已移除 ----
+    check("rgbLedPush" not in text, "WS2812 驱动已移除")
+    check("/api/v1/led/" not in text, "灯效接口已移除")
+    check("kRgbLedCandidates" not in text, "引脚扫描表已移除")
+    if main_ui:
+        check("板载 RGB 灯" not in main_ui, "设置页不再有灯效卡片")
 
     print()
     for ok, msg in checks:
@@ -170,7 +166,7 @@ def main() -> int:
         print(f"[FAIL] {len(fails)} 项未通过：")
         for f in fails:
             print("  - " + f)
-        print("\n[ota-push] 检查未通过")
+        print("\n[ota] 检查未通过")
         return 1
     print(f"全部通过（{len(checks)} 项）")
     return 0
