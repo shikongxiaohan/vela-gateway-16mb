@@ -3,7 +3,7 @@
 # 为什么单独一个文件：
 #   版本号必须在**编译之前**定下来（src/vela_version.h 要被 main.cpp 包含），
 #   而 PlatformIO 的 extra_scripts 是 pre: 阶段加载的，正好在编译之前跑。
-#   放在 pio_verify.py 的 AddPreAction 里就晚了 —— 那时 .o 可能已经编完。
+#   放在 pio_verify.py 的 AddPreAction 里就晚了，那时 .o 可能已经编完。
 #
 # 递进规则（详见 tools/version_util.py）：
 #   * 唯一真源是根目录 version.txt（v0.0.0.0002 这种四位修订号）

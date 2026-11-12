@@ -3,6 +3,7 @@ chcp 65001 >nul
 REM YD-ESP32 16MB 固件刷写脚本（首次换分区表必须整片擦除）
 REM 用法: flash_16mb.bat [COM口] [镜像文件]
 REM 例:   flash_16mb.bat COM3
+REM 不指定镜像时自动取 firmware\ 下最新的 *-factory.bin
 REM 依赖: pip install esptool
 
 setlocal
@@ -12,7 +13,11 @@ set PORT=%1
 if "%PORT%"=="" set PORT=COM3
 
 set IMG=%2
-if "%IMG%"=="" set IMG=firmware\vela-gateway-v0.0.0.1-esp32-16mb-factory.bin
+if "%IMG%"=="" (
+  for /f "delims=" %%F in ('dir /b /o-d "firmware\*-factory.bin" 2^>nul') do (
+    if not defined IMG set IMG=firmware\%%F
+  )
+)
 
 if not exist "%IMG%" goto missing
 
@@ -46,7 +51,7 @@ exit /b 0
 
 :missing
 echo 找不到镜像 %IMG%
-echo 请确认 firmware\vela-gateway-v0.0.0.1-esp32-16mb-factory.bin 存在，或先运行 pio run -e yd_esp32_16mb
+echo 请确认 firmware\ 下有 *-factory.bin，或先运行 pio run -e yd_esp32_16mb
 pause
 exit /b 1
 

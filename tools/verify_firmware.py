@@ -50,7 +50,7 @@ def parse_partitions(blob):
 def check_otadata(od, parts):
     """otadata 必须含至少一条合法记录，否则 bootloader 找不到可启动分区。"""
     if all(x == 0xFF for x in od):
-        fail("otadata 全 0xFF（未初始化）——设备会每 2 秒复位一次")
+        fail("otadata 全 0xFF（未初始化），设备会每 2 秒复位一次")
         print("     修复：cp $ARDUINO/tools/partitions/boot_app0.bin firmware/ota_data_initial.bin")
         return
     # 两个 4KB 扇区，各含一条记录
@@ -184,7 +184,7 @@ def main():
     if ok:
         print("全部通过 ✓")
         return 0
-    print("存在问题 ✗ —— 请先修复再烧录")
+    print("存在问题 ✗，先修好再烧")
     return 1
 
 

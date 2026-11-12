@@ -22,8 +22,8 @@ NVS 是否被清"三个指标卡住回归：不修复的话复位次数会发散
 
 import sys
 
-FACT_MAGIC = 0x46414354  # "FACT" —— 主动恢复出厂：清空全部用户配置
-SEPU_MAGIC = 0x53455055  # "SEPU" —— 自动降级：只进配网，不清配置
+FACT_MAGIC = 0x46414354  # "FACT": 主动恢复出厂，清空全部用户配置
+SEPU_MAGIC = 0x53455055  # "SEPU": 自动降级，只进配网，不清配置
 
 
 class FactoryResetSim:

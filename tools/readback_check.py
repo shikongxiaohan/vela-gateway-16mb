@@ -2,7 +2,7 @@
 """
 读回设备 flash 的关键扇区，直接看清设备里到底躺着什么。
 
-用途：刷完固件设备起不来时，用它区分两种情况——
+用途：刷完固件设备起不来时，用它分清是哪一种情况：
   a) 刷的是旧文件 / 文件本身有问题
   b) 刷了但没擦除，或地址填错，导致设备里的内容不对
 
@@ -111,7 +111,7 @@ def check(data, expect, label, report):
         allff = all(b == 0xFF for b in data)
         crc = int.from_bytes(data[0x1C:0x20], "little")
         if allff:
-            report.append((False, "otadata 全 0xFF —— 未初始化，bootloader 无处可启动（这就是每 2 秒复位的原因）"))
+            report.append((False, "otadata 全 0xFF，没初始化，bootloader 找不到可启动分区（每 2 秒复位就是这个原因）"))
             return False
         if seq not in (1, 2, 0xFFFFFFFF):
             report.append((False, f"otadata ota_seq={seq} 不是合法值"))
@@ -122,7 +122,7 @@ def check(data, expect, label, report):
     if expect == "app":
         magic = data[0]
         if magic != 0xE9:
-            report.append((False, f"app 镜像头 magic=0x{magic:02x} 不是 0xE9 —— 0x{ADDR_APP:X} 处没有 app"))
+            report.append((False, f"app 镜像头 magic=0x{magic:02x} 不是 0xE9，0x{ADDR_APP:X} 处没有 app"))
             return False
         entry = int.from_bytes(data[4:8], "little")
         segc = data[1]          # 段数在偏移 1（偏移 23 是 hash_appended）
@@ -134,7 +134,7 @@ def check(data, expect, label, report):
         return True
     if expect == "bootloader":
         if data[0] != 0xE9:
-            report.append((False, f"bootloader magic=0x{data[0]:02x} 不是 0xE9 —— 0x{ADDR_BOOTLOADER:X} 处没有 bootloader"))
+            report.append((False, f"bootloader magic=0x{data[0]:02x} 不是 0xE9，0x{ADDR_BOOTLOADER:X} 处没有 bootloader"))
             return False
         entry = int.from_bytes(data[4:8], "little")
         segs = _segments(data)
@@ -146,13 +146,13 @@ def check(data, expect, label, report):
             report.append((False, desc))
             report.append((False,
                 f"  ↑ 设备里的 bootloader 不是我们这份（本地 firmware/bootloader.bin 的 "
-                f"entry=0x{exp:08x}）—— 0x{ADDR_BOOTLOADER:X} 上是别的项目的二级 bootloader"))
+                f"entry=0x{exp:08x}）。0x{ADDR_BOOTLOADER:X} 上装的是别的项目的二级 bootloader"))
             return False
         report.append((True, desc))
         return True
     if expect == "parttable":
         if data[0] != 0xAA:
-            report.append((False, f"分区表 magic=0x{data[0]:02x} 不是 0xAA —— 0x{ADDR_PARTTABLE:X} 处没有分区表"))
+            report.append((False, f"分区表 magic=0x{data[0]:02x} 不是 0xAA，0x{ADDR_PARTTABLE:X} 处没有分区表"))
             return False
         # ESP-IDF 分区表：条目从 offset 0 开始，每条 32 字节，magic = 0x50AA。
         # esp_partition_t 布局：magic[0:2] type[2] subtype[3] offset[4:8]

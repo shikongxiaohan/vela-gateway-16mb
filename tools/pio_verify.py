@@ -106,7 +106,7 @@ def fix_otadata(source, target, env):
         print(r.stdout.rstrip())
         if r.returncode != 0:
             print(r.stderr.rstrip())
-            print("[factory-reset] 恢复出厂状态机回归测试未通过 —— "
+            print("[factory-reset] 恢复出厂状态机回归测试未通过，检查 FACT/SEPU 两条路径"
                   "检查 setup() 里的 arm 标志处理逻辑")
 
     # 局域网访问后台的鉴权回归测试（防 LAN 打开后台全 401 回归）
@@ -116,7 +116,7 @@ def fix_otadata(source, target, env):
         print(r.stdout.rstrip())
         if r.returncode != 0:
             print(r.stderr.rstrip())
-            print("[lan-admin] 局域网访问后台的鉴权回归测试未通过 —— "
+            print("[lan-admin] 局域网访问后台的鉴权回归测试未通过，检查令牌下发与前端 api() 有没有带 X-Vela-Token"
                   "检查令牌下发（__PH_TOKEN__）与前端 api() 是否带上 X-Vela-Token")
 
     # 版本号自动递进机制的回归测试（防 4 位零填充/跳号/进位回归）
@@ -126,7 +126,7 @@ def fix_otadata(source, target, env):
         print(r.stdout.rstrip())
         if r.returncode != 0:
             print(r.stderr.rstrip())
-            print("[version-bump] 版本号递进回归测试未通过 —— "
+            print("[version-bump] 版本号递进回归测试未通过，检查 tools/version_util.py 的零填充与进位"
                   "检查 tools/version_util.py 的零填充与进位逻辑")
 
     # 管理台页面发送逻辑的回归测试（防 49KB 整页发送导致"站点没有有效内容"）
@@ -136,7 +136,7 @@ def fix_otadata(source, target, env):
         print(r.stdout.rstrip())
         if r.returncode != 0:
             print(r.stderr.rstrip())
-            print("[webui] 管理台页面发送回归测试未通过 —— "
+            print("[webui] 管理台页面发送回归测试未通过，检查 sendMainWebUi() 的流式发送与 UTF-8 切块边界"
                   "检查 sendMainWebUi() 的流式发送与 UTF-8 切块边界")
 
     # 表盘/快应用安装协议回归测试。
@@ -148,8 +148,18 @@ def fix_otadata(source, target, env):
         print(r.stdout.rstrip())
         if r.returncode != 0:
             print(r.stderr.rstrip())
-            print("[wfi] 表盘安装协议回归测试未通过 —— "
+            print("[wfi] 表盘安装协议回归测试未通过，检查 namespace wfi 的字段号与分片算法"
                   "检查 namespace wfi 的 WearPacket 字段号与分片算法")
+
+    # 两个页面内嵌 JS 的语法检查。改文案时少删一个引号，编译照过、页面白屏，
+    # 只有 node --check 能拦住。
+    js = Path(env.subst("$PROJECT_DIR")) / "tools" / "test_webui_js.py"
+    if js.exists():
+        r = subprocess.run(["python3", str(js)], capture_output=True, text=True)
+        print(r.stdout.rstrip())
+        if r.returncode != 0:
+            print(r.stderr.rstrip())
+            print("[webui-js] 页面脚本语法检查未通过，页面会在真机上白屏")
 
     # 标记这次版本已出包（下次源码不变就不会再递进版本号）
     sys.path.insert(0, str(Path(env.subst("$PROJECT_DIR")) / "tools"))

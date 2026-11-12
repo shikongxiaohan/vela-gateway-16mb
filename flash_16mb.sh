@@ -4,16 +4,25 @@
 # 用法：
 #   ./flash_16mb.sh [串口] [镜像文件]
 #   ./flash_16mb.sh /dev/ttyUSB0
-#   ./flash_16mb.sh /dev/ttyUSB1 firmware/vela-gateway-v0.0.0.1-esp32-16mb-factory.bin
+#   ./flash_16mb.sh /dev/ttyUSB1 firmware/vela-gateway-v0.0.0.14-esp32-16mb-factory.bin
 #
-# 默认刷 firmware/vela-gateway-v0.0.0.1-esp32-16mb-factory.bin（已合并 bootloader + 分区表 + otadata + app），
-# 从 0x0 一次写入，等价于官方 "Factory" 镜像。
+# 不指定镜像时，自动取 firmware/ 下最新的 *-factory.bin。factory 已经把
+# bootloader、分区表、otadata、app 合并好了，从 0x0 一次写完，等价官方 Factory 镜像。
 #
 # 依赖：pip install esptool
 set -euo pipefail
 
 PORT="${1:-/dev/ttyUSB0}"
-IMG="${2:-firmware/vela-gateway-v0.0.0.1-esp32-16mb-factory.bin}"
+# 没指定就取最新的 factory 产物。写死版本号的话，下次出包后脚本就找不到文件了。
+if [ -z "${2:-}" ]; then
+  IMG=$(ls -t firmware/*-factory.bin 2>/dev/null | head -1 || true)
+  if [ -z "$IMG" ]; then
+    echo "firmware/ 下没有 *-factory.bin，先跑 pio run -e yd_esp32_16mb" >&2
+    exit 1
+  fi
+else
+  IMG="$2"
+fi
 
 cd "$(dirname "$0")"
 

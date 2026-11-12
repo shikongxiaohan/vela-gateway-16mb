@@ -1,48 +1,50 @@
 # Vela Gateway
 
-把 ESP32 变成手表 / 手环的 Wi-Fi 上网桥。蓝牙 SPP 连手表，Wi-Fi 连路由器，用 lwIP NAPT 把两者桥起来，手表通过它上网。
+让 ESP32 给手表当上网的桥。手表侧走蓝牙 SPP，家里走 Wi-Fi，中间用 lwIP NAPT 把两层接起来。手表不用知道 Wi-Fi 密码，换路由器也只改网关这边。
 
-面向 **16MB Flash** 的 ESP32（ESP32-WROVER-E N16R8 / YD-ESP32-B）。管理台是手机能直接用的网页，连上就能配置 Wi-Fi、刷固件、看状态。
+硬件是 16MB Flash 的 ESP32（ESP32-WROVER-E N16R8 / YD-ESP32-B）。管理台是个手机浏览器能直接开的网页，配 Wi-Fi、刷固件、看状态都在里面。
 
-**当前版本 `v0.0.0.14`** · 技术预览 · RAM 22.6%（74,088 / 327,680 B）· Flash 25.5%（1,605,145 / 6,291,456 B）
+当前版本 v0.0.0.17，RAM 用 22.6%，Flash 用 25.5%。
 
 ---
 
 ## 刷固件
 
-不用装编译环境，直接用 [乐鑫 Flash Download Tool](https://www.espressif.com/en/support/download/other-tools)。
+不用装编译环境，用[乐鑫 Flash Download Tool](https://www.espressif.com/en/support/download/other-tools)就够。
 
 | 场景 | 文件 | 地址 |
 |---|---|---|
-| **首次 / 救砖** | [`firmware/vela-gateway-v0.0.0.14-esp32-16mb-factory.bin`](firmware/) | `0x0` |
-| 网页 OTA 升级 | [`firmware/vela-gateway-v0.0.0.14-esp32-16mb-ota.bin`](firmware/) | `0x20000` |
+| 首次刷 / 救砖 | [`firmware/vela-gateway-v0.0.0.17-esp32-16mb-factory.bin`](firmware/) | `0x0` |
+| 网页 OTA 升级 | [`firmware/vela-gateway-v0.0.0.17-esp32-16mb-ota.bin`](firmware/) | `0x20000` |
 
-factory 是整包（bootloader + 分区表 + otadata + app），**只刷这一个、地址填 `0x0`**，分区表不用管。
+factory 是整包，bootloader、分区表、otadata、app 都在里面，只刷这一个文件、地址填 `0x0`，不用另外管分区表。
 
-历史版本在 [Releases](https://github.com/shikongxiaohan/vela-gateway-16mb/releases)，每个都带 MD5。详细步骤见 [docs/刷写.md](docs/刷写.md)。
+旧版本在 [Releases](https://github.com/shikongxiaohan/vela-gateway-16mb/releases)，都带 MD5。具体步骤见 [docs/刷写.md](docs/刷写.md)。
 
-## 使用
+## 用起来
 
-1. 刷完自动进配网热点 **`Vela-Setup`**，密码 `12345678`
-2. 手机连上，浏览器打开 `http://192.168.4.1`
-3. 选 Wi-Fi、输密码，保存
-4. 连上后改用路由器分配的 IP 打开同一个管理台（路由器后台能查到）
+1. 刷完自动开热点 `Vela-Setup`，密码 `12345678`
+2. 手机连上，浏览器开 `http://192.168.4.1`
+3. 选 Wi-Fi、输密码、保存
+4. 连上以后改用路由器分的 IP 开同一个管理台。IP 在路由器后台能查到
 
-热点名和密码都能在管理台里改。
+热点名和密码都能在管理台改。
+
+连接失败的时候会自动开热点让你重配，已有的配置不会被清掉。想彻底清空得手动点「恢复出厂」。
 
 ### 升级固件
 
-系统页「固件升级」：选 `-ota.bin` 传进设备，列表里点一行选中，再点「升级到选中版本」。设备会自己校验镜像、写进备用分区、重启切过去；新固件起不来会自动退回旧版。
+在系统页。选 `-ota.bin` 传进设备，列表里点一行选中，再点「升级到选中版本」。镜像会先校验一遍，通过了才写进备用分区，写完重启切过去。新固件如果起不来，会自动退回旧版。
 
-整包 `-factory.bin` 网页刷不了（第一个字节是空白 Flash，不是 app 镜像），必须用数据线。
+整包 `-factory.bin` 不能在网页上刷，它的第一个字节是空白 Flash，不是 app 镜像。整包只能走数据线。
 
 ### 装表盘 / 快应用
 
-管理台「资源」标签能把手表表盘（`.bin` / `.face`）和快应用（`.rpk`）装进去：文件先上传到网关 Flash，再由网关走蓝牙 Mass 通道分片推给手表。装的时候回程网络会暂停几秒，手表 TCP 自动重传。
+在「资源」页。表盘是 `.bin` / `.face`，快应用是 `.rpk`。文件先传到网关存着，再由网关通过蓝牙 Mass 通道分片推给手表。
+
+装的过程中网关会暂停回程网络，因为 Mass 通道要独占蓝牙。手表那边的 TCP 会自己重传，装完就恢复。
 
 详见 [docs/表盘安装.md](docs/表盘安装.md)。
-
-> 连不上 Wi-Fi 时会自动开热点让你重配，**不会清空已有配置**。要清空得手动点「恢复出厂」。
 
 ## 编译
 
@@ -50,20 +52,24 @@ factory 是整包（bootloader + 分区表 + otadata + app），**只刷这一�
 pio run -e yd_esp32_16mb
 ```
 
-产物在 `firmware/`。需要 PlatformIO，平台锁在 `espressif32@6.1.0` + ESP-IDF `4.4.4`（见 `platformio.ini`，版本不能随便升）。
+产物落在 `firmware/`。需要 PlatformIO，平台锁在 `espressif32@6.1.0` + ESP-IDF `4.4.4`，见 `platformio.ini`。这组版本不能随便升，升级会踩一堆坑。
 
-构建时自动完成：版本号递进 → 编译 → 修 otadata → 生成 factory/ota → 校验镜像 → 跑回归测试。
+一次构建会自动做完这些：递进版本号、编译、修 otadata、生成 factory 和 ota、校验镜像、跑回归测试。
 
 ## 版本号
 
-`主.次.构建.修订` 四段，如 `v0.0.0.3`。修订号最多 4 位、前导 0 省略，到 9999 进位到构建号。
+四段，主.次.构建.修订，比如 `v0.0.0.3`。修订号最多四位，前导零不补，到 9999 进位到构建号。
 
-**不用手改**。改源码后构建会自动 +1，源码没动则沿用。唯一真源是 `version.txt`，`src/vela_version.h` 由它自动生成。手动调整用：
+平时不用手工改。改了源码，构建时自动 +1；源码没动就沿用。真源是根目录的 `version.txt`，`src/vela_version.h` 从它生成。
+
+要手动调：
 
 ```bash
 python3 tools/bump_version.py --show
 python3 tools/bump_version.py --set v0.0.0.7
 ```
+
+修订号不是每次都对应一个能用的固件。编译失败的次数也算进去了，所以中间会有空号，比如 v0.0.0.6 到 v0.0.0.10 从来没出过包。
 
 ## 分区
 
@@ -72,9 +78,9 @@ python3 tools/bump_version.py --set v0.0.0.7
 | nvs | 20 KB | 配置 |
 | otadata | 8 KB | OTA 启动记录 |
 | ota_0 / ota_1 | 各 6 MB | 双 app 槽，支持回滚 |
-| spiffs | 3.875 MB | 数据 |
+| spiffs | 3.875 MB | 表盘、快应用、固件包 |
 
-固件约 1.5 MB，6 MB 槽位有 4 倍余量。
+固件 1.6 MB 左右，6 MB 的槽有将近四倍余量。
 
 ## 目录
 
@@ -85,7 +91,7 @@ firmware/     当前版本固件
 docs/         刷写说明、表盘安装、管理台截图
 partitions_ota_16mb.csv
 platformio.ini
-version.txt   版本号唯一真源
+version.txt   版本号真源
 ```
 
 ## 许可

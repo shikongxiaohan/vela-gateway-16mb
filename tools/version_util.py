@@ -70,7 +70,7 @@ def read_version():
 
 def render_header(t, build_date: str) -> str:
     major, minor, build, revision = t
-    return f"""// 由 tools/version_util.py 自动生成 —— 请勿手工编辑。
+    return f"""// 由 tools/version_util.py 自动生成，别手工改。
 //
 // 生成来源：version.txt（根目录） + 生成时的日期
 // 版本号：{format_version(t)}
@@ -124,7 +124,7 @@ def artifact_basename(t=None, hardware: str = "esp32-16mb") -> str:
 # ---------------------------------------------------------------------------
 
 # 参与指纹的文件（相对项目根）。注意**不要**把 version.txt 和
-# src/vela_version.h 算进去——它们每次构建都会被改写，算进去就永远"变了"，
+# src/vela_version.h 算进去，它们每次构建都会被改写，算进去就永远"变了"，
 # 结果是每编译一次就多跳一个修订号（实测跳到了 0004）。
 FINGERPRINT_GLOBS = [
     "src/*.cpp",

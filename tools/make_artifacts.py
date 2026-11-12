@@ -128,7 +128,7 @@ def main() -> int:
     print(f"✓ {factory_out.name}  {factory_out.stat().st_size:>10,} B")
 
     # 3) 归档：每个版本都留一份到 firmware-history/
-    #    早期实现是"删掉旧版本产物"，结果回滚时发现历史固件没了 ——
+    #    早期实现是"删掉旧版本产物"，结果回滚时发现历史固件没了。
     #    固件是二进制、不可重建（同样的源码在不同工具链/依赖下出的字节不同），
     #    所以必须每个版本都留着，宁可多占几 MB。
     archive_dir.mkdir(exist_ok=True)

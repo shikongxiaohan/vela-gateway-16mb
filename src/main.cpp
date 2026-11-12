@@ -158,7 +158,7 @@ constexpr char kApSsid[] = "Vela-Setup";
 //   展示形态：v0.0.0.1     （网页徽章、串口横幅、固件文件名）
 //
 // 与 semver 的区别：semver 的 0.x 会把"未发布"当特殊状态，而四段式的
-// 0.0.0.1 含义是直白的——主/次/构建都还是 0，这是第 1 个修订。
+// 0.0.0.1 的含义很直白：主、次、构建都还是 0，这是第 1 个修订。
 // 前三段为 0 只说明"协议未冻结"，不代表不能发布。
 //
 // 修订号**最多 4 位，前导 0 省略**：v0.0.0.1 → v0.0.0.9 → v0.0.0.10
@@ -168,7 +168,7 @@ constexpr char kApSsid[] = "Vela-Setup";
 // 这个修订号是**自动递进**的：
 //   真源是根目录 version.txt，版本号在构建时由 tools/bump_version.py 递增，
 //   再由 tools/version_util.py 生成下面这个头文件。
-//   所以这里不再手写数字——手写的话下次构建就被覆盖了。
+//   所以这里不再手写数字，手写的话下次构建就被覆盖了。
 //
 // 文件名   ：<项目>-v<主>.<次>.<构建>.<修订>-<硬件>-<类型>.bin
 //         例：vela-gateway-v0.0.0.2-esp32-16mb-factory.bin
@@ -1043,7 +1043,7 @@ void renderDisplay() {
   char buf[80];
 
   // 第 1 行：IP（配网模式显示 AP IP 192.168.4.1）
-  // 直接从 IPAddress 的 4 个字节格式化，避免每次刷新都 new 一个 String ——
+  // 直接从 IPAddress 的 4 个字节格式化，省掉每次刷新都 new 一个 String，
   // 那会在 BT 认证→启动 WiFi 的窗口里（loopTask 与桥接任务同在 core 1）
   // 反复申请/释放小块，把堆切碎，导致 esp_wifi_init 因最大连续块不足而 257。
   IPAddress ip = gSetupMode ? WiFi.softAPIP()
@@ -6258,11 +6258,11 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   </div>
   <div class="spark" id="spark"><i style="height:2px"></i></div>
   <div class="legend"><span><em style="background:#2563eb"></em>收到</span><span><em style="background:#059669"></em>发出</span></div>
-  <p class="muted" style="margin:6px 0 0">每 2 秒采一格，共 30 格。柱高按窗口内峰值归一。</p>
+  <p class="muted" style="margin:6px 0 0">每 2 秒采一格，一共 30 格。柱高按这一分钟里的最大值缩放。</p>
 </div>
 
 <div class="card" id="autoCard" style="display:none">
-  <h2>⚠ 连不上 Wi-Fi，将自动开启配网热点</h2>
+  <h2>连不上 Wi-Fi，已自动开热点</h2>
   <p class="muted" id="autoText"></p>
   <div class="row" style="margin-top:10px">
     <button class="ghost" data-act="cancel">暂不开热点（30 分钟）</button>
@@ -6422,7 +6422,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 
 <div class="card">
   <h2>链路质量</h2>
-  <p class="hint">综合信号强度、空闲内存、转发丢包三项算出的 0-100 分；低于 50 时会明显卡顿。</p>
+  <p class="hint">信号强度、空闲内存、丢包率加权算出来的 0-100 分。低于 50 就会明显卡。</p>
   <div style="display:flex;align-items:baseline;gap:10px">
     <div style="font-size:34px;font-weight:700;font-variant-numeric:tabular-nums" id="qScore">—</div>
     <div class="muted" id="qText">读取中</div>
@@ -6514,7 +6514,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 
 <div class="card">
   <h2>向手表推一条消息</h2>
-  <p class="hint">走已认证的 SPP 会话，把手表当成一块能收到通知的小屏。需桥接处于已连接状态。</p>
+  <p class="hint">通过已认证的 SPP 会话发过去，手表上会弹通知。需要桥接处于已连接状态。</p>
   <label>内容（最多 400 字）</label>
   <input id="pushText" autocomplete="off" placeholder="例如：饭好了，下来吃饭">
   <div class="row" style="margin-top:9px">
@@ -6963,9 +6963,9 @@ async function testBluetooth(){
   $('bluetoothStatus').textContent='测试连接中，约 5-10 秒…';
   var d=await api('/setup/bluetooth/test?mac='+encodeURIComponent(m));
   if(d&&d.ok){ toast('蓝牙连接成功'); log('蓝牙测试成功 '+m+' 通道 '+(d.channel||'自动'));
-    $('bluetoothStatus').textContent='✅ 连接成功，通道 '+(d.channel||'自动'); }
+    $('bluetoothStatus').textContent='已连接，通道 '+(d.channel||'自动'); }
   else { toast('蓝牙测试失败',true); log('蓝牙测试失败 '+((d&&d.error)||''));
-    $('bluetoothStatus').textContent='❌ '+((d&&d.error)||'失败')+(d&&d.message?' · '+d.message:''); }
+    $('bluetoothStatus').textContent='失败：'+((d&&d.error)||'未知原因')+(d&&d.message?' · '+d.message:''); }
 }
 
 /* ---------- 保存 ---------- */
@@ -7455,10 +7455,10 @@ void handleStatus(bool publicSetup) {
 // 新版管理台：HTML 里保留 __PH_xxx__ 占位符，发送时按当前运行状态替换，
 // 这样版本号 / 热点名 / 热点密码不用在固件里写死两份。
 //
-// ⚠️ 这个页面有 49 KB。早期实现是 `String page(kWebUi)` 整串替换后再 send()：
+// 这个页面有 49 KB。早期实现是 `String page(kWebUi)` 整串替换后再 send()：
 //    - 堆上要同时存在 49KB 原文 + 49KB 替换副本，替换过程还要反复 realloc，
 //      ESP32 只有 ~100KB 可用堆，压到极限时 String 分配失败会退化成空串，
-//      于是发出去的只是一个没有响应体的 200 ——
+//      于是发出去的只是一个没有响应体的 200，
 //      手机浏览器（尤其 Android Chrome）就显示「该站点没有有效内容」。
 //    - 就算分配成功，一次性 WiFiClient.write(49KB) 在手机慢速接收下也可能
 //      写超时、只发出一部分，客户端拿到的是截断的 HTML。
@@ -7469,7 +7469,7 @@ void handleStatus(bool publicSetup) {
 // kWebUi 声明成 PROGMEM，但 ESP32 是统一地址空间：PROGMEM 是空宏，
 // .rodata 被直接映射到数据总线可读地址，所以下面把 kWebUi 当普通指针用
 // （memcmp / page[i]）是合法的。AVR 那套 "必须走 pgm_read_*" 的规矩在
-// ESP32 上不成立，别照搬 —— 真按那样改成 malloc 一整页副本，反而会白吃
+// ESP32 上不成立，别照搬。真按那样改成 malloc 一整页副本，反而白吃
 // 49KB 堆，把本来就只剩 50 多 KB 的余量压死。
 static void sendMainWebUi() {
   const size_t total = strlen_P(kWebUi);
@@ -7590,7 +7590,7 @@ static void sendMainWebUi() {
 // crc32 覆盖前面全部字节（含 md5 和长度），所以必须在发送前流式算一遍。
 //
 // ESP32 侧的两个约束决定了下面的写法：
-//   · 空闲堆只有 50 多 KB，表盘动辄 1~3 MB —— 全程不能把文件读进内存，
+//   · 空闲堆只有 50 多 KB，表盘动辄 1~3 MB，全程不能把文件读进内存，
 //     只按切片粒度（约 2 KB）滚动读。
 //   · SPP 的收发由 vela_watch 任务独占（gSppRxFrame 是共享装配缓冲），
 //     安装状态机必须挂进那个读循环里逐帧推进，不能另起线程抢数据。
@@ -7845,7 +7845,7 @@ bool buildWearPacket(uint8_t* out, size_t cap, size_t& len, uint32_t type, uint3
   return true;
 }
 
-// WatchFace{ PrepareInfo{ id, size, version=65536 } } —— 注意两层都是 field 6：
+// WatchFace{ PrepareInfo{ id, size, version=65536 } }，两层都是 field 6：
 // 外层 WearPacket 的 oneof 里 WatchFace=6，WatchFace 里 prepare_info 也是 6。
 bool buildWatchfacePrepare(uint8_t* out, size_t cap, size_t& len,
                            const char* wfId, uint32_t fileSize) {
@@ -7925,7 +7925,7 @@ void parsePrepareReply(const uint8_t* pb, size_t len, bool massSide,
 // ---- Mass 数据通道应答位置无关探测 ---------------------------------------
 // mass_prepare 的应答只有设备会给，字段号一旦对不上就卡在 mass_prepare_timeout，
 // 看不出是哪一层错。这里把所有候选状态的字节位置都扫出来打一遍，并且刻意
-// **不依赖** Mass{2}/PrepareResponse 这层包装 —— 包装层猜错也能看到线索。
+// **不依赖** Mass{2}/PrepareResponse 这层包装，包装层猜错也能看到线索。
 void dumpPrepareReply(const uint8_t* pb, size_t len, const char* tag) {
   Serial.printf("WF_INSTALL_PREPARE_RAW %s len=%u ", tag, static_cast<unsigned>(len));
   for (size_t i = 0; i < len && i < 96; ++i) Serial.printf("%02X", pb[i]);
@@ -8204,7 +8204,7 @@ void pump(uint8_t& /*seq*/, const uint8_t encKey[16]) {
 
     case kWaitResult: {
       if (now - gJob.lastAckMs > kResultTimeoutMs) {
-        // 数据已经全部发完且都确认了，设备只是没回结果 —— 多数情况下表盘已经装上
+        // 数据已经全部发完且都确认了，设备只是没回结果。多数情况下表盘已经装上了
         gPausedNetwork = false;
         finish("installed(no_result)");
       }
@@ -8224,7 +8224,7 @@ void onAck(uint8_t seq) {
   gJob.lastAckMs = millis();
 }
 
-// 收到加密 protobuf（type=3, channel=1, op=2）—— 解密后由读循环调用
+// 收到加密 protobuf（type=3, channel=1, op=2），解密后由读循环调用
 void onProto(uint32_t pbType, uint32_t pbId, const uint8_t* pb, size_t pbLen) {
   if (gJob.state == kIdle || gJob.state == kDone || gJob.state == kFailed) return;
 
@@ -9770,7 +9770,7 @@ void setupRoutes() {
         // 判定"这是不是 app 镜像"：看第一个段的加载地址 0x3F400020 处是不是
         // esp_app_desc_t 的魔数 0xABCD5432。ESP-IDF 的 esp_image_verify() 用的
         // 就是这个判据。整包（factory / merged）镜像从 0x0 开始，第一段是二级
-        // 引导，绝对不能直接塞进 OTA 分区——否则 ota_0 开头不是 app 描述符，
+        // 引导，绝对不能直接塞进 OTA 分区，否则 ota_0 开头不是 app 描述符，
         // update_core 校验失败，设备再也起不来。
         // 注意：头部 0x18 是段表第一项，不是写地址（0x14 才是），别拿它当判据。
         static const uint32_t kAppDescMagic = 0xABCD5432u;
@@ -9943,7 +9943,7 @@ void enterSetupMode() {
   gWatchAutoReconnectSuppressed = true;
   // 自动降级（配置全部保留）时让 AP 与 STA 共存：后台继续尝试连已保存的
   // Wi-Fi。路由器一恢复 / 密码改回来，设备自己重启回正常工作模式，
-  // 用户什么都不用改 —— 这是「不清配置」能真正兑现的关键。
+  // 用户什么都不用改，这是「不清配置」能真正兑现的关键。
   const bool keepConfig = gSetupKeepConfig && !ssid.isEmpty() &&
                           watchMac.length() == 17 && watchAuthKey.length() == 32;
   WiFi.mode(keepConfig ? WIFI_AP_STA : WIFI_AP);
@@ -9988,7 +9988,7 @@ static void setupTriggerTask(void*) {
       if (since == 0) since = millis();
       const uint32_t held = millis() - since;
       // 3 分钟兜底：GPIO0 在下载模式下被拉低、或板子 IO 故障导致一直读 Low 时，
-      // 如果不做上限，10 秒后就会无条件恢复出厂 —— 那就变成"插上 USB 就清空"。
+      // 如果不做上限，10 秒后就会无条件恢复出厂，那就变成"插上 USB 就清空"。
       if (held > 180000) {
         Serial.println("BOOT_HOLD_ABORT_TOO_LONG assume_download_mode_or_io_fault");
         since = millis();  // 重新开始计时，不触发动作
@@ -10162,7 +10162,7 @@ void setup() {
   // (setupWatchNetworkProxy), which is called during Bluetooth auth, before
   // WiFi is connected. Without this, tcpip_callback asserts "Invalid mbox".
   //
-  // ⚠️ 这里必须用 esp_netif_init()，绝对不要直接调 tcpip_init()。
+  // 这里必须用 esp_netif_init()，绝对不要直接调 tcpip_init()。
   // IDF 的 esp_netif_init() 内部已经会调一次 tcpip_init()，而 lwip_init()
   // 没有任何幂等保护 → 第二次会再跑一遍 sys_init() → 第二次调用
   // esp_vfs_lwip_sockets_register()。socket 的 fd 区间（FD_SETSIZE-8 .. FD_SETSIZE-1）
@@ -10385,7 +10385,7 @@ a{color:#58a5ff}
 <div class=card>
 <h3>新建更新包（高级）</h3>
 <p class=muted style="margin-bottom:8px">需要单独刷 bootloader / 分区表 / 自定义偏移时用这一组。日常升级只需要上面的"一键"。</p>
-<p class=muted style="color:#27ae60;margin-bottom:8px">✅ 固件升级支持自动回滚保护：如果新固件启动失败，设备将自动恢复到上一个正常固件。</p>
+<p class=muted style="color:#27ae60;margin-bottom:8px">升级带自动回滚：新固件起不来，会自动退回上一个正常固件。</p>
 
 <div class=upload-item>
 <h3>固件 (firmware.bin) - 支持回滚保护</h3>
@@ -10446,7 +10446,7 @@ async function loadDeviceInfo(){
     'Flash模式：'+d.flashMode+'<br>'+
     '可用内存：'+d.freeHeap+' bytes<br>';
     if(d.rollbackEnabled){
-      html+='<span style="color:#27ae60">✅ 回滚保护已启用</span><br>';
+      html+='<span style="color:#27ae60">回滚保护已启用</span><br>';
     }
     if(d.runningPartition){
       html+='运行分区：'+esc(d.runningPartition)+' (0x'+d.runningAddr.toString(16)+', '+(d.runningSize/1024/1024).toFixed(1)+'MB)<br>';
@@ -10477,23 +10477,23 @@ async function uploadFile(n){
     let t=await r.text();
     try{let d=JSON.parse(t);
       if(d.ok){
-        document.getElementById('uploadResult').innerHTML='✅ '+file.name+' 上传成功<br>地址：0x'+addr.toString(16)+'<br>大小：'+file.size+' bytes';
+        document.getElementById('uploadResult').innerHTML=file.name+' 上传成功<br>地址：0x'+addr.toString(16)+'<br>大小：'+file.size+' bytes';
         document.getElementById('ledIndicator').className='led-indicator led-on';
         document.getElementById('ledText').textContent='升级完成，2秒后重启...';
         document.getElementById('otaStatus').textContent='升级完成！LED常亮2秒后设备将自动重启。';
-        setTimeout(function(){document.body.innerHTML='<div style="text-align:center;padding:40px"><h2>✅ 升级完成</h2><p>设备正在重启，请等待约15秒后重新连接WiFi热点</p></div>'},2000);
+        setTimeout(function(){document.body.innerHTML='<div style="text-align:center;padding:40px"><h2>升级完成</h2><p>设备正在重启，请等待约15秒后重新连接WiFi热点</p></div>'},2000);
       }else{
-        document.getElementById('uploadResult').innerHTML='❌ 上传失败：'+esc(d.error||'未知错误');
+        document.getElementById('uploadResult').innerHTML='上传失败：'+esc(d.error||'未知错误');
         document.getElementById('ledIndicator').className='led-indicator';
         document.getElementById('ledText').textContent='失败';
       }
     }catch(e){
-      document.getElementById('uploadResult').innerHTML='❌ 响应解析失败：'+esc(t.substring(0,200));
+      document.getElementById('uploadResult').innerHTML='响应解析失败：'+esc(t.substring(0,200));
       document.getElementById('ledIndicator').className='led-indicator';
       document.getElementById('ledText').textContent='失败';
     }
   }catch(e){
-    document.getElementById('uploadResult').innerHTML='❌ 上传错误：'+esc(String(e));
+    document.getElementById('uploadResult').innerHTML='上传错误：'+esc(String(e));
     document.getElementById('ledIndicator').className='led-indicator';
     document.getElementById('ledText').textContent='失败';
   }
@@ -10509,12 +10509,12 @@ async function preflight(){
   var lines=[];
   var ok16 = d.flashSize>=16*1024*1024;
   lines.push('芯片：'+esc(d.chipModel)+' / '+d.chipCores+' 核');
-  lines.push('Flash：'+human(d.flashSize)+(ok16?' <span style="color:#27ae60">✅ 16MB</span>':' <span style="color:#e74c3c">❌ 不是 16MB</span>'));
+  lines.push('Flash：'+human(d.flashSize)+(ok16?' <span style="color:#27ae60">16MB</span>':' <span style="color:#e74c3c">不是 16MB</span>'));
   lines.push('Flash 模式：'+d.flashMode);
   lines.push('可用内存：'+human(d.freeHeap));
   if(d.runningPartition){lines.push('当前运行分区：'+esc(d.runningPartition)+' @0x'+d.runningAddr.toString(16))}
   if(d.nextPartition){lines.push('本次写入分区：'+esc(d.nextPartition)+' @0x'+d.nextAddr.toString(16))}
-  if(d.rollbackEnabled){lines.push('<span style="color:#27ae60">✅ 回滚保护已启用</span>')}
+  if(d.rollbackEnabled){lines.push('<span style="color:#27ae60">回滚保护已启用</span>')}
   box.innerHTML=lines.join('<br>');
   if(!ok16){
     let extra=document.createElement('div');
@@ -10570,14 +10570,14 @@ async function quickOtaPick(input){
     try{d=JSON.parse(xhr.responseText)}catch(e){}
     if(d&&d.ok){
       bar.firstElementChild.style.width='100%';
-      txt.innerHTML='<span style="color:#27ae60">✅ 写入完成，共 '+human(d.size)+'，设备正在重启…</span>';
+      txt.innerHTML='<span style="color:#27ae60">写入完成，共 '+human(d.size)+'，设备正在重启…</span>';
       setTimeout(function(){
         document.body.innerHTML='<div style="text-align:center;padding:48px 16px">'+
-        '<div style="font-size:40px">✅</div><h2 style="margin:12px 0;color:#58a5ff">刷写完成</h2>'+
+        '<h2 style="margin:12px 0;color:#58a5ff">刷写完成</h2>'+
         '<p class=muted>设备正在重启，约 15 秒后热点会重新出现。<br>重新连上热点后打开本页面即可看到新版本。</p></div>';
       },1200);
     }else{
-      txt.innerHTML='<span style="color:#e74c3c">❌ '+(d?esc(d.error||'未知错误'):'响应异常')+'</span>';
+      txt.innerHTML='<span style="color:#e74c3c">'+(d?esc(d.error||'未知错误'):'响应异常')+'</span>';
       bar.firstElementChild.style.background='#e74c3c';
     }
   };
@@ -10599,7 +10599,7 @@ document.addEventListener('change',function(ev){
 function switchProj(t){
   var nm=t===6?'空中升级':'手表网关';
   if(!confirm('切换到「'+nm+'」？设备将重启。'))return;
-  api('/setup/project/switch?target='+t,{method:'POST'}).then(d=>{if(d.ok)document.body.innerHTML='<div style="text-align:center;padding:40px"><h2>🔄 正在切换...</h2><p>设备重启中，请等待约15秒后重新连接WiFi热点</p></div>';else alert('切换失败:'+(d.error||''))});
+  api('/setup/project/switch?target='+t,{method:'POST'}).then(d=>{if(d.ok)document.body.innerHTML='<div style="text-align:center;padding:40px"><h2>正在切换…</h2><p>设备重启中，请等待约15秒后重新连接WiFi热点</p></div>';else alert('切换失败:'+(d.error||''))});
 }
 
 loadDeviceInfo();
@@ -10632,7 +10632,7 @@ void loop() {
   }
 
   // 固件库的"延时安装"：网页那边已经回了 200，这里再把文件写进 OTA 分区并重启。
-  // 不能放在 HTTP 回调里做 —— 1.6 MB 写 Flash 要好几秒，浏览器早超时了。
+  // 不能放在 HTTP 回调里做，1.6 MB 写 Flash 要好几秒，浏览器早超时了。
   fwlib::servicePending();
 
   handleWatchProbeSerial();
