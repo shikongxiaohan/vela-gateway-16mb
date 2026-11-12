@@ -6928,7 +6928,7 @@ async function loadSys(){
   $('yMemLargest').textContent=d.heapLargest!==undefined?(Math.round(d.heapLargest/1024)+' KB'):'—';
   $('yPsram').textContent=d.psramSize
     ? ((d.psramSize/1048576).toFixed(0)+' MB · 空闲 '+((d.psramFree||0)/1024/1024).toFixed(1)+' MB')
-    : '未检测到';
+    : '未启用';
 
   // OTA 槽：直接列出两个槽里实际躺着的镜像，升级后核对版本不用翻日志
   var slots=$('ySlots');
@@ -7485,8 +7485,9 @@ void handleStatus(bool publicSetup) {
   // 最大连续块：free 大而 largest 小说明堆被切碎，malloc 仍会失败。
   // 排查「传大文件到一半挂掉」时这两个数要一起看。
   d["heapLargest"] = static_cast<uint32_t>(ESP.getMaxAllocHeap());
-  // PSRAM：WROVER-E 的 8MB 已编译启用。配置里打开了 IGNORE_NOTFOUND，
-  // 所以插在没有 PSRAM 的板子上也能启动，这里会报 0。
+  // PSRAM：固件当前未开启 SPIRAM 编译开关，这里恒为 0。
+  // v0.0.0.35 曾打开过，设备在启动阶段复位后被 bootloader 回滚，
+  // 没有串口日志无法定位，先退回关闭状态。
   d["psramSize"] = static_cast<uint32_t>(ESP.getPsramSize());
   d["psramFree"] = static_cast<uint32_t>(ESP.getFreePsram());
   // 运行时长：系统页「设备信息」直接显示，省得用户自己拿开机时间换算。
@@ -10766,7 +10767,7 @@ void setup() {
   setupRoutes();
   Serial.println("WATCH_RETURN_PATH_TRACER v7 enabled");
   Serial.println("VELA_MEM_OPT v7 shared_spp_frame=true reused_tx_scratch=true lazy_asr_queue=true");
-  // PSRAM 若未检测到会报 size=0；此时固件仍按内部 RAM 运行。
+  // PSRAM 编译开关关闭时报 size=0，全部内存走内部 RAM。
   Serial.printf("PSRAM size=%lu free=%lu\n",
                 static_cast<unsigned long>(ESP.getPsramSize()),
                 static_cast<unsigned long>(ESP.getFreePsram()));

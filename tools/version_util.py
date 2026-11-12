@@ -134,6 +134,10 @@ FINGERPRINT_GLOBS = [
     "src/CMakeLists.txt",
     "CMakeLists.txt",
     "platformio.ini",
+    # sdkconfig 直接决定编译开关（PSRAM、蓝牙内存分配等），漏掉它会出现
+    # 「内容变了版本号不动」，新固件顶着旧版本号发布。
+    "sdkconfig*",
+    "partitions*.csv",
 ]
 
 # 明确排除：这些文件由版本机制自己生成，不能参与指纹
