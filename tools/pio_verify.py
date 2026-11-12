@@ -161,6 +161,16 @@ def fix_otadata(source, target, env):
             print(r.stderr.rstrip())
             print("[webui-js] 页面脚本语法检查未通过，页面会在真机上白屏")
 
+    # SPIFFS 挂载前提检查。懒挂载只在录音路径里做过一次，结果固件库和
+    # 表盘上传在没录过音的设备上必然失败，而且报错还指向「不是 app 镜像」。
+    sg = Path(env.subst("$PROJECT_DIR")) / "tools" / "test_spiffs_guard.py"
+    if sg.exists():
+        r = subprocess.run(["python3", str(sg)], capture_output=True, text=True)
+        print(r.stdout.rstrip())
+        if r.returncode != 0:
+            print(r.stderr.rstrip())
+            print("[spiffs] 文件系统挂载前提检查未通过，检查各路由入口是否调用 ensureSpiffs()")
+
     # 标记这次版本已出包（下次源码不变就不会再递进版本号）
     sys.path.insert(0, str(Path(env.subst("$PROJECT_DIR")) / "tools"))
     try:

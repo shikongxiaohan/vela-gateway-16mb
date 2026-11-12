@@ -1450,27 +1450,33 @@ void emitWatchRawTrace(const SppV2Frame& frame) {
                 static_cast<unsigned>(opcode));
 }
 
+// SPIFFS 懒挂载。启动阶段不挂，把那点堆让给蓝牙控制器；
+// 但任何用到文件系统的地方都必须先过这里。早期只有录音路径会挂载，
+// 结果固件库和表盘上传在没录过音的设备上必然失败：
+// SPIFFS.open() 一律返回 false，写入全被跳过，最后误报成「不是 app 镜像」。
+bool ensureSpiffs() {
+  if (gWatchStreamCaptureFsReady) return true;
+  gWatchStreamCaptureFsReady = SPIFFS.begin(true);
+  if (gWatchStreamCaptureFsReady) {
+    Serial.printf("SPIFFS_MOUNT_OK total=%u used=%u\n",
+                  static_cast<unsigned>(SPIFFS.totalBytes()),
+                  static_cast<unsigned>(SPIFFS.usedBytes()));
+  } else {
+    // 最常见的两个原因：分区表里没有 spiffs 分区（例如旧的 partitions_ota.csv），
+    // 或者分区太小/文件系统损坏。这里直接打出来，避免"功能静默失效"。
+    const esp_partition_t* fs = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
+    Serial.printf("SPIFFS_MOUNT_FAILED partition=%s size=%u hint=%s\n",
+                  fs ? fs->label : "missing",
+                  fs ? static_cast<unsigned>(fs->size) : 0u,
+                  fs ? "format_failed_or_too_small" : "no_spiffs_partition_in_table");
+  }
+  return gWatchStreamCaptureFsReady;
+}
+
 void beginWatchStreamCapture(uint16_t mode) {
   if (gWatchStreamCaptureFile) gWatchStreamCaptureFile.close();
-  // Mount SPIFFS lazily here instead of in setup(): the mount costs heap that
-  // the Bluetooth controller init needs up front.
-  if (!gWatchStreamCaptureFsReady) {
-    gWatchStreamCaptureFsReady = SPIFFS.begin(true);
-    if (gWatchStreamCaptureFsReady) {
-      Serial.printf("SPIFFS_MOUNT_OK total=%u used=%u\n",
-                    static_cast<unsigned>(SPIFFS.totalBytes()),
-                    static_cast<unsigned>(SPIFFS.usedBytes()));
-    } else {
-      // 最常见的两个原因：分区表里没有 spiffs 分区（例如旧的 partitions_ota.csv），
-      // 或者分区太小/文件系统损坏。这里直接打出来，避免"录音功能静默失效"。
-      const esp_partition_t* fs = esp_partition_find_first(
-          ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
-      Serial.printf("SPIFFS_MOUNT_FAILED partition=%s size=%u hint=%s\n",
-                    fs ? fs->label : "missing",
-                    fs ? static_cast<unsigned>(fs->size) : 0u,
-                    fs ? "format_failed_or_too_small" : "no_spiffs_partition_in_table");
-    }
-  }
+  ensureSpiffs();
   beginXiaoAiSession();
   gWatchStreamCaptureLength = 0;
   gWatchStreamPacketCount = 0;
@@ -7415,7 +7421,10 @@ void handleStatus(bool publicSetup) {
   d["fwSize"] = static_cast<uint32_t>(ESP.getSketchSize());
   d["heapFree"] = static_cast<uint32_t>(ESP.getFreeHeap());
   d["heapMinFree"] = static_cast<uint32_t>(ESP.getMinFreeHeap());
-  if (gWatchStreamCaptureFsReady) {
+  // 状态接口是管理台每次轮询都会调的，在这里顺手把文件系统挂上：
+  // 用户打开页面后，后面的固件库、表盘上传才有可用的文件系统。
+  // 挂载本身是一次性的，之后只是读一个 bool。
+  if (ensureSpiffs()) {
     d["spiffsTotal"] = static_cast<uint32_t>(SPIFFS.totalBytes());
     d["spiffsUsed"] = static_cast<uint32_t>(SPIFFS.usedBytes());
   }
@@ -8526,6 +8535,9 @@ struct Pending {
 static Pending gPending;
 static File gUpload;
 static bool gUploadFailed = true;
+// 实际写入字节数。用于区分「文件没写进去」和「文件写进去了但不是 app 镜像」，
+// 这两种情况给用户的提示完全不同。
+static size_t gUploadWritten = 0;
 
 bool pendingWrite() { return gPending.armed; }
 
@@ -8895,6 +8907,17 @@ void setupRoutes() {
   server.on("/api/v1/firmware/upload", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
     JsonDocument d;
+
+    // 文件系统没挂上时，SPIFFS.open() 一律失败，写入全部跳过。
+    // 这种情况必须报存储错误，不能报「不是 app 镜像」，否则排查方向全错。
+    if (!ensureSpiffs()) {
+      d["ok"] = false;
+      d["error"] = "storage_unavailable";
+      d["hint"] = "设备文件系统未挂载（SPIFFS 分区缺失或格式化失败），固件无法暂存。请查看串口 SPIFFS_MOUNT_FAILED 一行。";
+      sendJson(200, d);
+      return;
+    }
+
     if (fwlib::gUploadFailed) {
       d["ok"] = false;
       d["error"] = "upload_failed";
@@ -8902,6 +8925,7 @@ void setupRoutes() {
       sendJson(200, d);
       return;
     }
+
     File done = SPIFFS.open(fwlib::kName, FILE_READ);
     uint32_t size = done ? static_cast<uint32_t>(done.size()) : 0;
     uint8_t magic = 0;
@@ -8910,6 +8934,19 @@ void setupRoutes() {
       magic = static_cast<uint8_t>(done.read());
       done.close();
     }
+
+    // 大小对不上说明写入中途失败，文件是残缺的，不能当成镜像来判类型
+    if (size == 0 || size != fwlib::gUploadWritten) {
+      SPIFFS.remove(fwlib::kName);
+      d["ok"] = false;
+      d["error"] = "write_incomplete";
+      d["hint"] = "文件只写入了部分内容，通常是 SPIFFS 空间不足。请删除设备上已上传的表盘或固件后重试。";
+      d["expected"] = static_cast<uint32_t>(fwlib::gUploadWritten);
+      d["received"] = size;
+      sendJson(200, d);
+      return;
+    }
+
     if (magic != 0xE9) {
       // app 镜像必须以 0xE9 开头（ESP 镜像魔数）。整包 -factory.bin 的第一个
       // 字节是 0xFF，在此处直接拒绝，避免写入阶段才失败。
@@ -8928,8 +8965,15 @@ void setupRoutes() {
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
       fwlib::gUploadFailed = true;
+      fwlib::gUploadWritten = 0;
+      if (!ensureSpiffs()) {
+        Serial.println("FW_LIB_UPLOAD_REJECT spiffs_unavailable");
+        return;
+      }
       if (!SPIFFS.exists(fwlib::kDir)) SPIFFS.mkdir(fwlib::kDir);
       const size_t freeBytes = SPIFFS.totalBytes() - SPIFFS.usedBytes();
+      // totalSize 在 START 阶段通常还是 0，这个检查只在浏览器给了准确长度时生效；
+      // 真正的兜底是写入失败时立即置 gUploadFailed。
       if (upload.totalSize > 0 &&
           (upload.totalSize + fwlib::kReserve > freeBytes ||
            upload.totalSize > fwlib::kMaxFirmware)) {
@@ -8941,27 +8985,42 @@ void setupRoutes() {
       SPIFFS.remove(fwlib::kName);
       fwlib::gUpload = SPIFFS.open(fwlib::kName, FILE_WRITE);
       if (!fwlib::gUpload) {
-        Serial.println("FW_LIB_UPLOAD_REJECT open_failed");
+        Serial.printf("FW_LIB_UPLOAD_REJECT open_failed free=%u\n",
+                      static_cast<unsigned>(freeBytes));
         return;
       }
       Serial.printf("FW_LIB_UPLOAD_START name=%s size=%u\n",
                     upload.filename.c_str(), static_cast<unsigned>(upload.totalSize));
     } else if (upload.status == UPLOAD_FILE_WRITE) {
       if (!fwlib::gUpload) return;
-      if (fwlib::gUpload.write(upload.buf, upload.currentSize) != upload.currentSize) {
-        Serial.println("FW_LIB_UPLOAD_WRITE_FAILED");
-        return;
+      const size_t n = fwlib::gUpload.write(upload.buf, upload.currentSize);
+      fwlib::gUploadWritten += n;
+      if (n != upload.currentSize) {
+        // 写不满就是空间不够。这里必须把状态钉死为失败，
+        // 否则 END 阶段会把 gUploadFailed 清掉，上层就误判成镜像类型错误。
+        fwlib::gUploadFailed = true;
+        Serial.printf("FW_LIB_UPLOAD_WRITE_FAILED written=%u chunk=%u\n",
+                      static_cast<unsigned>(fwlib::gUploadWritten),
+                      static_cast<unsigned>(upload.currentSize));
       }
     } else if (upload.status == UPLOAD_FILE_END) {
       if (fwlib::gUpload) {
         fwlib::gUpload.flush();
         fwlib::gUpload.close();
       }
-      fwlib::gUploadFailed = false;
-      Serial.println("FW_LIB_UPLOAD_DONE");
+      // 只有全程没写失败才认为成功。原来这里无条件置 false，
+      // 会把「打开失败」「写入失败」都洗成「镜像类型不对」。
+      if (!fwlib::gUploadFailed) {
+        Serial.printf("FW_LIB_UPLOAD_DONE bytes=%u\n",
+                      static_cast<unsigned>(fwlib::gUploadWritten));
+      } else {
+        Serial.printf("FW_LIB_UPLOAD_END_WITH_ERROR written=%u\n",
+                      static_cast<unsigned>(fwlib::gUploadWritten));
+      }
     } else if (upload.status == UPLOAD_FILE_ABORTED) {
       if (fwlib::gUpload) fwlib::gUpload.close();
       SPIFFS.remove(fwlib::kName);
+      fwlib::gUploadFailed = true;
       Serial.println("FW_LIB_UPLOAD_ABORTED");
     }
   });
@@ -8969,6 +9028,13 @@ void setupRoutes() {
   server.on("/api/v1/firmware/list", HTTP_GET, [](){
     if (!isSetupApClient() && !requireAuth()) return;
     JsonDocument d;
+    if (!ensureSpiffs()) {
+      d["ok"] = false;
+      d["error"] = "storage_unavailable";
+      d["hint"] = "设备文件系统未挂载，固件列表不可用。";
+      sendJson(200, d);
+      return;
+    }
     d["ok"] = true;
     d["current"] = kFwVersionFull;
     JsonObject usage = d["usage"].to<JsonObject>();
@@ -8981,6 +9047,10 @@ void setupRoutes() {
 
   server.on("/api/v1/firmware/install", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
+    if (!ensureSpiffs()) {
+      jsonError(503, "storage_unavailable", "设备文件系统未挂载，无法读取固件");
+      return;
+    }
     const String b = body();
     JsonDocument in;
     if (!b.isEmpty()) deserializeJson(in, b);
@@ -9017,6 +9087,10 @@ void setupRoutes() {
 
   server.on("/api/v1/firmware/delete", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
+    if (!ensureSpiffs()) {
+      jsonError(503, "storage_unavailable", "设备文件系统未挂载，无法删除文件");
+      return;
+    }
     const String b = body();
     JsonDocument in;
     if (!b.isEmpty()) deserializeJson(in, b);
@@ -9324,6 +9398,13 @@ void setupRoutes() {
   server.on("/api/v1/resource/list", HTTP_GET, [](){
     if (!isSetupApClient() && !requireAuth()) return;
     JsonDocument d;
+    if (!ensureSpiffs()) {
+      d["ok"] = false;
+      d["error"] = "storage_unavailable";
+      d["hint"] = "设备文件系统未挂载，资源列表不可用。";
+      sendJson(200, d);
+      return;
+    }
     d["ok"] = true;
     d["bridgeRunning"] = gWatchBridgeRunning;
 
@@ -9390,6 +9471,10 @@ void setupRoutes() {
     if (upload.status == UPLOAD_FILE_START) {
       wfUploadFailed = true;   // 只有走到 END 才算成功
       wfUploadPath[0] = 0;
+      if (!ensureSpiffs()) {
+        Serial.println("WF_UPLOAD_REJECT spiffs_unavailable");
+        return;
+      }
       const String name = upload.filename;
       const bool isApp = name.endsWith(".rpk") || name.endsWith(".RPK");
       const bool isWf = name.endsWith(".bin") || name.endsWith(".face") ||
@@ -9466,6 +9551,13 @@ void setupRoutes() {
   server.on("/api/v1/resource/upload", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
     JsonDocument d;
+    if (!ensureSpiffs()) {
+      d["ok"] = false;
+      d["error"] = "storage_unavailable";
+      d["hint"] = "设备文件系统未挂载，文件无法暂存。请查看串口 SPIFFS_MOUNT_FAILED 一行。";
+      sendJson(200, d);
+      return;
+    }
     if (wfUploadFailed || !wfUploadPath[0]) {
       d["ok"] = false;
       d["error"] = "upload_failed";
@@ -9515,7 +9607,7 @@ void setupRoutes() {
 
   server.on("/api/v1/resource/install", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
-    if (!requireAuth()) return;
+    if (!ensureSpiffs()) return jsonError(503, "storage_unavailable", "设备文件系统未挂载，无法读取文件");
     JsonDocument in;
     if (deserializeJson(in, server.arg("plain"))) return jsonError(400, "bad_json", "");
     const String slot = in["slot"] | "";
@@ -9576,6 +9668,7 @@ void setupRoutes() {
 
   server.on("/api/v1/resource/delete", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
+    if (!ensureSpiffs()) return jsonError(503, "storage_unavailable", "设备文件系统未挂载，无法删除文件");
     JsonDocument in;
     if (deserializeJson(in, server.arg("plain"))) return jsonError(400, "bad_json", "");
     const String slot = in["slot"] | "";
