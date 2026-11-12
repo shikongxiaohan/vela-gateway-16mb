@@ -6327,6 +6327,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
     </div>
     <div class="bar"><i id="sFlashBar"></i></div>
     <p class="muted" id="sPart" style="margin:6px 0 0">正在读取分区信息…</p>
+    <p class="muted" id="sSlots" style="margin:4px 0 0">正在读取 OTA 槽…</p>
   </div>
   <p class="muted" id="sCounters" style="margin:8px 0 0"></p>
 </div>
@@ -6960,6 +6961,14 @@ async function refresh(){
   }
   $('sPart').textContent = '分区 '+(d.appPartition||'?')+' @0x'+(d.appPartitionAddr||0).toString(16).toUpperCase()+
     ' · Flash '+Math.round((d.flashSize||0)/1048576)+' MB';
+  if(d.otaSlots && d.otaSlots.length){
+    $('sSlots').textContent = 'OTA 槽 ' + d.otaSlots.map(function(slot){
+      var tag = slot.hasImage ? String(slot.version||'—') : '空';
+      return slot.label + ' ' + tag + (slot.running ? '（运行中）' : '');
+    }).join(' · ');
+  } else {
+    $('sSlots').textContent = '';
+  }
   $('dFw').textContent=d.fwVersionFull||d.fwVersion||'—';
   $('dCh').textContent=d.fwChannel||'—';
   $('dBu').textContent=d.fwVerMajor===undefined?'—':(d.fwVerMajor+'.'+d.fwVerMinor+'.'+d.fwVerBuild+'.'+d.fwVerRevision);
@@ -7512,6 +7521,25 @@ void handleStatus(bool publicSetup) {
     const esp_partition_t* fs = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
     d["spiffsPartitionSize"] = fs ? static_cast<uint32_t>(fs->size) : 0u;
+    // 两个 OTA 槽各自的镜像与状态。整片刷写后当前槽未必是系统页标签上写的
+    // 那个版本，这里把每个槽里实际躺着的镜像都报出来，避免"升级到了错的槽"。
+    JsonArray slots = d["otaSlots"].to<JsonArray>();
+    for (const char* label : {"ota_0", "ota_1"}) {
+      const esp_partition_t* p = esp_partition_find_first(
+          ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, label);
+      if (!p) continue;
+      JsonObject o = slots.add<JsonObject>();
+      o["label"] = label;
+      o["address"] = static_cast<uint32_t>(p->address);
+      o["running"] = running && running->address == p->address;
+      esp_app_desc_t desc;
+      const bool has = esp_ota_get_partition_description(p, &desc) == ESP_OK;
+      o["hasImage"] = has;
+      if (has) {
+        o["version"] = String(desc.version);
+        o["built"] = String(desc.date) + " " + String(desc.time);
+      }
+    }
   }
   // 上一次升级是否被回滚。前端据此提示，用户不用再靠猜版本号。
   d["otaRollback"] = gOtaRollbackDetected;
@@ -10164,6 +10192,13 @@ void setupRoutes() {
       d["nextPartition"] = next->label;
       d["nextAddr"] = (uint32_t)next->address;
       d["nextSize"] = (uint32_t)next->size;
+      // 空闲目标分区里是否已经躺着一个可直接启动的镜像。整片刷写、或用
+      // /ota/upload?addr= 直接写过分区之后，这里是 true，页面要提示用户
+      // 当前运行的不一定是这份镜像。
+      esp_app_desc_t desc;
+      const bool hasImage = esp_ota_get_partition_description(next, &desc) == ESP_OK;
+      d["nextHasImage"] = hasImage;
+      if (hasImage) d["nextImageVersion"] = String(desc.version);
     }
     d["rollbackEnabled"] = true;
     sendJson(200, d);
@@ -10795,7 +10830,11 @@ async function preflight(){
   lines.push('Flash 模式：'+d.flashMode);
   lines.push('可用内存：'+human(d.freeHeap));
   if(d.runningPartition){lines.push('当前运行分区：'+esc(d.runningPartition)+' @0x'+d.runningAddr.toString(16))}
-  if(d.nextPartition){lines.push('本次写入分区：'+esc(d.nextPartition)+' @0x'+d.nextAddr.toString(16))}
+  if(d.nextPartition){
+    var nt='本次写入分区：'+esc(d.nextPartition)+' @0x'+d.nextAddr.toString(16);
+    if(d.nextHasImage) nt+=' <span style="color:#e67e22">（已有镜像 '+(d.nextImageVersion||'')+'，写入后覆盖）</span>';
+    lines.push(nt);
+  }
   if(d.rollbackEnabled){lines.push('<span style="color:#27ae60">回滚保护已启用</span>')}
   box.innerHTML=lines.join('<br>');
   if(!ok16){
