@@ -445,6 +445,9 @@ static void settlePushOnLinkReset(const char* reason) {
 
 // 重启标志：避免在HTTP handler中直接调用ESP.restart()
 static volatile bool gRestartRequested = false;
+// 最近一次收到 HTTP 请求的时间。空中升级模式的空闲返回用它判定
+// 「刷完没人管了」，只靠 gRestartRequested 覆盖不到手机中途锁屏的情况。
+static uint32_t gLastHttpActivityMs = 0;
 
 // ---- 自动重连状态机 ----
 static uint32_t gBootMs = 0;               // 上电时间
@@ -6393,7 +6396,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <button data-act="tab" data-arg="bt"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18l5-4-10-8 10-4-5-4"/></svg>手表</button>
   <button data-act="tab" data-arg="res"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 19h16"/></svg>资源</button>
   <button data-act="tab" data-arg="dev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 9h6v6H9z"/></svg>设备</button>
-  <button data-act="tab" data-arg="tools"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a4 4 0 0 0 5 5l-9.4 9.4a2.8 2.8 0 0 1-4-4z"/><path d="M14.7 6.3 17 4"/></svg>工具</button>
+  <button data-act="tab" data-arg="tools"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2 2 2 0 1 1-4 0 1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15a2 2 0 1 1 0-4 1.7 1.7 0 0 0 1.5-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 4a2 2 0 1 1 4 0 1.7 1.7 0 0 0 2.9 1.5l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A1.7 1.7 0 0 0 21 11a2 2 0 1 1 0 4z"/></svg>设置</button>
   <button data-act="tab" data-arg="sys"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>系统</button>
 </nav>
 
@@ -6489,8 +6492,49 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 
 <div class="card">
   <h2>固件升级</h2>
-  <p class="muted">进入空中升级模式后，可通过手机浏览器刷写固件。设备将重启，热点保持开启。</p>
+  <p class="muted">进入空中升级模式后设备重启，只开启热点和升级页面，不运行蓝牙桥接。刷写完成后再重启回网关。</p>
   <button class="ghost" style="width:100%;margin-top:9px" data-act="switchProj" data-arg="6">进入空中升级</button>
+</div>
+
+<div class="card">
+  <h2>设备动作</h2>
+  <button class="ghost" style="width:100%" data-act="reboot">重启设备</button>
+  <p class="muted" style="margin-top:8px">重启不修改任何配置。</p>
+</div>
+
+<div class="card" id="logCard">
+  <h2>运行日志 <span class="muted" style="font-weight:400">· 本页操作</span></h2>
+  <div class="log" id="oLocal">就绪</div>
+  <h2 style="margin-top:12px">设备事件 <span class="muted" style="font-weight:400">· 最近 24 条</span></h2>
+  <div class="log" id="oDev">（暂无事件）</div>
+</div>
+
+</section>
+
+<section class="panel" id="p-sys">
+<div class="card">
+  <h2>设备信息</h2>
+  <div class="mini"><b>固件版本</b><span id="yVer">—</span></div>
+  <div class="mini"><b>硬件</b><span id="yHw">—</span></div>
+  <div class="mini"><b>Flash</b><span id="yFlash">—</span></div>
+  <div class="mini"><b>当前运行分区</b><span id="yPart">—</span></div>
+  <div class="mini"><b>运行时长</b><span id="yUp">—</span></div>
+  <div class="mini"><b>空闲内存</b><span id="yMem">—</span></div>
+  <div class="mini"><b>历史最低内存</b><span id="yMemMin">—</span></div>
+</div>
+
+<div class="card">
+  <h2>OTA 槽</h2>
+  <div class="list" id="ySlots" style="max-height:none"></div>
+</div>
+
+<div class="card">
+  <h2>上次升级未生效</h2>
+  <div id="otaBadBox" style="display:none">
+    <p class="sub" id="otaBadText"></p>
+    <button class="ghost" style="width:100%;margin-top:10px" data-act="otaBadAck">知道了</button>
+  </div>
+  <p class="hint" id="otaBadNone">没有记录到固件回滚。</p>
 </div>
 
 <div class="card">
@@ -6501,52 +6545,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
     <li>Wi-Fi 连接失败时：自动开启配网热点，原有配置保持不变</li>
   </ul>
   <button class="danger" style="width:100%;margin-top:10px" data-act="openReset">恢复出厂设置…</button>
-  <p class="muted" style="margin-top:8px">清除范围：Wi-Fi 配置、手表密钥、热点密码。固件、分区表与 SPIFFS 文件不受影响。</p>
-</div>
-
-<div class="card" id="logCard">
-  <h2>运行日志 <span class="muted" style="font-weight:400">· 本页操作</span></h2>
-  <div class="log" id="oLocal">就绪</div>
-  <h2 style="margin-top:12px">设备事件 <span class="muted" style="font-weight:400">· 最近 24 条，升级与推送失败原因看这里</span></h2>
-  <div class="log" id="oDev">（暂无事件）</div>
-</div>
-
-</section>
-
-<section class="panel" id="p-sys">
-<div class="card">
-  <h2>版本</h2>
-  <div class="mini"><b>当前版本</b><span id="yVer">—</span></div>
-  <div class="mini"><b>版本构成</b><span id="yBuild">—</span></div>
-  <div class="mini"><b>发布通道</b><span id="yChan">—</span></div>
-</div>
-
-<!-- 升级失败提示：写入后没能跑起来、被 bootloader 回滚时显示。 -->
-<div class="card" id="otaBadCard" style="display:none">
-  <h2>上次升级未生效</h2>
-  <p class="sub" id="otaBadText"></p>
-  <button class="ghost" style="width:100%;margin-top:10px" data-act="otaBadAck">知道了</button>
-</div>
-
-<!-- 固件升级：网关模式下直接写空闲 OTA 分区，写完重启生效。 -->
-<div class="card">
-  <h2>固件升级</h2>
-  <p class="sub">选择 <code>-ota.bin</code> 后直接写入空闲升级分区，写入完成设备自动重启。整包 <code>-factory.bin</code> 需通过数据线烧录。</p>
-  <input type="file" id="fwFile" accept=".bin">
-  <div id="fwBar" class="muted" style="margin-top:10px">未选择文件</div>
-  <div class="bar" style="margin-top:10px"><i id="fwProgress" style="width:0"></i></div>
-  <div class="row" style="margin-top:10px">
-    <button class="ghost" data-act="fwDiag">上传诊断</button>
-    <button class="ghost" data-act="fwSafe">安全模式</button>
-  </div>
-  <div id="fwDiag" class="muted" style="margin-top:8px"></div>
-  <p class="hint" style="margin-top:10px">写入期间蓝牙桥接暂停，约 10 至 30 秒；重启后恢复。配置、手表密钥、表盘均保留。新固件若无法启动，会自动退回当前版本。</p>
-</div>
-
-<div class="card">
-  <h2>设备动作</h2>
-  <button class="ghost" style="width:100%" data-act="reboot">重启设备</button>
-  <p class="hint" style="margin-top:10px">重启不修改任何配置。更换固件请使用上方升级功能。</p>
+  <p class="hint" style="margin-top:10px">清除范围：Wi-Fi 配置、手表密钥、热点密码。固件、分区表与 SPIFFS 文件不受影响。</p>
 </div>
 </section>
 
@@ -6828,8 +6827,11 @@ function showTab(name){
   else if(name==='net') loadNet();
   else if(name==='bt') loadWatch();
   else if(name==='res') loadRes();
-  else if(name==='tools'){ loadPrefs(); }
-  else if(name==='sys') loadSys();
+  else if(name==='tools'){
+    // 「设置」就是原来的工具页：固件升级、重启、恢复出厂、偏好都收在这里
+    loadPrefs();
+    loadSys();
+  }
 }
 /* ---------- 流量 ---------- */
 var sparkMax=1;
@@ -7025,16 +7027,46 @@ async function loadSys(){
   var d=await api('/api/v1/status');
   if(!d||d.ok===false) return;
   $('yVer').textContent=d.fwVersionFull||d.fwVersion||'—';
-  $('yBuild').textContent=verParts(d);
-  $('yChan').textContent=d.fwChannel||'—';
-  if(d.otaRollback){
-    $('otaBadCard').style.display='';
-    $('otaBadText').textContent='目标版本 '+(d.otaRollbackExpected||'未知')+
-      ' 未能启动，设备已自动回滚到 '+(d.otaRollbackRunning||d.fwVersionFull||'旧版本')+
-      '。可重新上传固件再试；若反复回滚，请用数据线整片刷写并查看串口日志。';
-  } else {
-    $('otaBadCard').style.display='none';
+  $('yHw').textContent=d.fwHardware||'—';
+  $('yFlash').textContent=d.flashSize?(Math.round(d.flashSize/1048576)+' MB'):'—';
+  $('yPart').textContent=d.appPartition
+    ? (d.appPartition+' · '+Math.round((d.appPartitionSize||0)/1024)+' KB')
+    : '—';
+  $('yUp').textContent=uptimeText(d.uptime);
+  $('yMem').textContent=d.heapFree!==undefined?(Math.round(d.heapFree/1024)+' KB'):'—';
+  $('yMemMin').textContent=d.heapMinFree!==undefined?(Math.round(d.heapMinFree/1024)+' KB'):'—';
+
+  // OTA 槽：直接列出两个槽里实际躺着的镜像，升级后核对版本不用翻日志
+  var slots=$('ySlots');
+  var list=(d.otaSlots||[]);
+  if(!list.length){ slots.innerHTML='<div class="item" style="cursor:default"><span>未读到分区信息</span></div>'; }
+  else{
+    slots.innerHTML=list.map(function(o){
+      var txt=o.hasImage?(o.version||'未知版本')+(o.built?(' · '+o.built):''):'空';
+      return '<div class="item" style="cursor:default"><span>'+
+        '<i class="dot '+(o.running?'ok':'mid')+'"></i>'+o.label+(o.running?'（运行中）':'')+
+        '</span><small>'+txt+'</small></div>';
+    }).join('');
   }
+
+  if(d.otaRollback){
+    $('otaBadBox').style.display='';
+    $('otaBadNone').style.display='none';
+    $('otaBadText').textContent='目标版本 '+(d.otaRollbackExpected||'未知')+
+      ' 未能启动，设备已回滚到 '+(d.otaRollbackRunning||d.fwVersionFull||'旧版本')+
+      '。可重新刷写；反复回滚时改用数据线整片刷写。';
+  } else {
+    $('otaBadBox').style.display='none';
+    $('otaBadNone').style.display='';
+  }
+}
+function uptimeText(sec){
+  sec=Math.floor(sec||0);
+  if(!sec) return '—';
+  var dd=Math.floor(sec/86400), hh=Math.floor(sec%86400/3600), mm=Math.floor(sec%3600/60);
+  if(dd) return dd+' 天 '+hh+' 小时';
+  if(hh) return hh+' 小时 '+mm+' 分';
+  return mm+' 分 '+(sec%60)+' 秒';
 }
 /* ---------- 状态轮询 ---------- */
 var lastRx=0,lastTx=0;
@@ -7085,7 +7117,7 @@ async function refresh(){
   $('dSp').textContent=d.spiffsPartitionSize?Math.round(d.spiffsPartitionSize/1024)+' KB':'—';
   // 设备事件只在首页/系统页可见，别的分页没必要拉，省一次请求和一块堆。
   var nowMs=Date.now();
-  if((activeTab==='dash'||activeTab==='sys') && nowMs-devLogAt>6000){ devLogAt=nowMs; syncDeviceLogs(); }
+  if((activeTab==='dash'||activeTab==='tools') && nowMs-devLogAt>6000){ devLogAt=nowMs; syncDeviceLogs(); }
   if(d.fwVersionFull||d.fwVersion) $('fwTag').textContent=d.fwVersionFull||d.fwVersion;
   if(d.autoReset!==undefined) renderAuto(d);
   $('pollHint').textContent = '· '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
@@ -7338,136 +7370,7 @@ function pollInst(){
 
 document.addEventListener('change',function(ev){
   if(ev.target && (ev.target.id==='wfFile'||ev.target.id==='appFile')) uploadRes(ev.target);
-  if(ev.target && ev.target.id==='fwFile') uploadFw(ev.target);
 });
-
-/* ---------- 固件升级 -------------------------------------------------------
-   网关模式下直接写空闲 OTA 分区，写完重启生效，不再切「空中升级」模式。 */
-
-function fwEsc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){
-  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
-
-function fwSize(n){ n=n||0; return n>=1024*1024 ? (n/1048576).toFixed(2)+' MB' : Math.round(n/1024)+' KB'; }
-
-function uploadFw(input){
-  var f=input.files&&input.files[0];
-  if(!f) return;
-  var bar=$('fwBar'), prog=$('fwProgress');
-  if(!/\.bin$/i.test(f.name)){ bar.textContent='只接受 .bin 文件'; input.value=''; return; }
-  if(f.size>6*1024*1024){ bar.textContent='文件超过 6 MB，超出升级分区容量'; input.value=''; return; }
-  // 上传前先自检镜像头：app 镜像首字节必须是 0xE9，且 0x20 处是 esp_app_desc_t
-  // 魔数 0xABCD5432。选错文件（比如 -factory.bin 或压缩包）在这里就能拦住，
-  // 不用把 1.6 MB 传完再被设备拒绝。设备侧也有同一道检查，两边都留着。
-  return checkFwHeader(f).then(function(why){
-    if(why){ bar.textContent=why; prog.style.background='#e74c3c'; input.value=''; return; }
-    if(!confirm('刷入 '+f.name+' ？\n\n写入期间蓝牙桥接暂停约 10 至 30 秒，完成后设备自动重启。\n新固件若无法启动，会自动退回当前版本。')){ input.value=''; return; }
-    startFwUpload(f,input,bar,prog);
-  });
-}
-function checkFwHeader(f){
-  return new Promise(function(resolve){
-    if(f.size<64){ resolve('文件太小，不像固件镜像'); return; }
-    var fr=new FileReader();
-    fr.onload=function(){
-      var b=new Uint8Array(fr.result);
-      if(b[0]!==0xE9) { resolve('不是 ESP32 应用镜像（首字节 '+(b[0]||0).toString(16)+'，应为 e9）'); return; }
-      var magic=(b[0x20]|(b[0x21]<<8)|(b[0x22]<<16)|(b[0x23]<<24))>>>0;
-      if(magic!==0xABCD5432){ resolve('缺少应用描述符（magic='+magic.toString(16)+'），这是整包或表盘文件，不能网页升级'); return; }
-      resolve('');
-    };
-    fr.onerror=function(){ resolve('读取文件失败，请重新选择'); };
-    fr.readAsArrayBuffer(f.slice(0,64));
-  });
-}
-function startFwUpload(f,input,bar,prog){
-
-  var fd=new FormData(); fd.append('file',f,f.name);
-  var xhr=new XMLHttpRequest();
-  xhr.open('POST','/api/v1/ota/upload');
-  xhr.setRequestHeader('X-Vela-Token',VELA_TOKEN);
-  prog.style.width='0'; prog.style.background='';
-  bar.textContent='准备写入…';
-  var pct=0;
-  xhr.upload.onprogress=function(e){
-    if(!e.lengthComputable) return;
-    pct=Math.min(100,Math.round(e.loaded/e.total*100));
-    prog.style.width=pct+'%';
-    bar.textContent='写入中 '+pct+'%（'+fwSize(e.loaded)+' / '+fwSize(e.total)+'）';
-  };
-  var sentAt=Date.now();
-  log('固件上传开始 '+f.name+'（'+fwSize(f.size)+'）');
-  xhr.onload=function(){
-    var j={}; try{ j=JSON.parse(xhr.responseText); }catch(e){}
-    if(j.ok){
-      log('固件写入成功 '+(j.version||'')+' → '+(j.target||'?')+'，设备重启中');
-      prog.style.width='100%';
-      bar.textContent='写入完成，共 '+fwSize(j.size)+(j.version?('，版本 '+fwEsc(j.version)):'')+'，设备重启中…';
-      setTimeout(function(){
-        document.body.innerHTML='<div style="text-align:center;padding:56px 20px">'+
-          '<h2 style="margin:12px 0">固件已写入</h2>'+
-          '<p class="muted">设备正在重启，约 15 秒后恢复。<br>刷新本页面可查看新版本。</p></div>';
-      },1200);
-    } else if(j.error==='no_data'&&!j.hint){
-      bar.textContent='设备没收到文件内容（多半是路径没匹配或请求被挡）。已做镜像头自检，仍失败请看「设备事件」。';
-      log('固件上传无数据');
-      input.value='';
-    } else {
-      prog.style.background='#e74c3c';
-      bar.textContent='写入失败：'+fwEsc(j.error||('HTTP '+xhr.status))+(j.hint?(' — '+fwEsc(j.hint)):'');
-      log('固件写入失败：'+(j.error||('HTTP '+xhr.status))+(j.hint?(' / '+(j.hint)):''));
-      input.value='';
-    }
-  };
-  xhr.ontimeout=function(){
-    prog.style.background='#e74c3c';
-    bar.textContent='设备长时间没有响应，可能正在重启或链路中断';
-    input.value='';
-  };
-  xhr.onerror=function(){
-    var waited=Math.round((Date.now()-sentAt)/1000);
-    prog.style.background='#e74c3c';
-    // 进度走满后设备会立刻重启，浏览器此时断开是正常现象；没走满就是真断了。
-    // 以前这里一律报「上传中断」，用户会以为没写进去。
-    if(pct>=100){
-      bar.textContent='进度已走满，设备正在重启。约 15 秒后刷新页面确认版本。';
-      log('固件上传完成，连接随设备重启断开');
-    } else {
-      bar.textContent='上传在第 '+pct+'% 中断（'+waited+' 秒）';
-      log('固件上传中断于 '+pct+'%，设备事件里可看 OTA_ABORT / OTA_REJECT');
-    }
-    input.value='';
-  };
-  xhr.timeout=120000;
-  xhr.send(fd);
-}
-
-// 上传诊断：直接问设备「最近一次上传走到哪一步」。上传失败时用户不用去
-// 别处翻日志，点一下就有结论：phase=none 说明请求根本没进上传回调。
-async function fwDiag(){
-  var box=$('fwDiag');
-  box.textContent='读取中…';
-  var d=await api('/api/v1/ota/upload/diag');
-  if(!d||!d.ok){ box.textContent='读不到设备状态，可能正在重启'; return; }
-  var map={file_start:'已收到文件头',file_write:'正在写入',file_end:'写入结束，等待校验',
-           aborted:'上传被中断',done:'已完成并重启',none:'没有收到任何上传'};
-  box.textContent='阶段：'+(map[d.phase]||d.phase||'?')+'（'+d.written+' 字节）'
-    +(d.target?(' · 目标 ' + d.target):'')
-    +' · 堆 '+Math.round((d.freeHeap||0)/1024)+' KB'
-    +' · 写入速度 '+(d.kbps||0)+' KB/s'
-    +' · 分区写入占用 '+(d.updateRunning?'是':'否')
-    +(d.error?(' · 错误 '+d.error):'');
-}
-
-// 安全模式：只停蓝牙桥接，其他一概不动。上传失败如果是因为蓝牙/内存把
-// 设备压垮（症状是传到某个百分比就断开、设备重启），关掉桥接后内存和
-// CPU 都松下来，同样的上传就能过去。刷完要手动重连手表。
-async function fwSafeMode(){
-  var d=await api('/api/v1/upload/safe-mode',{method:'POST'});
-  if(!d||!d.ok){ toast('切换失败：'+((d&&d.error)||'')||'', true); return; }
-  toast(d.bridgeStopped?'已停蓝牙桥接，现在可以重新上传':'蓝牙桥接本来就没在跑，直接上传吧');
-  log('安全模式：'+JSON.stringify(d));
-  refresh();
-}
 
 // 统一事件委托：所有按钮用 data-act，避免内联 onclick 的引号地狱
 document.addEventListener('click',function(ev){
@@ -7506,8 +7409,6 @@ document.addEventListener('click',function(ev){
   else if(act==='watchRestart') watchRestart();
   else if(act==='contextReset') contextReset();
   else if(act==='pushText') pushText();
-  else if(act==='fwDiag') fwDiag();
-  else if(act==='fwSafe') fwSafeMode();
   else if(act==='pushPreset'){ $('pushText').value=b.dataset.arg||''; pushText(); }
   else if(act==='syncClock') syncClock();
   else if(act==='tz-preset'){ $('tzInput').value=b.dataset.arg; syncClock(); }
@@ -7719,6 +7620,9 @@ void handleStatus(bool publicSetup) {
   d["fwSize"] = static_cast<uint32_t>(ESP.getSketchSize());
   d["heapFree"] = static_cast<uint32_t>(ESP.getFreeHeap());
   d["heapMinFree"] = static_cast<uint32_t>(ESP.getMinFreeHeap());
+  // 运行时长：系统页「设备信息」直接显示，省得用户自己拿开机时间换算。
+  d["uptime"] = static_cast<uint32_t>(millis() / 1000u);
+  d["freeSketchSpace"] = static_cast<uint32_t>(ESP.getFreeSketchSpace());
   // 状态接口是管理台每次轮询都会调的，在这里顺手触发一次文件系统挂载：
   // 用户打开页面后，后面的固件库、表盘上传才有可用的文件系统。
   // 挂载成功后只是读一个 bool，未挂载时最多起一个后台格式化任务，不会阻塞。
@@ -8928,7 +8832,7 @@ static String sVersion;           // 从镜像 app 描述符读出的版本
 static String sTargetLabel;       // 本次写入的分区
 // 最近一次上传停在哪个阶段：upload_page / upload_callback 里没有阶段名的话，
 // 「页面没反应」和「传到一半断了」在设备侧看起来一模一样。
-static uint8_t sPhase = 0;        // 0=未开始 1=START 2=WRITE 3=END 4=ABORTED 5=完成重启
+static uint8_t sPhase = 0;        // 0=未开始 1=START 2=WRITE 3=END 4=ABORTED 5=已提交待重启
 static uint32_t sLastRxMs = 0;
 // 写入速度：本次上传的字节数与起点，用来判断「卡住」到底是断链还是擦写太慢。
 static uint32_t sStartedAtMs = 0;
@@ -8940,7 +8844,7 @@ const char* phaseName() {
     case 2: return "file_write";
     case 3: return "file_end";
     case 4: return "aborted";
-    case 5: return "done";
+    case 5: return "committed";
     default: return "none";
   }
 }
@@ -9594,9 +9498,10 @@ void setupRoutes() {
   // ==================== 固件库 ====================
   // 上传 → 列表 → 选中安装 → 删除。安装只是「标记 + 延时」，真正写 OTA 分区
   // 在 loop() 里做（fwlib::servicePending），这样 HTTP 响应能先回给浏览器。
-  // 系统页固件升级：网关模式下直接写空闲 OTA 分区，写完重启生效。
-  // 与 /ota/upload2 的区别是不要求先切到空中升级模式，也不经过 SPIFFS，
-  // 因此不会碰到文件系统首次格式化那二三十秒。
+  // 网关模式直写升级：网关模式下直接写空闲 OTA 分区，不经过 SPIFFS。
+  // 页面上的入口已在 v0.0.0.31 移除（主管理台不再提供第二条升级路径），
+  // 接口保留给脚本和旧页面；网页升级统一走设置页 →「进入空中升级」。
+  // 注意它写完后不再自动重启，需要显式调用 /api/v1/reboot 才生效。
   server.on("/api/v1/ota/upload", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
     JsonDocument d;
@@ -9646,11 +9551,12 @@ void setupRoutes() {
     Serial.printf("OTA_DIRECT_SUCCESS part=%s ver=%s bytes=%u\n",
                   otadirect::sTargetLabel.c_str(), otadirect::sVersion.c_str(),
                   static_cast<unsigned>(otadirect::sWritten));
-    otadirect::sPhase = 5;
+    // 不再在响应后固定 delay + ESP.restart()：页面会说「设备重启中」，
+    // 但如果这次写入被 bootloader 回滚，用户看到的就是版本没变、原因不明。
+    // 改成先停在待生效状态，页面自行确认，再决定何时重定向。
+    otadirect::sPhase = 3;
     velaLog("OTA_OK part=%s ver=%s bytes=%u", otadirect::sTargetLabel.c_str(),
             otadirect::sVersion.c_str(), static_cast<unsigned>(otadirect::sWritten));
-    delay(1200);
-    ESP.restart();
   }, otaDirectUploadCallback);
 
   server.on("/api/v1/firmware/upload", HTTP_POST, [](){
@@ -11334,7 +11240,9 @@ async function quickOtaPick(input){
       setTimeout(function(){
         document.body.innerHTML='<div style="text-align:center;padding:48px 16px">'+
         '<h2 style="margin:12px 0;color:#58a5ff">刷写完成</h2>'+
-        '<p class=muted>设备正在重启，热点约 15 秒后恢复。<br>热点恢复后刷新本页面即可查看新版本。</p></div>';
+        '<p class=muted>镜像已写入备用分区，重启后生效。<br>'+
+        '现在可以切回网关；不操作的话，3 分钟后设备自动返回。</p>'+
+        '<button class=btn-blue style="margin-top:14px" data-act="backGateway">返回网关并重启</button></div>';
       },1200);
     }else{
       txt.innerHTML='<span style="color:#e74c3c">'+(d?esc(d.error||'未知错误'):'响应异常')+'</span>';
@@ -11351,6 +11259,7 @@ document.addEventListener('click',function(ev){
   var b=ev.target.closest('[data-act]');
   if(!b)return;
   if(b.dataset.act==='quickOta')quickOta();
+  if(b.dataset.act==='backGateway')switchProj(1);
 });
 document.addEventListener('change',function(ev){
   if(ev.target&&ev.target.id==='quickFile')quickOtaPick(ev.target);
@@ -11385,7 +11294,10 @@ void loop() {
   }
 
   if (gOtaMode) {
-    if (gServerStarted) server.handleClient();
+    if (gServerStarted) {
+      gLastHttpActivityMs = millis();
+      server.handleClient();
+    }
     serviceHeartbeatLed();
     delay(2);
     return;
@@ -11523,5 +11435,22 @@ void loop() {
       gReconnectFailCount++;
     }
   }
+
+  // 空中升级模式的兜底返回：页面刷写成功后会调 /setup/project/switch 把
+  // project 改回 1。手机中途锁屏或页面被关掉时这个请求不会发出，设备就
+  // 一直停在只有热点的状态。这里在持续 3 分钟没有任何请求后自己切回网关，
+  // 用户不必长按 BOOT 才能救回来。
+  if (gOtaMode) {
+    const uint32_t activeMs = millis() - gLastHttpActivityMs;
+    if (gLastHttpActivityMs && activeMs > 180000u) {
+      Serial.printf("OTA_MODE_IDLE_SWITCH_BACK idle_ms=%lu\n",
+                    static_cast<unsigned long>(activeMs));
+      velaLog("OTA_MODE idle_switch_back");
+      prefs.putInt("project", 1);
+      delay(200);
+      ESP.restart();
+    }
+  }
+
   delay(2);
 }
