@@ -243,7 +243,7 @@ bool gLedOn = false;
 // PSRAM 占用的 16/17（仅当固件开启 PSRAM 时）。
 constexpr uint8_t kRgbLedCandidates[] = {2, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33};
 constexpr uint8_t kRgbLedCandidateCount = sizeof(kRgbLedCandidates) / sizeof(kRgbLedCandidates[0]);
-constexpr uint8_t kRgbLedDefaultPin = 16;
+constexpr uint8_t kRgbLedDefaultPin = 21; // YD-ESP32-B 商家页面确认：WS2812 DIN 接 GPIO21
 bool rgbPinUsable(int pin);
 void rgbLedPush(uint8_t pin, uint8_t r, uint8_t g, uint8_t b);
 void rgbLedClear();
@@ -6712,7 +6712,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 <section class="panel" id="p-tools">
 <div class="card">
   <h2>RGB 灯（WS2812）</h2>
-  <p class="hint">板载 WS2812 灯珠的 DIN 官方定义接在 GPIO16。注意：若模组为 ESP32-WROVER-E（带 PSRAM），GPIO16/17 被模组内部占用、未引出，固件无法直接驱动——此时需飞线：把灯珠 DIN 焊到任一空闲引脚（如 GPIO25），再到下方改引脚。带 PSRAM 的固件会自动禁用 16/17 选项。</p>
+  <p class="hint">板载 WS2812 灯珠 DIN 接 GPIO21（YD-ESP32-B 商家页面确认），固件默认即用 21。注意：早期资料曾写 GPIO16，但 WROVER-E 模组未引出 16/17，实际板卡走 21。若你的板子批次不同，可用下方全引脚扫描再改引脚。</p>
   <div class="mini"><b>当前引脚</b><span id="ledPinNow">—</span></div>
   <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">
     <button class="ghost" style="width:auto;padding:8px 14px;background:#e53935;border:none;color:#fff" data-act="ledColor" data-arg="255,0,0">红</button>
@@ -7530,30 +7530,20 @@ document.addEventListener('click',function(ev){
 
 async function ledColor(arg){
   const [r,g,b]=arg.split(',').map(Number);
-  try{
-    const res=await fetch('/api/v1/led/test?r='+r+'&g='+g+'&b='+b,{method:'POST'});
-    if(res.ok){ $('ledScanMsg').textContent='已发送颜色 ('+r+','+g+','+b+')'; }
-    else{ const j=await res.json().catch(()=>({})); $('ledScanMsg').textContent='失败：'+(j.error||res.status); }
-  }catch(e){ $('ledScanMsg').textContent='失败：'+e.message; }
+  const j=await api('/api/v1/led/test?r='+r+'&g='+g+'&b='+b,{method:'POST'});
+  $('ledScanMsg').textContent=(j&&j.ok!==false&&!j.error)?'已发送颜色 ('+r+','+g+','+b+')':'失败：'+((j&&(j.error||j.message))||'未知');
 }
 async function ledScan(){
   $('ledScanMsg').textContent='扫描中，请勿断电，全程约 25 秒…';
-  try{
-    const res=await fetch('/api/v1/led/scan',{method:'POST'});
-    const j=await res.json();
-    if(res.ok){ $('ledScanMsg').textContent='扫描完成。若看到灯亮，请记住对应引脚并在上方保存。'; }
-    else{ $('ledScanMsg').textContent='扫描失败：'+(j.error||res.status); }
-  }catch(e){ $('ledScanMsg').textContent='扫描失败：'+e.message; }
+  const j=await api('/api/v1/led/scan',{method:'POST'});
+  $('ledScanMsg').textContent=(j&&j.ok!==false&&!j.error)?'扫描完成。若看到灯亮，请记住对应引脚并在上方保存。':'扫描失败：'+((j&&(j.error||j.message))||'未知');
 }
 async function ledSavePin(){
   const v=parseInt($('ledPinInput').value,10);
   if(isNaN(v)||v<0||v>39){ $('ledScanMsg').textContent='请输入 0-39 的引脚号'; return; }
-  try{
-    const res=await fetch('/api/v1/led/pin?pin='+v,{method:'POST'});
-    const j=await res.json();
-    if(res.ok){ $('ledPinNow').textContent=v+'（已保存）'; $('ledScanMsg').textContent='引脚已保存为 '+v+'，可点上方颜色按钮测试。'; }
-    else{ $('ledScanMsg').textContent='保存失败：'+(j.error||res.status); }
-  }catch(e){ $('ledScanMsg').textContent='保存失败：'+e.message; }
+  const j=await api('/api/v1/led/pin?pin='+v,{method:'POST'});
+  if(j&&j.ok!==false&&!j.error){ $('ledPinNow').textContent=v+'（已保存）'; $('ledScanMsg').textContent='引脚已保存为 '+v+'，点上方颜色按钮测试。'; }
+  else{ $('ledScanMsg').textContent='保存失败：'+((j&&(j.error||j.message))||'未知'); }
 }
 async function watchRestart(){
   toast('正在重新连接手表…');

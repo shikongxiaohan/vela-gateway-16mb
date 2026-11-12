@@ -2,7 +2,7 @@
 
 基于 ESP32 的智能手表网络桥接固件。设备通过蓝牙 SPP 与手表建立数据链路，通过 Wi-Fi 接入本地网络，在两者之间完成 IP 层转发，使不具备 Wi-Fi 能力的手表获得网络访问能力。
 
-当前版本 v0.0.0.38，RAM 占用 24.0%，Flash 占用 26.4%。
+当前版本 v0.0.0.39，RAM 占用 24.0%，Flash 占用 26.2%。
 
 ## 功能
 
@@ -18,7 +18,7 @@
 | 主控 | ESP32（ESP32-WROVER-E N16R8） |
 | Flash | 16 MB |
 | PSRAM | 8 MB（v38 起保守启用：BOOT_INIT + 仅 heap_caps 分配，不重定向 malloc） |
-| 板载 RGB | WS2812，DIN 官方定义接 GPIO16（WROVER-E 模组未引出该脚，需飞线到空闲脚如 GPIO25，详见设置页「RGB 灯」卡片） |
+| 板载 RGB | WS2812，DIN 接 GPIO21（YD-ESP32-B 商家页面确认），设置页可测色/扫描/改引脚 |
 | 开发板 | YD-ESP32-B |
 | 软件框架 | Arduino + ESP-IDF 4.4.4 |
 
