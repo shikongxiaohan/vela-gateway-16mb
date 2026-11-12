@@ -228,15 +228,31 @@ bool gDisplayReady = false;
 bool gDisplayInitDeferred = false;
 uint32_t gLastDisplayMs = 0;
 
-// ---------- 心跳 LED（板载 D2 = GPIO2 = LED_BUILTIN）----------
-// 在 loop() 里按桥接状态以不同频率翻转，既指示主循环存活，也反映当前状态。
-#if defined(LED_BUILTIN)
-constexpr int kHeartbeatLedPin = LED_BUILTIN;
-#else
-constexpr int kHeartbeatLedPin = 2;  // 板载 LED：GPIO2（丝印 D2）
-#endif
+// ---------- 板载 RGB 灯（WS2812）----------
+// 这颗灯珠自带控制芯片，靠单根数据线的脉宽编码接收颜色（GRB 24 位，
+// 800 kHz），普通 digitalWrite 的高低电平对它无效。
+//
+// 引脚：开发板丝印与原理图未标出模块模组具体接在哪个 GPIO。源码历史上按
+// “D2 = GPIO2” 的高电平点亮方式写过，与实测「灯效不生效」一致。这里把
+// 候选引脚做成运行时可切换，用 /api/v1/led/scan 逐个试，找到能点亮的那一个
+// 后写进偏好（led_pin），下次开机直接用它。
+constexpr uint8_t kRgbLedCandidates[] = {2, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33};
+constexpr uint8_t kRgbLedCandidateCount = sizeof(kRgbLedCandidates) / sizeof(kRgbLedCandidates[0]);
+constexpr uint8_t kRgbLedDefaultPin = 2;
 bool gLedOn = false;
 uint32_t gLastLedMs = 0;
+
+// WS2812 位时序换算成 RMT tick：一格 32 位（高 16 位高电平 ticks，低 16 位低电平 ticks）。
+// 80 MHz / 800 kHz = 100 ticks 一位。
+//   '0'：高 0.35 µs / 低 0.80 µs → 28 / 52 ticks
+//   '1'：高 0.70 µs / 低 0.60 µs → 56 / 44 ticks
+constexpr uint32_t kWs2812BitTicks = 100;
+void rgbLedPush(uint8_t pin, uint8_t r, uint8_t g, uint8_t b);
+void rgbLedClear();
+void rgbLedRestorePin();
+void rgbLedInit();
+bool rgbLedReady();
+static bool rgbLedBegin(uint8_t pin);
 
 // 显示函数定义在状态变量之后（见文件后部），那里 gSetupMode /
 // gWatchBridgeState / 网络计数器等均已声明。
@@ -375,12 +391,15 @@ static uint32_t gTrafficHistLastTx = 0;
 
 // 日志环形缓冲：抓关键事件（连接/断开/重连/恢复出厂/OTA），
 // 页面「运行日志」区可直接查看，无需接入串口。
-constexpr uint8_t kLogRingLines = 24;
+constexpr uint16_t kLogRingLines = 64;
 constexpr uint8_t kLogLineMax = 96;
 static char gLogRing[kLogRingLines][kLogLineMax] = {{0}};
 static uint32_t gLogRingMs[kLogRingLines] = {0};
-static uint8_t gLogRingNext = 0;
-static uint8_t gLogRingCount = 0;
+// 每行一个单调递增序号：页面按 seq 增量拉取，不必每次整环重传。
+static uint32_t gLogRingSeq[kLogRingLines] = {0};
+static uint32_t gLogRingNextSeq = 1;
+static uint16_t gLogRingNext = 0;
+static uint16_t gLogRingCount = 0;
 // 写日志的线程不止一个：蓝牙任务（推送结果）、HTTP 任务（改配置、OTA）、
 // 主循环。环形缓冲的 next/count 是跨线程的共享下标，被别的任务切一下就会
 // 写串行或者漏一行，所以这里用递归锁保护。
@@ -396,7 +415,8 @@ static void velaLog(const char* fmt, ...) {
                       xSemaphoreTakeRecursive(gLogMutex, pdMS_TO_TICKS(20)) == pdTRUE;
   snprintf(gLogRing[gLogRingNext], kLogLineMax, "%s", line);
   gLogRingMs[gLogRingNext] = millis();
-  gLogRingNext = static_cast<uint8_t>((gLogRingNext + 1) % kLogRingLines);
+  gLogRingSeq[gLogRingNext] = gLogRingNextSeq++;
+  gLogRingNext = static_cast<uint16_t>((gLogRingNext + 1) % kLogRingLines);
   if (gLogRingCount < kLogRingLines) ++gLogRingCount;
   if (locked) xSemaphoreGiveRecursive(gLogMutex);
   Serial.printf("LOG %s\n", line);
@@ -1196,30 +1216,163 @@ void getTrafficLedTiming(uint32_t bps, uint32_t& onMs, uint32_t& offMs) {
   }
 }
 
+// ===== WS2812 驱动（RMT 发送，不占 CPU，发完即返回）=====
+#include <driver/rmt.h>
+
+static rmt_channel_t gRgbRmtChannel = RMT_CHANNEL_0;
+static bool gRgbRmtReady = false;
+static uint8_t gRgbPin = kRgbLedDefaultPin;
+static uint32_t gRgbLastPushMs = 0;
+
+bool rgbLedReady() { return gRgbRmtReady; }
+
+// 已知的、几乎不可能有 WS2812 的引脚：
+//   GPIO6~11 接 SPI Flash，动了直接起不来；
+//   GPIO0 是 BOOT 键，拉高会干扰长按检测；
+//   GPIO34~39 只能是输入，推不出数据；
+//   GPIO1/3 是串口日志。
+static bool rgbPinUsable(int pin) {
+  if (pin >= 6 && pin <= 11) return false;
+  if (pin == 0 || pin == 1 || pin == 3) return false;
+  if (pin >= 34 && pin <= 39) return false;
+  return true;
+}
+
+// 开机初始化：优先用上次 /api/v1/led/pin 固定下来的引脚，没有就用默认。
+void rgbLedInit() {
+  const uint8_t saved = prefs.getUChar("led_pin", kRgbLedDefaultPin);
+  gRgbPin = saved;
+  rgbLedBegin(saved);
+  rgbLedClear();
+  Serial.printf("RGB_LED init pin=%u rmt=%d\n", saved, gRgbRmtReady ? 1 : 0);
+}
+uint8_t rgbLedPin() { return gRgbPin; }
+
+// 复位引脚上的残留配置，换引脚前调用。RMT 的引脚绑定不随通道删除自动解绑，
+// 不显式 rmt_set_pin(pin, RMT_MODE_TX, RMT_PIN_NO_CHANGE) 会把旧引脚一直拉住。
+static void rgbLedDetach() {
+  if (!gRgbRmtReady) return;
+  rmt_set_pin(gRgbRmtChannel, RMT_MODE_TX, GPIO_NUM_MAX);
+}
+
+// 纯软件实现的备用路径：RMT 不可用时退化成忙等，够驱动一颗灯珠（24×1.25 µs）。
+// 只在 RMT 初始化失败时才走这里，正常情况不会占用主循环时间。
+static void ws2812BitBang(uint8_t pin, uint8_t r, uint8_t g, uint8_t b) {
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
+  const uint8_t grb[3] = {g, r, b};
+  for (int i = 0; i < 3; ++i) {
+    const uint8_t v = grb[i];
+    for (int bit = 7; bit >= 0; --bit) {
+      digitalWrite(pin, HIGH);
+      if (v & (1u << bit)) {
+        delayMicroseconds(1);   // '1'：约 0.7 µs 高
+        digitalWrite(pin, LOW);
+        delayMicroseconds(1);   // 约 0.6 µs 低
+      } else {
+        digitalWrite(pin, LOW);
+        delayMicroseconds(1);   // '0'：约 0.35 µs 高 / 0.8 µs 低
+      }
+    }
+  }
+  delayMicroseconds(60);        // 复位：>50 µs 低电平
+}
+
+static bool rgbLedBegin(uint8_t pin) {
+  rgbLedDetach();
+  if (gRgbRmtReady) {
+    rmt_driver_uninstall(gRgbRmtChannel);
+    gRgbRmtReady = false;
+  }
+  rmt_config_t cfg = RMT_DEFAULT_CONFIG_TX(static_cast<gpio_num_t>(pin), gRgbRmtChannel);
+  cfg.clk_div = 1;            // 80 MHz
+  cfg.mem_block_num = 1;
+  cfg.tx_config.loop_en = false;
+  cfg.tx_config.carrier_en = false;
+  cfg.tx_config.idle_output_en = true;
+  cfg.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
+  if (rmt_config(&cfg) != ESP_OK || rmt_driver_install(gRgbRmtChannel, 0, 0) != ESP_OK) {
+    Serial.printf("RGB_LED rmt_init_failed pin=%u (fallback bitbang)\n", pin);
+    gRgbRmtReady = false;
+    gRgbPin = pin;
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+    return false;
+  }
+  gRgbRmtReady = true;
+  gRgbPin = pin;
+  Serial.printf("RGB_LED rmt_ready pin=%u\n", pin);
+  return true;
+}
+
+void rgbLedPush(uint8_t pin, uint8_t r, uint8_t g, uint8_t b) {
+  if (pin != gRgbPin || !gRgbRmtReady) {
+    if (!rgbLedBegin(pin) || !gRgbRmtReady) {
+      ws2812BitBang(pin, r, g, b);
+      gRgbLastPushMs = millis();
+      return;
+    }
+  }
+  rmt_item32_t items[24];
+  const uint8_t grb[3] = {g, r, b};   // WS2812 的传输顺序是 G→R→B
+  for (int i = 0; i < 3; ++i) {
+    for (int bit = 0; bit < 8; ++bit) {
+      const bool one = (grb[i] >> (7 - bit)) & 0x01;
+      rmt_item32_t& it = items[i * 8 + bit];
+      it.level0 = 1;
+      it.duration0 = one ? 56 : 28;
+      it.level1 = 0;
+      it.duration1 = one ? 44 : 52;
+    }
+  }
+  rmt_write_items(gRgbRmtChannel, items, 24, true);
+  gRgbLastPushMs = millis();
+}
+
+void rgbLedClear() { rgbLedPush(gRgbPin, 0, 0, 0); }
+
+// 扫描用：逐个候选引脚点一次绿光，调用方负责肉眼确认。
+void rgbLedScan(uint8_t pin, uint8_t r, uint8_t g, uint8_t b) { rgbLedPush(pin, r, g, b); }
+
 void serviceHeartbeatLed() {
   // 模式追踪：1=流量模式(双连), 2=部分连接, -1=未初始化
   static int8_t sLastMode = -1;
+  // 避免每毫秒都重发 RMT：WS2812 只要颜色不变就不用重复写。
+  static uint32_t sLastColor = 0xFFFFFFFFu;
+  static uint32_t sLastPushMs = 0;
+
+  auto push = [](uint8_t r, uint8_t g, uint8_t b) {
+    const uint32_t color = (static_cast<uint32_t>(r) << 16) |
+                           (static_cast<uint32_t>(g) << 8) | b;
+    if (color == sLastColor) return;
+    // 两次写入至少隔 1 ms，避免高频循环把 RMT 队列塞满
+    if (sLastColor != 0xFFFFFFFFu && millis() - sLastPushMs < 1) return;
+    sLastColor = color;
+    sLastPushMs = millis();
+    rgbLedPush(gRgbPin, r, g, b);
+  };
 
   // ===== 用户选择的手动灯效优先 =====
   // 0=关闭 1=常亮 2=呼吸 3=心跳 4=流量联动（默认，走下面原有逻辑）
   if (gLedMode != 4) {
     const uint32_t now = millis();
     switch (gLedMode) {
-      case 0: digitalWrite(kHeartbeatLedPin, LOW); break;
-      case 1: digitalWrite(kHeartbeatLedPin, HIGH); break;
-      case 2: {   // 呼吸：1.6 秒一个来回，三角波避免浮点
+      case 0: push(0, 0, 0); break;
+      case 1: push(0, 40, 120); break;          // 常亮：低亮度蓝
+      case 2: {   // 呼吸：1.6 秒一个来回
         const uint32_t phase = now % 1600;
         const uint32_t level = phase < 800 ? phase : (1600 - phase);
-        digitalWrite(kHeartbeatLedPin, level > 400 ? HIGH : LOW);
+        const uint8_t v = static_cast<uint8_t>(level * 60 / 800);
+        push(0, static_cast<uint8_t>(v / 3), v);
         break;
       }
       case 3: {   // 心跳：咚-咚 两下，间隔 1 秒
         const uint32_t phase = now % 1000;
         const bool beat = (phase < 90) || (phase >= 160 && phase < 250);
-        digitalWrite(kHeartbeatLedPin, beat ? HIGH : LOW);
+        push(0, beat ? 90 : 0, beat ? 40 : 0);
         break;
       }
-      default: digitalWrite(kHeartbeatLedPin, LOW); break;
+      default: push(0, 0, 0); break;
     }
     return;
   }
@@ -1282,7 +1435,7 @@ void serviceHeartbeatLed() {
       // 确实无流量：立即灭灯，重置相位
       if (gLedOn) {
         gLedOn = false;
-        digitalWrite(kHeartbeatLedPin, LOW);
+        rgbLedClear();
       }
       gTrafficLedPhaseOnMs = 0;
       gTrafficLedPhaseOffMs = 0;
@@ -1312,7 +1465,7 @@ void serviceHeartbeatLed() {
       gTrafficLedInOnPhase = true;
       if (!gLedOn) {
         gLedOn = true;
-        digitalWrite(kHeartbeatLedPin, HIGH);
+        rgbLedPush(gRgbPin, 0, 60, 20);
       }
       return;
     }
@@ -1325,7 +1478,7 @@ void serviceHeartbeatLed() {
       gTrafficLedInOnPhase = !gTrafficLedInOnPhase;
       gTrafficLedCycleStartMs = now;
       gLedOn = gTrafficLedInOnPhase;
-      digitalWrite(kHeartbeatLedPin, gTrafficLedInOnPhase ? HIGH : LOW);
+      if (gTrafficLedInOnPhase) rgbLedPush(gRgbPin, 0, 60, 20); else rgbLedClear();
     }
     return;
   }
@@ -1364,7 +1517,7 @@ void serviceHeartbeatLed() {
     sPartialInOnPhase = true;
     if (!gLedOn) {
       gLedOn = true;
-      digitalWrite(kHeartbeatLedPin, HIGH);
+      rgbLedPush(gRgbPin, 60, 30, 0);
     }
     return;
   }
@@ -1377,7 +1530,7 @@ void serviceHeartbeatLed() {
     sPartialInOnPhase = !sPartialInOnPhase;
     sPartialCycleStartMs = now2;
     gLedOn = sPartialInOnPhase;
-    digitalWrite(kHeartbeatLedPin, sPartialInOnPhase ? HIGH : LOW);
+    if (sPartialInOnPhase) rgbLedPush(gRgbPin, 60, 30, 0); else rgbLedClear();
   }
 }
 
@@ -5411,7 +5564,7 @@ static void factoryResetApply(const char* reason) {
     }
   }
 
-  digitalWrite(kHeartbeatLedPin, LOW);
+  rgbLedClear();
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   delay(150);
@@ -6502,6 +6655,8 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <div class="mini"><b>运行时长</b><span id="yUp">—</span></div>
   <div class="mini"><b>空闲内存</b><span id="yMem">—</span></div>
   <div class="mini"><b>历史最低内存</b><span id="yMemMin">—</span></div>
+  <div class="mini"><b>最大连续块</b><span id="yMemLargest">—</span></div>
+  <div class="mini"><b>PSRAM</b><span id="yPsram">—</span></div>
 </div>
 
 <div class="card">
@@ -6673,27 +6828,35 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 
 <div class="card">
   <h2>向手表推一条消息</h2>
-  <p class="hint">经已认证的 SPP 会话发送，手表侧以通知形式显示。要求桥接处于已连接状态。</p>
+  <p class="hint">经已认证的 SPP 会话发送，要求桥接处于已连接状态。</p>
   <label>内容（最多 400 字）</label>
   <input id="pushText" autocomplete="off" placeholder="输入要推送的文本内容">
   <div class="row" style="margin-top:9px">
     <button data-act="pushText">发送到手表</button>
     <button class="ghost" data-act="pushPreset" data-arg="测试消息：网关工作正常">发送测试消息</button>
   </div>
+  <div id="pushResult" class="muted" style="margin-top:8px"></div>
 </div>
 </section>
 
 <section class="panel" id="p-tools">
 <div class="card">
-  <h2>LED 灯效</h2>
-  <p class="hint">板载 LED 位于 GPIO2。默认模式为流量联动，仅在数据转发时闪烁。</p>
+  <h2>板载 RGB 灯</h2>
+  <p class="hint">板载为 WS2812 灯珠，默认模式为流量联动，仅在数据转发时亮起。</p>
   <div class="row3" id="ledGroup">
     <button class="ghost" data-act="led" data-arg="0">关闭</button>
     <button class="ghost" data-act="led" data-arg="1">常亮</button>
     <button class="ghost" data-act="led" data-arg="2">呼吸</button>
     <button class="ghost" data-act="led" data-arg="3">心跳</button>
     <button class="ghost" data-act="led" data-arg="4">流量联动</button>
-    <button class="ghost" data-act="ledTest">点亮 1.5 秒</button>
+    <button class="ghost" data-act="ledTest">点亮测试</button>
+  </div>
+  <div class="mini" style="margin-top:8px"><b>当前引脚</b><span id="ledPinNow">—</span></div>
+  <button class="ghost" style="width:100%;margin-top:8px" data-act="ledScan">扫描引脚</button>
+  <p class="hint" style="margin-top:8px">灯不亮时点扫描：设备依次用 19 个可用引脚各点一次绿灯，每次约 0.6 秒，全程约 15 秒。GPIO21/22 是 OLED 的 I2C 线，扫到这两根时若接了屏幕可能短暂无响应，属正常。看到灯亮的那个引脚号记下来，填入下方并保存。扫描期间蓝牙转发会暂停。</p>
+  <div class="row" style="margin-top:8px">
+    <input id="ledPinInput" type="number" inputmode="numeric" placeholder="引脚号，如 4" style="flex:1">
+    <button class="ghost" style="width:auto;padding:8px 14px" data-act="ledSavePin">保存引脚</button>
   </div>
 </div>
 
@@ -6728,8 +6891,15 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 <div class="card" id="logCard">
   <h2>运行日志 <span class="muted" style="font-weight:400">· 本页操作</span></h2>
   <div class="log" id="oLocal">就绪</div>
-  <h2 style="margin-top:12px">设备事件 <span class="muted" style="font-weight:400">· 最近 24 条</span></h2>
-  <div class="log" id="oDev">（暂无事件）</div>
+
+  <h2 style="margin-top:12px">设备日志 <span class="muted" style="font-weight:400">· 最近 64 条</span></h2>
+  <div class="row3" style="margin:8px 0">
+    <button class="ghost" style="padding:8px 0;font-size:13px" id="devLogLive" data-act="devLogLive">暂停刷新</button>
+    <button class="ghost" style="padding:8px 0;font-size:13px" data-act="devLogCopy">复制</button>
+    <button class="ghost" style="padding:8px 0;font-size:13px" data-act="devLogClear">清屏</button>
+  </div>
+  <div class="log" id="oDev" style="max-height:340px">（暂无事件）</div>
+  <p class="hint" style="margin-top:8px">这里是设备自己记的事件，不是浏览器控制台。设备日志只保留最近 64 条，重启后清空；串口输出（USB 连接时可用）包含更完整的信息。</p>
 </div>
 
 </section>
@@ -6770,26 +6940,83 @@ function toast(msg,err){
 // 运行日志：上半区是本页操作，下半区是设备侧事件（/api/v1/logs 环形缓冲）。
 // 以前这里只有一个本地 log()，只能看到浏览器自己干的事；升级失败、推送失败
 // 这些真正有用的原因全在设备里，不开串口根本看不到。
-var _devLogSig='', devLogAt=0;
+var _devLogSig='', devLogAt=0, devLogInited=false;
 function log(msg){
   var line=new Date().toLocaleTimeString('zh-CN',{hour12:false})+'  '+msg;
   var o=$('oLocal');
   o.textContent=line+'\n'+o.textContent;
   if(o.textContent.length>4000) o.textContent=o.textContent.slice(0,4000);
 }
+// 设备日志查看器。
+// 用 since=seq 增量拉：每次只取上一轮之后新增的行，不用整环重传。
+// 设备环形缓冲是固定 64 行，被覆盖掉的行取不回来，所以本地保留一份
+// 最多 300 行的历史，翻历史时能看到被覆盖之前的行。
+var _devLogLines=[], _devLogSeq=0, _devLogLive=true, _devLogBusy=false;
 async function syncDeviceLogs(){
-  var d=await api('/api/v1/logs');
-  if(!d||!d.ok||!d.lines) return;
+  if(_devLogBusy) return;
+  _devLogBusy=true;
+  try{
+    var d=await api('/api/v1/logs?since='+_devLogSeq);
+    if(!d||!d.ok||!d.lines) return;
+    var added=0;
+    for(var i=0;i<d.lines.length;i++){
+      var l=d.lines[i];
+      if(!l||!l.m||!l.seq) continue;
+      _devLogLines.push(l);
+      if(l.seq>_devLogSeq) _devLogSeq=l.seq;
+      added++;
+    }
+    if(_devLogLines.length>300) _devLogLines=_devLogLines.slice(-300);
+    if(added && _devLogLive) renderDeviceLogs();
+  } finally { _devLogBusy=false; }
+}
+function renderDeviceLogs(){
+  if(!_devLogLines.length){ $('oDev').textContent='（暂无事件）'; return; }
+  var el=$('oDev');
+  var atBottom=el.scrollTop+el.clientHeight>=el.scrollHeight-8;
   var out=[];
-  for(var i=d.lines.length-1;i>=0;i--){
-    var l=d.lines[i];
-    if(!l||!l.m) continue;
-    out.push(new Date(l.t||0).toLocaleTimeString('zh-CN',{hour12:false})+'  '+l.m);
+  for(var i=_devLogLines.length-1;i>=0;i--){
+    var l=_devLogLines[i];
+    // 时间取 l.t（设备 millis()），显示为相对开机时长，如 +01:23。
+    // 设备未同步 NTP 时没有可靠的日历时间，用相对时间不会给出错误日期。
+    // 时间戳右对齐到固定宽度（设备最长跑到 9:59:59），让日志正文从同一列开始
+    var ts='+'+fmtMs(l.t||0);
+    while(ts.length<9) ts=' '+ts;
+    out.push(ts+'  '+l.m);
   }
   var txt=out.join('\n');
   if(txt===_devLogSig) return;
   _devLogSig=txt;
-  $('oDev').textContent=txt||'（暂无事件）';
+  el.textContent=txt;
+  if(atBottom) el.scrollTop=el.scrollHeight;
+}
+function fmtMs(ms){
+  var s=Math.floor(ms/1000), m=Math.floor(s/60), h=Math.floor(m/60);
+  function p(n){ return n<10?('0'+n):(''+n); }
+  if(h) return h+':'+p(m%60)+':'+p(s%60);
+  return p(m)+':'+p(s%60);
+}
+function devLogToggle(){
+  _devLogLive=!_devLogLive;
+  var b=$('devLogLive');
+  if(b) b.textContent=_devLogLive?'暂停刷新':'继续刷新';
+  if(_devLogLive) syncDeviceLogs();
+}
+function devLogCopy(){
+  var txt=_devLogLines.map(function(l){
+    return '+'+(l.t||0)+'ms  '+(l.m||'');
+  }).join('\n');
+  if(!txt){ toast('还没有日志'); return; }
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(function(){ toast('已复制 '+_devLogLines.length+' 行'); },
+      function(){ toast('复制失败，浏览器不允许', true); });
+  } else {
+    toast('这个浏览器不支持复制', true);
+  }
+}
+function devLogClear(){
+  _devLogLines=[]; _devLogSig='';
+  $('oDev').textContent='（已清屏，只清本页缓存，不影响设备）';
 }
 async function api(path,opt){
   try{
@@ -6974,6 +7201,8 @@ async function loadPrefs(){
     var isCur=parseInt(b.dataset.arg,10)===p.ledMode;
     b.classList.toggle('ghost', !isCur);
   });
+  if($('ledPinNow')) $('ledPinNow').textContent=p.ledPin!==undefined?('GPIO'+p.ledPin):'—';
+  if($('ledPinInput')&&p.ledPin!==undefined&&!$('ledPinInput').value) $('ledPinInput').value=p.ledPin;
 }
 function setToggle(id,on){
   var el=$(id); if(!el) return;
@@ -7036,6 +7265,8 @@ async function loadSys(){
   $('yUp').textContent=uptimeText(d.uptime);
   $('yMem').textContent=d.heapFree!==undefined?(Math.round(d.heapFree/1024)+' KB'):'—';
   $('yMemMin').textContent=d.heapMinFree!==undefined?(Math.round(d.heapMinFree/1024)+' KB'):'—';
+  $('yMemLargest').textContent=d.heapLargest!==undefined?(Math.round(d.heapLargest/1024)+' KB'):'—';
+  $('yPsram').textContent=d.psramSize?((d.psramSize/1048576).toFixed(0)+' MB'):'未启用';
 
   // OTA 槽：直接列出两个槽里实际躺着的镜像，升级后核对版本不用翻日志
   var slots=$('ySlots');
@@ -7396,7 +7627,12 @@ document.addEventListener('click',function(ev){
   else if(act==='goto-upgrade') switchProj(6);
   else if(act==='tab') showTab(b.dataset.arg);
   else if(act==='led') savePrefs({ledMode:parseInt(b.dataset.arg,10)});
+  else if(act==='devLogLive') devLogToggle();
+  else if(act==='devLogCopy') devLogCopy();
+  else if(act==='devLogClear') devLogClear();
   else if(act==='ledTest') ledTest();
+  else if(act==='ledScan') ledScan();
+  else if(act==='ledSavePin') ledSavePin();
   else if(act==='togglePref'){
     var key=b.dataset.arg;
     var nv = b.dataset.on!=='1';
@@ -7418,8 +7654,20 @@ document.addEventListener('click',function(ev){
 });
 
 async function ledTest(){
-  var r=await api('/api/v1/led/test',{method:'POST'});
-  toast(r&&r.ok?'LED 已点亮 1.5 秒':'测试失败', !(r&&r.ok));
+  var r=await api('/api/v1/led/test?g=80',{method:'POST'});
+  toast(r&&r.ok?('已点亮，引脚 '+r.pin):'测试失败', !(r&&r.ok));
+}
+async function ledScan(){
+  toast('开始扫描，约 15 秒，注意看灯');
+  var r=await api('/api/v1/led/scan?ms=600',{method:'POST'});
+  toast(r&&r.ok?('扫描完成，共试 '+r.count+' 个引脚'):'扫描失败', !(r&&r.ok));
+}
+async function ledSavePin(){
+  var v=parseInt($('ledPinInput').value,10);
+  if(isNaN(v)){ toast('请填写引脚号',true); return; }
+  var r=await api('/api/v1/led/pin?pin='+v,{method:'POST'});
+  if(r&&r.ok){ toast('已设为 GPIO'+v); loadPrefs(); }
+  else toast('保存失败：'+((r&&r.message)||(r&&r.error)||''), true);
 }
 async function watchRestart(){
   toast('正在重新连接手表…');
@@ -7432,22 +7680,33 @@ async function contextReset(){
 }
 async function pushText(){
   var t=$('pushText').value.trim();
+  var box=$('pushResult');
   if(!t){ toast('内容为空',true); return; }
   var r=await api('/api/v1/watch/push',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});
-  if(!r||!r.ok){ toast('发送失败：'+((r&&r.message)||(r&&r.error)||''), true); return; }
+  if(!r||!r.ok){
+    var why=(r&&r.message)||(r&&r.error)||'未知错误';
+    toast('发送失败：'+why, true);
+    if(box) box.textContent='失败：'+why;
+    return;
+  }
   $('pushText').value='';
+  if(box) box.textContent='已入队，等待蓝牙投递…';
   toast('已入队，等待蓝牙链路投递…');
   // 入队不等于发出去。真正结果只有会话线程知道，这里轮询最多 6 秒。
   var got=await waitPushResult(6000);
+  var msg;
   if(got===2){
+    msg='已写入蓝牙发送通道。本机侧到此为止，手表是否显示通知取决于手表端快应用。';
     toast('已写入蓝牙发送通道');
-    log('PUSH 已发出（state=2）。若手表未弹通知，说明是手表端快应用不处理该消息，与本机无关。');
   } else if(got===3){
-    toast('发送失败，详见运行日志', true);
-    log('PUSH 失败，原因见上方 PUSH_FAIL / PUSH_DROPPED 行');
+    msg='投递失败。原因见设置页「设备日志」里 PUSH_FAIL / PUSH_DROPPED 开头的行。';
+    toast('发送失败，详见设备日志', true);
   } else {
-    toast('暂无回执，去看运行日志', true);
+    msg='6 秒内没有收到投递回执。链路可能正在重连，稍后到设备日志确认。';
+    toast('暂无回执，去看设备日志', true);
   }
+  if(box) box.textContent=msg;
+  log('PUSH ' + msg);
   refresh();
 }
 async function waitPushResult(maxMs){
@@ -7621,6 +7880,12 @@ void handleStatus(bool publicSetup) {
   d["fwSize"] = static_cast<uint32_t>(ESP.getSketchSize());
   d["heapFree"] = static_cast<uint32_t>(ESP.getFreeHeap());
   d["heapMinFree"] = static_cast<uint32_t>(ESP.getMinFreeHeap());
+  // 最大连续块：free 大而 largest 小说明堆被切碎，malloc 仍会失败。
+  // 排查「传大文件到一半挂掉」时这两个数要一起看。
+  d["heapLargest"] = static_cast<uint32_t>(ESP.getMaxAllocHeap());
+  // PSRAM 当前是关闭编译的（sdkconfig 里 CONFIG_ESP32_SPIRAM_SUPPORT 未设置），
+  // 这里如实报 0，免得看页面的人以为板上有 8MB 却没用上。
+  d["psramSize"] = static_cast<uint32_t>(ESP.getPsramSize());
   // 运行时长：系统页「设备信息」直接显示，省得用户自己拿开机时间换算。
   d["uptime"] = static_cast<uint32_t>(millis() / 1000u);
   d["freeSketchSpace"] = static_cast<uint32_t>(ESP.getFreeSketchSpace());
@@ -9007,7 +9272,7 @@ void otaUploadCallback() {
                     s_otaFlashAddr, hasExplicitAddr ? 1 : 0,
                     s_otaIsFirmware ? 1 : 0,
                     static_cast<unsigned>(upload.totalSize));
-      digitalWrite(kHeartbeatLedPin, LOW);
+      rgbLedClear();
 
       if (!s_otaIsFirmware) {
         // 原始镜像写入参数校验，避免一上传就把设备写死。
@@ -9052,7 +9317,7 @@ void otaUploadCallback() {
           if (upload.buf[0] != 0xE9 || magic != kAppDescMagic) {
             s_otaError = "这不是 app 镜像（缺少 app 描述符），网页升级只能传文件名带 -ota 的那个；整包镜像请用数据线整片刷写";
             Serial.printf("OTA_REJECT_NOT_APP_IMAGE magic=0x%08X\n", magic);
-            digitalWrite(kHeartbeatLedPin, LOW);
+            rgbLedClear();
             return;   // 必须先 return：否则 begin() 已经占用了目标分区
           }
         }
@@ -9075,7 +9340,9 @@ void otaUploadCallback() {
       // LED闪烁指示升级中
       static unsigned long lastBlink = 0;
       if (millis() - lastBlink > 100) {
-        digitalWrite(kHeartbeatLedPin, !digitalRead(kHeartbeatLedPin));
+        static bool sBlinkOn = false;
+        sBlinkOn = !sBlinkOn;
+        if (sBlinkOn) rgbLedPush(gRgbPin, 120, 80, 0); else rgbLedClear();
         lastBlink = millis();
       }
 
@@ -9779,12 +10046,13 @@ void setupRoutes() {
     JsonDocument d;
     d["ok"] = true;
     d["ledMode"] = gLedMode;
+    d["ledPin"] = rgbLedPin();
     d["showLog"] = gPrefShowLog;
     d["compact"] = gPrefCompact;
     d["timezone"] = gNtpTz;
     d["autoConnectWatch"] = autoConnectWatch;
     d["insecureTls"] = allowInsecureTls;
-    d["ledPin"] = kHeartbeatLedPin;
+    d["ledPin"] = rgbLedPin();
     sendJson(200, d);
   });
 
@@ -9820,21 +10088,69 @@ void setupRoutes() {
     JsonDocument d;
     d["ok"] = true;
     d["ledMode"] = gLedMode;
+    d["ledPin"] = rgbLedPin();
     d["showLog"] = gPrefShowLog;
     d["compact"] = gPrefCompact;
     sendJson(200, d);
   });
 
-  // 灯效自检：点亮 1.5 秒再恢复，方便确认板载 LED 是否接在这颗 GPIO 上
+  // 灯效自检：用当前配置的引脚点一次颜色。
+  // 颜色可用 ?r=&g=&b= 指定，默认绿。
   server.on("/api/v1/led/test", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
-    digitalWrite(kHeartbeatLedPin, HIGH);
-    delay(1500);
-    digitalWrite(kHeartbeatLedPin, LOW);
+    const uint8_t r = static_cast<uint8_t>(server.hasArg("r") ? server.arg("r").toInt() : 0);
+    const uint8_t g = static_cast<uint8_t>(server.hasArg("g") ? server.arg("g").toInt() : 80);
+    const uint8_t b = static_cast<uint8_t>(server.hasArg("b") ? server.arg("b").toInt() : 0);
+    rgbLedPush(rgbLedPin(), r, g, b);
     JsonDocument d;
     d["ok"] = true;
-    d["pin"] = kHeartbeatLedPin;
-    d["note"] = "高电平点亮 1.5 秒后恢复；若灯没亮，说明这颗 GPIO 上没有灯或为低电平点亮";
+    d["pin"] = rgbLedPin();
+    d["rmt"] = gRgbRmtReady;
+    d["color"] = String(r) + "," + String(g) + "," + String(b);
+    sendJson(200, d);
+  });
+
+
+  // 逐个引脚点亮指定颜色，用于确定板载 RGB 接在哪。
+  // 一次点亮 dwell 毫秒后熄灭，轮询全部候选约 19×dwell。
+  server.on("/api/v1/led/scan", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    const uint32_t dwell = constrain(server.hasArg("ms") ? server.arg("ms").toInt() : 600, 200, 2000);
+    JsonDocument d;
+    JsonArray tried = d["tried"].to<JsonArray>();
+    Serial.printf("RGB_SCAN start dwell=%u\n", static_cast<unsigned>(dwell));
+    for (uint8_t i = 0; i < kRgbLedCandidateCount; ++i) {
+      const int pin = kRgbLedCandidates[i];
+      if (!rgbPinUsable(pin)) continue;
+      rgbLedPush(static_cast<uint8_t>(pin), 0, 80, 0);
+      delay(dwell);
+      rgbLedClear();
+      delay(80);
+      tried.add(pin);
+      Serial.printf("RGB_SCAN pin=%d\n", pin);
+    }
+    // 扫完把灯恢复到当前配置的引脚，再交给主循环接管
+    rgbLedBegin(gRgbPin);
+    d["ok"] = true;
+    d["count"] = tried.size();
+    d["hint"] = "逐个引脚短暂点亮绿色；看到灯亮的那个数字就是引脚号，可用 POST /api/v1/led/pin?pin=N 固定下来";
+    sendJson(200, d);
+  });
+
+  // 固定灯珠引脚并写进 NVS，下次开直接用，不用再扫。
+  server.on("/api/v1/led/pin", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    if (!server.hasArg("pin")) return jsonError(400, "pin_required", "add ?pin=N");
+    const int pin = server.arg("pin").toInt();
+    if (!rgbPinUsable(pin)) {
+      return jsonError(400, "pin_rejected", "这个引脚被 Flash/串口/BOOT 占用，不能用于 RGB 灯");
+    }
+    prefs.putUChar("led_pin", static_cast<uint8_t>(pin));
+    rgbLedBegin(static_cast<uint8_t>(pin));
+    rgbLedPush(static_cast<uint8_t>(pin), 0, 80, 0);
+    JsonDocument d;
+    d["ok"] = true;
+    d["pin"] = pin;
     sendJson(200, d);
   });
 
@@ -9894,9 +10210,9 @@ void setupRoutes() {
     // 温度传感器：IDF 4.4 的 temperatureRead() 读内部传感器，未校准时会有偏差，
     // 所以这里给的是"趋势参考值"，前端标注了 ±3℃。
     d["chipTempC"] = static_cast<int>(temperatureRead());
-    // LED 状态（心跳灯当前电平）
-    d["ledPin"] = kHeartbeatLedPin;
-    d["ledOn"] = digitalRead(kHeartbeatLedPin) == HIGH;
+    // 板载 RGB 灯：当前绑定的引脚与上一次写入的颜色
+    d["ledPin"] = rgbLedPin();
+    d["ledRmt"] = gRgbRmtReady;
     // I2C / OLED 是否在场（状态屏）
     d["oledConfigured"] = true;
     // 运行时长（esp_timer 微秒级，不依赖 millis 回绕）
@@ -10049,16 +10365,29 @@ void setupRoutes() {
   // ==================== 日志环形缓冲 ====================
   server.on("/api/v1/logs", HTTP_GET, [](){
     if (!isSetupApClient() && !requireAuth()) return;
+    // since：只取环里"比这个下标新"的行。页面首次拉取不带，之后带上
+    // 上一次拿到的 seq，就只增量取。环里被覆盖掉的行自然取不到，页面
+    // 上会表现为"中间少了几行"，这比重复刷 64 行要轻得多。
+    const uint32_t sinceSeq = server.hasArg("since") ? server.arg("since").toInt() : 0;
     JsonDocument d;
     d["ok"] = true;
     JsonArray lines = d["lines"].to<JsonArray>();
-    for (uint8_t i = 0; i < gLogRingCount; ++i) {
-      const uint8_t idx = static_cast<uint8_t>((gLogRingNext + kLogRingLines - gLogRingCount + i) % kLogRingLines);
+    // 读环时同样要拿锁：这个接口跑在 HTTP 任务上，写环的是蓝牙任务和主循环。
+    const bool locked = gLogMutex &&
+                        xSemaphoreTakeRecursive(gLogMutex, pdMS_TO_TICKS(50)) == pdTRUE;
+    for (uint16_t i = 0; i < gLogRingCount; ++i) {
+      const uint16_t idx = static_cast<uint16_t>(
+          (gLogRingNext + kLogRingLines - gLogRingCount + i) % kLogRingLines);
+      const uint32_t seq = gLogRingSeq[idx];
+      if (sinceSeq && static_cast<int32_t>(seq - sinceSeq) <= 0) continue;
       JsonObject o = lines.add<JsonObject>();
+      o["seq"] = seq;
       o["t"] = gLogRingMs[idx];
       o["m"] = gLogRing[idx];
     }
+    if (locked) xSemaphoreGiveRecursive(gLogMutex);
     d["capacity"] = kLogRingLines;
+    d["next"] = gLogRingNextSeq;
     sendJson(200, d);
   });
 
@@ -10427,9 +10756,9 @@ void setupRoutes() {
       Serial.printf("OTA_EXPECT part=%s ver=%s\n",
                     s_otaTargetLabel.c_str(), s_otaImageVersion.c_str());
     }
-    digitalWrite(kHeartbeatLedPin, HIGH);
+    rgbLedPush(gRgbPin, 0, 90, 0);
     delay(2000);
-    digitalWrite(kHeartbeatLedPin, LOW);
+    rgbLedClear();
     delay(100);
     Serial.println("OTA_REBOOTING...");
     ESP.restart();
@@ -10446,7 +10775,7 @@ void setupRoutes() {
       d["file"] = s_otaFileName;
       d["written"] = (uint32_t)s_otaTotalWritten;
       sendJson(500, d);
-      digitalWrite(kHeartbeatLedPin, LOW);
+      rgbLedClear();
       Serial.printf("OTA_UPLOAD_ERROR: %s\n", s_otaError.c_str());
       return;
     }
@@ -10469,7 +10798,7 @@ void setupRoutes() {
         d["error"] = String("固件写入失败: ") + Update.errorString();
         d["file"] = s_otaFileName;
         sendJson(500, d);
-        digitalWrite(kHeartbeatLedPin, LOW);
+        rgbLedClear();
         Serial.printf("OTA_UPDATE_END_FAILED: %s\n", Update.errorString());
         return;
       }
@@ -10503,9 +10832,9 @@ void setupRoutes() {
     }
 
     // LED常亮2秒，然后灭掉重启
-    digitalWrite(kHeartbeatLedPin, HIGH);
+    rgbLedPush(gRgbPin, 0, 90, 0);
     delay(2000);
-    digitalWrite(kHeartbeatLedPin, LOW);
+    rgbLedClear();
     delay(100);
     Serial.println("OTA_REBOOTING...");
     ESP.restart();
@@ -10636,16 +10965,16 @@ static void setupTriggerTask(void*) {
         warned3 = true;
         // 3 秒提示用快速闪灯，无需串口也能看出来
         for (int i = 0; i < 3; ++i) {
-          digitalWrite(kHeartbeatLedPin, HIGH); delay(60);
-          digitalWrite(kHeartbeatLedPin, LOW); delay(60);
+          rgbLedPush(gRgbPin, 120, 60, 0); delay(60);
+          rgbLedClear(); delay(60);
         }
         Serial.println("BOOT_HOLD_3S keep_holding_for_factory_reset");
       }
       if (!warned10 && held >= 10000) {
         warned10 = true;
         for (int i = 0; i < 6; ++i) {
-          digitalWrite(kHeartbeatLedPin, HIGH); delay(50);
-          digitalWrite(kHeartbeatLedPin, LOW); delay(50);
+          rgbLedPush(gRgbPin, 140, 0, 0); delay(50);
+          rgbLedClear(); delay(50);
         }
         Serial.println("BOOT_HOLD_10S factory_reset_armed");
       }
@@ -10897,8 +11226,8 @@ void setup() {
     WiFi.softAP(gApSsid.c_str(), apPassword.c_str());
     Serial.printf("OTA_AP started ssid=%s ip=%s\n", gApSsid.c_str(), WiFi.softAPIP().toString().c_str());
 
-    // 初始化LED
-    pinMode(kHeartbeatLedPin, OUTPUT);
+    // 初始化板载 RGB 灯
+    rgbLedInit();
 
     // 启动HTTP服务器
     setupRoutes();
@@ -10918,9 +11247,8 @@ void setup() {
                 static_cast<unsigned long>(ESP.getFreeHeap()),
                 static_cast<unsigned long>(ESP.getMaxAllocHeap()));
   setupTriggerPins();
-  // 板载心跳 LED（D2/GPIO2）
-  pinMode(kHeartbeatLedPin, OUTPUT);
-  digitalWrite(kHeartbeatLedPin, LOW);
+  // 板载 RGB 灯（WS2812）
+  rgbLedInit();
   // OLED/Wire also consume and fragment heap. If this is a configured normal
   // boot, defer their initialization until STA has obtained an IP; Bluetooth
   // auth + Wi-Fi init get the cleanest possible WROOM heap. In first-setup AP
