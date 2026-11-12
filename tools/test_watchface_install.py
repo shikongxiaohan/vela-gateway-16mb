@@ -158,11 +158,11 @@ def main() -> int:
 
     print()
     if fails:
-        print(f"✗ {len(fails)} 项未通过：")
+        print(f"[FAIL] {len(fails)} 项未通过：")
         for f in fails:
             print("   -", f)
         return 1
-    print(f"✓ 全部通过（{oks} 项）")
+    print(f"全部通过（{oks} 项）")
     return 0
 
 

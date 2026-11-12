@@ -171,9 +171,9 @@ def main():
 
     print("-" * 64)
     if failures:
-        print(f"✗ 检出 {len(failures)} 个问题")
+        print(f"[FAIL] 检出 {len(failures)} 个问题")
         return 1
-    print("✓ 全部通过：主动恢复出厂会清配置、自动降级不清配置，且都不会陷入无限复位环")
+    print("全部通过：主动恢复出厂会清配置、自动降级不清配置，且都不会陷入无限复位环")
     return 0
 
 

@@ -3,7 +3,7 @@
 
 为什么需要这个检查（2026-11-09 第十五章）：
     IDF 的 esp_netif_init() 内部已经会调一次 tcpip_init()，而 lwip_init()
-    **没有幂等保护**，每次都会再跑一遍 sys_init()，于是
+    没有幂等保护，每次都会再跑一遍 sys_init()，于是
     esp_vfs_lwip_sockets_register() 被调用两次。socket 的 fd 区间
     [FD_SETSIZE-N .. FD_SETSIZE-1) 在 esp_vfs 里是「永久占用」的，
     第二次注册必然返回 ESP_ERR_INVALID_ARG (0x102)，撞上 vfs_lwip.c 里的
@@ -63,10 +63,10 @@ def main(argv):
             bad.append((f, lineno))
 
     if not bad:
-        print("[tcpip-init] ✓ 未发现直接调用 tcpip_init()（应使用 esp_netif_init()）")
+        print("[tcpip-init] OK 未发现直接调用 tcpip_init()（应使用 esp_netif_init()）")
         return 0
 
-    print("[tcpip-init] ✗ 发现直接调用 tcpip_init()，这会导致 abort 无限重启")
+    print("[tcpip-init] FAIL 发现直接调用 tcpip_init()，这会导致 abort 无限重启")
     for f, lineno in bad:
         print(f"    {f}:{lineno}")
     print("    改用 esp_netif_init()（自带 tcpip_initialized 保护，重复调用安全）。")

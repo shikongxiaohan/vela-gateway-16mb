@@ -93,9 +93,9 @@ def main():
 
     print()
     if failures:
-        print(f"✗ {len(failures)} 项未通过")
+        print(f"[FAIL] {len(failures)} 项未通过")
         return 1
-    print(f"✓ 全部通过（{checks} 项）")
+    print(f"全部通过（{checks} 项）")
     return 0
 
 

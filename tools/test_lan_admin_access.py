@@ -5,7 +5,7 @@
 背景（见 变更说明.md 第十八章）：
 - 固件的本地接口用 `X-Vela-Token` 头做鉴权（`authorized()`），
   `localToken` 默认 "vela-local"，非空即代表"必须带令牌"。
-- 而管理台前端 `api()` 早期**从不带任何令牌头**，于是：
+- 而管理台前端 `api()` 早期从不带任何令牌头，于是：
   · 在配网 SoftAP 上访问 → `isSetupApClient()` 为真 → 跳过鉴权 → 一切正常；
   · 连上家用路由器、用 LAN IP 访问 → 所有 `/api/v1/*` 返回 401 →
     页面永远显示"设备暂未响应"。
@@ -208,9 +208,9 @@ def main():
             failed += 1
 
     if problems or failed:
-        print("\n✗ 检出问题：局域网访问后台的鉴权链路不完整")
+        print("\n[FAIL] 检出问题：局域网访问后台的鉴权链路不完整")
         return 1
-    print("\n✓ 全部通过：LAN 访问后台可正常使用，同时未带令牌的请求仍被拒绝")
+    print("\n全部通过：LAN 访问后台可正常使用，同时未带令牌的请求仍被拒绝")
     return 0
 
 

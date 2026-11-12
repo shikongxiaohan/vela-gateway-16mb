@@ -6,7 +6,7 @@
 页面（kWebUi）有 49 KB。旧实现 `String page(kWebUi)` + 5 次 replace + send()
 在 ESP32 上会：
   1. 堆上同时要 49KB 原文 + 49KB 副本，替换过程反复 realloc，
-     碎片化时 String 分配失败 → 退化成空串 → 发出一个**没有响应体的 200**；
+     碎片化时 String 分配失败 → 退化成空串 → 发出一个没有响应体的 200；
      手机浏览器（Android Chrome）显示「该站点没有有效内容」。
   2. 一次性 write(49KB)，手机接收慢时可能写超时只发一半，收到截断 HTML。
 
@@ -67,7 +67,7 @@ def reference_replace(page: str) -> str:
 
 def stream_send(page: str):
     """精确复刻 sendMainWebUi() 的流式算法，返回 (content_length, 块列表)。"""
-    # 注意：C++ 里 kWebUi 是 char 数组，索引和长度都是**字节**。
+    # 注意：C++ 里 kWebUi 是 char 数组，索引和长度都是字节。
     # 这里先转成 bytes 再逐字节走，才能和固件里的计数方式严格对齐。
     raw = page.encode()
     n = len(raw)
@@ -205,9 +205,9 @@ def main() -> int:
 
     print()
     if fails:
-        print(f"✗ {len(fails)} 项未通过")
+        print(f"[FAIL] {len(fails)} 项未通过")
         return 1
-    print("✓ 全部通过：流式发送与整串替换等价，UTF-8 完整，Content-Length 精确，无占位符残留")
+    print("全部通过：流式发送与整串替换等价，UTF-8 完整，Content-Length 精确，无占位符残留")
     return 0
 
 

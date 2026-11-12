@@ -24,11 +24,11 @@ ok = True
 def fail(msg):
     global ok
     ok = False
-    print(f"  ✗ {msg}")
+    print(f"  [FAIL] {msg}")
 
 
 def good(msg):
-    print(f"  ✓ {msg}")
+    print(f"  [OK] {msg}")
 
 
 def parse_partitions(blob):
@@ -182,9 +182,9 @@ def main():
 
     print()
     if ok:
-        print("全部通过 ✓")
+        print("全部通过")
         return 0
-    print("存在问题 ✗，先修好再烧")
+    print("有问题，先修好再烧")
     return 1
 
 

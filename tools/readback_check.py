@@ -209,7 +209,7 @@ def main():
     print()
     ok = True
     for good, desc in report:
-        print(f"  {'✓' if good else '✗'}   {desc}")
+        print(f"  {'[OK]  ' if good else '[DIFF]'} {desc}")
         ok = ok and good
 
     if args.json:
@@ -220,10 +220,10 @@ def main():
 
     print()
     if ok:
-        print("✓ flash 内容全部正确。")
+        print("flash 内容全部正确。")
         print("  若设备仍起不来，问题不在 flash 内容，请把串口日志发出来。")
         return 0
-    print("✗ 发现问题。对照上面的描述处理：")
+    print("[FAIL] 发现问题，对照上面的描述处理：")
     if any("全 0xFF" in d for _, d in report):
         print("  · otadata 是空的 → 刷写时没写进去，或刷的是旧文件")
         print("    重新用 factory 镜像、地址 0x0、并【勾选 ERASE】重刷一次")

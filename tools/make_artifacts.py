@@ -82,15 +82,15 @@ def main() -> int:
             dst = fw_dir / src.name
             if not dst.exists() or dst.read_bytes() != src.read_bytes():
                 shutil.copyfile(src, dst)
-                print(f"✓ {src.name}  （复用归档版本，字节与已发布产物一致）")
+                print(f"{src.name}  （复用归档版本，字节与已发布产物一致）")
             else:
-                print(f"✓ {src.name}  （已是最新）")
+                print(f"{src.name}  （已是最新）")
         return 0
 
     # 1) app 镜像 → ota
     app = build_dir / "firmware.bin"
     if not app.exists():
-        print(f"✗ 找不到 {app}，先构建固件")
+        print(f"[FAIL] 找不到 {app}，先构建固件")
         return 1
     ota_out = fw_dir / f"{base}-ota.bin"
     shutil.copyfile(app, ota_out)
@@ -106,7 +106,7 @@ def main() -> int:
     ]
     missing = [str(p) for _, p in parts if not p.exists()]
     if missing:
-        print("✗ 缺少合并所需文件：")
+        print("[FAIL] 缺少合并所需文件：")
         for m in missing:
             print(f"    {m}")
         return 1
@@ -119,13 +119,13 @@ def main() -> int:
         cmd += [off, str(path)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print("✗ merge_bin 失败：")
+        print("[FAIL] merge_bin 失败：")
         print(r.stdout[-2000:])
         print(r.stderr[-2000:])
         return 1
 
-    print(f"✓ {ota_out.name}  {ota_out.stat().st_size:>10,} B")
-    print(f"✓ {factory_out.name}  {factory_out.stat().st_size:>10,} B")
+    print(f"{ota_out.name}  {ota_out.stat().st_size:>10,} B")
+    print(f"{factory_out.name}  {factory_out.stat().st_size:>10,} B")
 
     # 3) 归档：每个版本都留一份到 firmware-history/
     #    早期实现是"删掉旧版本产物"，结果回滚时发现历史固件没了。

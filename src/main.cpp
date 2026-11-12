@@ -153,7 +153,7 @@ constexpr char kApSsid[] = "Vela-Setup";
 //   构建    BUILD     每次对外发布源码构建 +1
 //   修订    REVISION  同一构建上的缺陷修复 +1，不动前三位
 //
-// 当前是**早期技术预览版**，四段对外可见、都要写出来：
+// 四段全部对外可见，都要写出来！！
 //
 //   展示形态：v0.0.0.1     （网页徽章、串口横幅、固件文件名）
 //
@@ -161,11 +161,11 @@ constexpr char kApSsid[] = "Vela-Setup";
 // 0.0.0.1 的含义很直白：主、次、构建都还是 0，这是第 1 个修订。
 // 前三段为 0 只说明"协议未冻结"，不代表不能发布。
 //
-// 修订号**最多 4 位，前导 0 省略**：v0.0.0.1 → v0.0.0.9 → v0.0.0.10
+// 修订号最多 4 位，前导 0 省略：v0.0.0.1 → v0.0.0.9 → v0.0.0.10
 // …… 最大 v0.0.0.9999，再往上进位到构建号。它是整数，不是定长字段，
 // 所以 1 写成 "1" 而不是 "0001"。
 //
-// 这个修订号是**自动递进**的：
+// 这个修订号是自动递进的：
 //   真源是根目录 version.txt，版本号在构建时由 tools/bump_version.py 递增，
 //   再由 tools/version_util.py 生成下面这个头文件。
 //   所以这里不再手写数字，手写的话下次构建就被覆盖了。
@@ -4621,8 +4621,8 @@ void authenticateWatchSpp(String target, String secretText) {
             }
           }
         }
-        // Log type=18 but do NOT reply — it's in the Music protobuf family,
-        // not a network-config request.  The real DHCP trigger is the
+        // Log type=18 but do NOT reply. It's in the Music protobuf family,
+        // not a network-config request. The real DHCP trigger is the
         // post-auth bootstrap sequence (type23/id3 → watch type23/id2).
         if (pbType == 18) {
           Serial.printf("WATCH_PB_OBSERVED type=18 (Music family) id=%lu bytes=%u hex=",
@@ -5139,11 +5139,11 @@ void handleWatchProbeSerial() {
 }
 
 // ==================== 恢复出厂设置 / 自动配网降级 ====================
-// 「恢复出厂」= 清空全部用户配置（Wi-Fi、手表密钥、云端 key……），只剩两个**主动**入口：
+// 「恢复出厂」= 清空全部用户配置（Wi-Fi、手表密钥、云端 key……），只剩两个主动入口：
 //   1) BOOT 长按 10 秒          → 置标志后重启，下次开机清空并直接进配网
 //   2) 网页 /api/v1/factory/reset → 立即清空并重启
 //
-// 「自动降级」= 只开配网热点，**不清任何用户配置**，一个入口：
+// 「自动降级」= 只开配网热点，不清任何用户配置，一个入口：
 //   3) 连不上 Wi-Fi 超过 kAutoSetupFallbackMs → 写标志后重启，开机进配网模式，
 //      手表密钥 / 云端 key / Wi-Fi 密码 / 热点名全部原样保留
 //
@@ -5157,7 +5157,7 @@ void handleWatchProbeSerial() {
 // 两条路都靠 "vela-fac" 命名空间里的 arm 标志跨重启传递，magic 值不同：
 //   kFactoryArmMagic   ("FACT") → 开机后清空全部配置
 //   kSetupOnlyArmMagic ("SEPU") → 开机后只进配网，不清配置
-// 开机处理一律**不重启**，否则 arm 标志会活过重启造成无限复位环（第十三章）。
+// 开机处理一律不重启，否则 arm 标志会活过重启造成无限复位环（第十三章）。
 
 constexpr uint32_t kAutoSetupGraceMs = 60000;             // 开机 1 分钟内不判定
 constexpr uint32_t kAutoSetupFallbackMs = 120000;         // 连续连不上 2 分钟 → 开热点
@@ -5222,7 +5222,7 @@ static void factoryClearNvs() {
   // 已经提交并关闭句柄，NVS 由 IDF 自己异步刷写，重启前 delay 即可。
 }
 
-// 真正执行清空 + 重启。调用后不再返回。**只由用户主动触发**。
+// 真正执行清空 + 重启。调用后不再返回。只由用户主动触发。
 static void factoryResetApply(const char* reason) {
   Serial.printf("FACTORY_RESET_BEGIN reason=%s\n", reason ? reason : "?");
   Serial.printf("FACTORY_RESET_PRE ssid_len=%u watch_mac=%s\n",
@@ -5287,7 +5287,7 @@ static void factoryResetDisarm() {
 
 // 开机时发现 arm 标志 → 说明上一次恢复出厂流程在"清 NVS"这一步被断电/复位打断，
 // 或者刚刚由 factoryResetApply() 重启过来。在这里把"清空"这一步补做完（幂等），
-// 然后**不重启**，让启动流程继续往下走：
+// 然后不重启，让启动流程继续往下走：
 //   loadConfig() 会读到空的 ssid / watch_mac
 //   → needSetup 判定为真 → enterSetupMode()
 //
@@ -5305,7 +5305,7 @@ static void factoryResetCompleteOnBoot() {
   gSetupKeepConfig = false;
 }
 
-// 自动降级：连不上 Wi-Fi → 只写 "SEPU" 标志后重启，**不动任何用户配置**。
+// 自动降级：连不上 Wi-Fi → 只写 "SEPU" 标志后重启，不动任何用户配置。
 // 这是和 factoryResetApply() 唯一但关键的区别。
 static void autoSetupFallbackApply(const char* reason) {
   Serial.printf("AUTO_SETUP_FALLBACK_BEGIN reason=%s ssid_len=%u watch_mac=%s keep_all_config=true\n",
@@ -5352,7 +5352,7 @@ static void initAutoSetupWindow() {
                 gAutoResetReason, static_cast<unsigned long>(kAutoSetupFallbackMs));
 }
 
-// 在 loop() 里每轮调用。连不上 Wi-Fi 太久 → 自动开热点进配网（**不清配置**）。
+// 在 loop() 里每轮调用。连不上 Wi-Fi 太久 → 自动开热点进配网（不清配置）。
 // 触发条件（全部满足才降级）：
 //   1. 链路不健康（Wi-Fi 与手表都没连上）
 //   2. 开机宽限期已过
@@ -7463,7 +7463,7 @@ void handleStatus(bool publicSetup) {
 //    - 就算分配成功，一次性 WiFiClient.write(49KB) 在手机慢速接收下也可能
 //      写超时、只发出一部分，客户端拿到的是截断的 HTML。
 //
-// 现在改成**流式发送**：先只读扫描一遍算准 Content-Length，再按 ≤1KB
+// 现在改成流式发送：先只读扫描一遍算准 Content-Length，再按 ≤1KB
 // 分块 sendContent，不组装 49KB 的替换结果，也不会一次性压 49KB 给 TCP。
 //
 // kWebUi 声明成 PROGMEM，但 ESP32 是统一地址空间：PROGMEM 是空宏，
@@ -7521,7 +7521,7 @@ static void sendMainWebUi() {
   server.send(200, "text/html; charset=utf-8", "");
 
   // 逐块发送：把连续的普通字符攒到一块再写，遇到占位符就先把攒的块刷出去。
-  // 切块时**不能切开 UTF-8 多字节字符**（中文 3 字节）：虽然 HTTP 是字节流、
+  // 切块时不能切开 UTF-8 多字节字符（中文 3 字节）：虽然 HTTP 是字节流、
   // 浏览器理论上能自行重组，但中间过一层不带 Content-Length 的代理、
   // 或者某些手机浏览器的容错逻辑会把它当成非法字节，于是显示乱码/空白。
   // 做法：切块前看当前字节是不是 UTF-8 的续字节（10xxxxxx），
@@ -7925,7 +7925,7 @@ void parsePrepareReply(const uint8_t* pb, size_t len, bool massSide,
 // ---- Mass 数据通道应答位置无关探测 ---------------------------------------
 // mass_prepare 的应答只有设备会给，字段号一旦对不上就卡在 mass_prepare_timeout，
 // 看不出是哪一层错。这里把所有候选状态的字节位置都扫出来打一遍，并且刻意
-// **不依赖** Mass{2}/PrepareResponse 这层包装，包装层猜错也能看到线索。
+// 不依赖 Mass{2}/PrepareResponse 这层包装，包装层猜错也能看到线索。
 void dumpPrepareReply(const uint8_t* pb, size_t len, const char* tag) {
   Serial.printf("WF_INSTALL_PREPARE_RAW %s len=%u ", tag, static_cast<unsigned>(len));
   for (size_t i = 0; i < len && i < 96; ++i) Serial.printf("%02X", pb[i]);
@@ -10104,10 +10104,10 @@ void setup() {
   // ====== 恢复出厂 / 自动降级前置处理（必须在 loadConfig 之前）======
   // 模块级实现见本文件前面的 "恢复出厂设置 / 自动配网降级" 一节。
   //   - FACT 标志（BOOT 长按 / 网页按钮）：补清空 + 解绑，强制进配网
-  //   - SEPU 标志（连不上 Wi-Fi 自动降级）：**不清任何配置**，只强制进配网
+  //   - SEPU 标志（连不上 Wi-Fi 自动降级）：不清任何配置，只强制进配网
   //   - 无标志：武装降级判定（见 autoSetupFallbackTick）
   //
-  // 注意开机处理一律**不重启**：factoryResetApply() / autoSetupFallbackApply()
+  // 注意开机处理一律不重启：factoryResetApply() / autoSetupFallbackApply()
   // 末尾都会 ESP.restart()，而 arm 标志活过重启，于是
   // "看到标志 → 再执行一遍 → 再重启" 会变成无限复位环（第十三章）。
   if (!gFactoryBootChecked) {

@@ -3,7 +3,7 @@
 # 为什么需要这个文件：
 #   espidf + arduino 双框架下，PlatformIO 产出的 ota_data_initial.bin
 #   可能是 8192 字节全 0xFF。本项目分区表（partitions_ota_16mb.csv）里
-#   **没有 factory 分区**，bootloader 拿不到 otadata 记录时会拒绝启动，
+#   没有 factory 分区，bootloader 拿不到 otadata 记录时会拒绝启动，
 #   表现为串口只有 bootloader 那几行、然后每 2 秒复位一次，
 #   而烧录工具显示"成功"。这个坑真实发生过一次，所以固化成构建步骤。
 #
@@ -80,7 +80,7 @@ def fix_otadata(source, target, env):
             shutil.copyfile(src, fw_dir / name)
 
     # 生成带版本号的产物（factory 整包 + ota app），文件名跟版本号走。
-    # 必须放在镜像校验**之前**：校验要读的就是刚生成的这批文件，
+    # 必须放在镜像校验之前：校验要读的就是刚生成的这批文件，
     # 顺序反了会拿上一版的产物来比，版本号必然对不上。
     ma = Path(env.subst("$PROJECT_DIR")) / "tools" / "make_artifacts.py"
     if ma.exists():

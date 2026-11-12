@@ -1,7 +1,7 @@
 # PlatformIO 构建前钩子：自动递进固件版本号。
 #
 # 为什么单独一个文件：
-#   版本号必须在**编译之前**定下来（src/vela_version.h 要被 main.cpp 包含），
+#   版本号必须在编译之前定下来（src/vela_version.h 要被 main.cpp 包含），
 #   而 PlatformIO 的 extra_scripts 是 pre: 阶段加载的，正好在编译之前跑。
 #   放在 pio_verify.py 的 AddPreAction 里就晚了，那时 .o 可能已经编完。
 #
@@ -50,7 +50,7 @@ def bump_version_for_build():
         return
     if bumped:
         print(f"[version] 版本已自动递进 → {vu.format_version(t)}")
-        # app 描述符里的版本是 IDF 在 **cmake configure 阶段**从 version.txt
+        # app 描述符里的版本是 IDF 在 cmake configure 阶段从 version.txt
         # 读进去的（PROJECT_VER），增量构建不会自动重跑 configure，
         # 于是镜像里的描述符会停在旧版本号。
         # 摸一下根 CMakeLists.txt 的 mtime，强制 cmake 重新 configure，
