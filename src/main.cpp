@@ -418,6 +418,7 @@ static String gNtpTz = "CST-8";
 // 一键推送待发送文本（空串表示没有待发）
 static char gPendingWatchText[420] = {0};
 static volatile bool gPendingWatchTextReady = false;
+static volatile uint32_t gPendingWatchTextAtMs = 0;   // 入队时刻，用于判断是否卡住
 
 // 重启标志：避免在HTTP handler中直接调用ESP.restart()
 static volatile bool gRestartRequested = false;
@@ -2999,9 +3000,16 @@ bool sendEncryptedWatchChannel(uint8_t& sequence, const uint8_t key[16],
 // 校验全部在这里做完（长度/密钥/目标 app），失败原因写日志，不影响主循环。
 static bool pushWatchText(const char* text) {
   if (!text || !*text) return false;
-  // 上一轮还在排队就先拒绝，避免覆盖掉用户刚输入的内容
-  if (gPendingWatchTextReady) return false;
+  // 队列里还有没发出去的内容时先拒绝，避免覆盖用户刚输入的另一条。
+  // 但超过 8 秒还没投递出去就认为上次尝试失败，允许覆盖：否则一条消息
+  // 卡住之后，用户会一直看到「发送队列已满」，而真实原因是链路发不出去。
+  if (gPendingWatchTextReady) {
+    const uint32_t ageMs = millis() - gPendingWatchTextAtMs;
+    if (ageMs < 8000u) return false;
+    velaLog("PUSH_QUEUE_STALE age_ms=%lu", static_cast<unsigned long>(ageMs));
+  }
   snprintf(gPendingWatchText, sizeof(gPendingWatchText), "%s", text);
+  gPendingWatchTextAtMs = millis();
   gPendingWatchTextReady = true;
   velaLog("PUSH_QUEUED bytes=%u", static_cast<unsigned>(strlen(text)));
   return true;
@@ -3026,6 +3034,12 @@ bool flushPendingWatchText(uint8_t& sequence, const uint8_t encKey[16]) {
     return false;
   }
   const bool ok = sendEncryptedWatchPb(sequence, encKey, pb, pbLength);
+  if (!ok) {
+    // 发送失败留在队列里，下一轮空闲时再试；超过 8 秒会被新消息覆盖，
+    // 不会让队列永久占着。
+    gPendingWatchTextReady = true;
+    gPendingWatchTextAtMs = millis();
+  }
   velaLog(ok ? "PUSH_OK bytes=%u" : "PUSH_FAIL reason=tx", static_cast<unsigned>(pbLength));
   return ok;
 }
@@ -4525,6 +4539,18 @@ void authenticateWatchSpp(String target, String secretText) {
         // points at STA before forwarding watch packets.
         serviceWatchInternetUplink();
         drainWatchNetworkTx(outgoingSequence);
+
+        // 待投递文本：这个会话是长连接，只在刚建立时补发一次的话，之后的
+        // 推送会一直排在队列里出不去 —— 第二次点「发送到手表」就会报
+        // 「发送队列已满」。空闲时定期补发，最短间隔 1.5 秒。
+        static uint32_t sNextPushAttemptMs = 0;
+        if (gPendingWatchTextReady &&
+            static_cast<int32_t>(millis() - sNextPushAttemptMs) >= 0) {
+          sNextPushAttemptMs = millis() + 1500u;
+          if (flushPendingWatchText(outgoingSequence, encKey)) {
+            velaLog("PUSH_SENT via=idle_loop");
+          }
+        }
       }
 
       if (r4GateActive &&
@@ -6439,18 +6465,14 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <button class="ghost" style="width:100%;margin-top:10px" data-act="otaBadAck">知道了</button>
 </div>
 
-<!-- 固件升级入口：上传至设备后经列表安装。 -->
+<!-- 固件升级：网关模式下直接写空闲 OTA 分区，写完重启生效。 -->
 <div class="card">
   <h2>固件升级</h2>
-  <p class="sub">上传 <code>-ota.bin</code> 后执行升级。整包 <code>-factory.bin</code> 不支持网页刷写，需通过数据线烧录。</p>
+  <p class="sub">选择 <code>-ota.bin</code> 后直接写入空闲升级分区，写入完成设备自动重启。整包 <code>-factory.bin</code> 需通过数据线烧录。</p>
   <input type="file" id="fwFile" accept=".bin">
   <div id="fwBar" class="muted" style="margin-top:10px">未选择文件</div>
-  <div class="list" id="fwList" style="margin-top:10px"><div class="muted">加载中…</div></div>
-  <div class="row" style="margin-top:10px">
-    <button class="ghost" data-act="fwRefresh">刷新</button>
-    <button data-act="fwInstall" id="fwInstallBtn" disabled>升级至选中版本</button>
-  </div>
-  <p class="hint" style="margin-top:10px">升级过程设备将重启，约 15 秒后恢复。配置与手表密钥不受影响。上传错误时可删除后重新上传。</p>
+  <div class="bar" style="margin-top:10px"><i id="fwProgress" style="width:0"></i></div>
+  <p class="hint" style="margin-top:10px">写入期间蓝牙桥接暂停，约 10 至 30 秒；重启后恢复。配置、手表密钥、表盘均保留。新固件若无法启动，会自动退回当前版本。</p>
 </div>
 
 <div class="card">
@@ -6927,7 +6949,6 @@ async function loadSys(){
   } else {
     $('otaBadCard').style.display='none';
   }
-  loadFw();
 }
 /* ---------- 状态轮询 ---------- */
 var lastRx=0,lastTx=0;
@@ -7231,10 +7252,8 @@ document.addEventListener('change',function(ev){
   if(ev.target && ev.target.id==='fwFile') uploadFw(ev.target);
 });
 
-/* ---------- 固件库 ---------------------------------------------------------
-   上传与安装分为两步，设备内固件在列表中可见。 */
-var fwSel=null;
-var FW_MAGIC=0xABCD5432;
+/* ---------- 固件升级 -------------------------------------------------------
+   网关模式下直接写空闲 OTA 分区，写完重启生效，不再切「空中升级」模式。 */
 
 function fwEsc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
@@ -7244,83 +7263,45 @@ function fwSize(n){ n=n||0; return n>=1024*1024 ? (n/1048576).toFixed(2)+' MB' :
 function uploadFw(input){
   var f=input.files&&input.files[0];
   if(!f) return;
-  var bar=$('fwBar');
+  var bar=$('fwBar'), prog=$('fwProgress');
+  if(!/\.bin$/i.test(f.name)){ bar.textContent='只接受 .bin 文件'; input.value=''; return; }
+  if(f.size>6*1024*1024){ bar.textContent='文件超过 6 MB，超出升级分区容量'; input.value=''; return; }
+  if(!confirm('刷入 '+f.name+' ？\n\n写入期间蓝牙桥接暂停约 10 至 30 秒，完成后设备自动重启。\n新固件若无法启动，会自动退回当前版本。')){ input.value=''; return; }
+
   var fd=new FormData(); fd.append('file',f,f.name);
   var xhr=new XMLHttpRequest();
-  xhr.open('POST','/api/v1/firmware/upload');
+  xhr.open('POST','/api/v1/ota/upload');
   xhr.setRequestHeader('X-Vela-Token',VELA_TOKEN);
-  bar.textContent='上传中 0%';
+  prog.style.width='0'; prog.style.background='';
+  bar.textContent='准备写入…';
   xhr.upload.onprogress=function(e){
-    if(e.lengthComputable) bar.textContent='上传中 '+Math.round(e.loaded/e.total*100)+'%';
+    if(!e.lengthComputable) return;
+    var pct=Math.min(100,Math.round(e.loaded/e.total*100));
+    prog.style.width=pct+'%';
+    bar.textContent='写入中 '+pct+'%（'+fwSize(e.loaded)+' / '+fwSize(e.total)+'）';
   };
   xhr.onload=function(){
     var j={}; try{ j=JSON.parse(xhr.responseText); }catch(e){}
-    if(j.ok){ bar.textContent='已存进设备：'+fwEsc(j.name||f.name); input.value=''; loadFw(); }
-    else { bar.textContent='没存进去：'+fwEsc(j.error||('HTTP '+xhr.status))+(j.hint?(' — '+fwEsc(j.hint)):''); input.value=''; }
+    if(j.ok){
+      prog.style.width='100%';
+      bar.textContent='写入完成，共 '+fwSize(j.size)+(j.version?('，版本 '+fwEsc(j.version)):'')+'，设备重启中…';
+      setTimeout(function(){
+        document.body.innerHTML='<div style="text-align:center;padding:56px 20px">'+
+          '<h2 style="margin:12px 0">固件已写入</h2>'+
+          '<p class="muted">设备正在重启，约 15 秒后恢复。<br>刷新本页面可查看新版本。</p></div>';
+      },1200);
+    } else {
+      prog.style.background='#e74c3c';
+      bar.textContent='写入失败：'+fwEsc(j.error||('HTTP '+xhr.status))+(j.hint?(' — '+fwEsc(j.hint)):'');
+      input.value='';
+    }
   };
-  xhr.onerror=function(){ bar.textContent='上传中断（连接断了），重新选一次文件'; input.value=''; };
+  xhr.onerror=function(){
+    prog.style.background='#e74c3c';
+    bar.textContent='上传中断，设备状态未改变，可重新选择文件';
+    input.value='';
+  };
   xhr.send(fd);
-}
-
-async function loadFw(){
-  var d=await api('/api/v1/firmware/list');
-  if(!d||d.ok===false){
-    var why=(d&&(d.hint||d.error))||'读取失败';
-    $('fwList').innerHTML='<div class="muted">'+fwEsc(why)+'</div>';
-    return;
-  }
-  var cur=d.current||'';
-  var items=d.items||[];
-  var keep=false;
-  items.forEach(function(it){ if(it.name===fwSel) keep=true; });
-  if(!keep) fwSel=null;
-  if(!items.length){
-    $('fwList').innerHTML='<div class="muted">设备内暂无固件，请先选择上方文件</div>';
-    $('fwInstallBtn').disabled=true;
-    return;
-  }
-  $('fwList').innerHTML=items.map(function(it){
-    var isCur = it.name===cur;
-    var on = it.name===fwSel;
-    return '<div class="item" style="cursor:pointer'+(on?';box-shadow:inset 0 0 0 1px var(--accent)':'')+'" data-fwpick="'+fwEsc(it.name)+'">'+
-      '<div style="min-width:0"><div style="overflow:hidden;text-overflow:ellipsis">'+(on?'● ':'○ ')+fwEsc(it.name)+'</div>'+
-      '<small>'+fwSize(it.bytes)+(isCur?' · 正在运行':'')+'</small></div>'+
-      '<div style="display:flex;gap:6px;flex:0 0 auto">'+
-      '<button class="ghost" style="padding:8px 10px;font-size:12.5px" data-act="fwDelete" data-arg="'+fwEsc(it.name)+'">删除</button>'+
-      '</div></div>';
-  }).join('');
-  $('fwInstallBtn').disabled = !fwSel;
-}
-
-document.addEventListener('click',function(ev){
-  var it=ev.target.closest('[data-fwpick]');
-  if(!it || ev.target.closest('[data-act]')) return;
-  fwSel=it.dataset.fwpick;
-  $('fwBar').textContent='已选中 '+fwSel+'，通过下方按钮开始升级';
-  loadFw();
-});
-
-async function fwDelete(name){
-  if(!confirm('删除设备里的 '+name+' ？')) return;
-  var d=await api('/api/v1/firmware/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})});
-  if(!d||d.ok===false) toast('删不掉：'+((d&&(d.error||d.message))||''),true);
-  if(fwSel===name) fwSel=null;
-  loadFw();
-}
-
-async function installFw(){
-  if(!fwSel){ toast('未选中固件',true); return; }
-  if(!confirm('把设备刷成 '+fwSel+' ？\n\n设备会重启，约 15 秒后回来。\n刷完如果新固件起不来，会自动退回现在这个版本。')) return;
-  var bar=$('fwBar');
-  bar.textContent='正在写入并校验…';
-  var d=await api('/api/v1/firmware/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:fwSel})});
-  if(!d||d.ok===false){
-    bar.textContent='升级失败：'+((d&&(d.error||d.message))||'');
-    return;
-  }
-  bar.textContent='已开始写入，设备马上重启';
-  document.body.innerHTML='<div style="text-align:center;padding:60px 20px">'+
-    '<h2>正在升级</h2><p>设备约 15 秒后完成重启。<br>需将手机重新连接至原 Wi-Fi 后访问管理台。</p></div>';
 }
 
 // 统一事件委托：所有按钮用 data-act，避免内联 onclick 的引号地狱
@@ -7354,9 +7335,6 @@ document.addEventListener('click',function(ev){
   }
   else if(act==='runChecks') runChecks();
   else if(act==='resRefresh') loadRes();
-  else if(act==='fwRefresh') loadFw();
-  else if(act==='fwInstall') installFw();
-  else if(act==='fwDelete') fwDelete(b.dataset.arg);
   else if(act==='resInstall') installRes(b.dataset.arg);
   else if(act==='resDelete') delRes(b.dataset.arg);
   else if(act==='resCancel') cancelRes();
@@ -8744,6 +8722,110 @@ void listItems(JsonArray& items, const String& current) {
 
 }  // namespace fwlib
 
+// ===== 网关模式直传升级 =====
+// 旧流程要先重启进「空中升级」模式，在那个只有一张网页的模式里刷写，
+// 刷完再重启回网关：两次重启、两次换热点。现在改成网关模式下直接流式写
+// 空闲 OTA 分区，写完记录目标并重启，省掉模式切换，也绕开 SPIFFS 暂存。
+namespace otadirect {
+
+static bool sActive = false;      // Update 会话已开始
+static bool sFailed = false;
+static String sError;
+static String sName;
+static size_t sWritten = 0;
+static String sVersion;           // 从镜像 app 描述符读出的版本
+static String sTargetLabel;       // 本次写入的分区
+
+void reset() {
+  sActive = false;
+  sFailed = false;
+  sError = "";
+  sName = "";
+  sWritten = 0;
+  sVersion = "";
+  sTargetLabel = "";
+}
+
+// app 描述符固定在镜像偏移 0x20，version 是其中偏移 0x10 的 32 字节字符串。
+void readVersion(const uint8_t* buf, size_t len) {
+  if (!sVersion.isEmpty() || len < 0x50) return;
+  char v[33];
+  memcpy(v, buf + 0x30, 32);
+  v[32] = 0;
+  for (int i = 0; i < 32; ++i) {
+    if (static_cast<uint8_t>(v[i]) < 0x20 || static_cast<uint8_t>(v[i]) > 0x7e) { v[i] = 0; break; }
+  }
+  sVersion = String(v);
+}
+
+}  // namespace otadirect
+
+// 直传上传回调。写入期间主循环被 HTTP 占用，蓝牙桥接会卡顿十几秒，属正常。
+void otaDirectUploadCallback() {
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    otadirect::reset();
+    otadirect::sName = upload.filename;
+    const esp_partition_t* target = esp_ota_get_next_update_partition(nullptr);
+    otadirect::sTargetLabel = target ? String(target->label) : String("");
+    otadirect::readVersion(upload.buf, upload.currentSize);
+
+    if (upload.currentSize >= 36) {
+      uint32_t magic = 0;
+      memcpy(&magic, upload.buf + 0x20, sizeof(magic));
+      if (upload.buf[0] != 0xE9 || magic != 0xABCD5432u) {
+        otadirect::sFailed = true;
+        otadirect::sError = "文件不是应用镜像（缺少 app 描述符）。网页升级只能传 -ota.bin，整包 -factory.bin 需用数据线刷写。";
+        Serial.printf("OTA_DIRECT_REJECT not_app_image magic=0x%08X\n", magic);
+        return;
+      }
+    }
+
+    const uint32_t size = upload.totalSize > 0 ? upload.totalSize : UPDATE_SIZE_UNKNOWN;
+    if (!Update.begin(size, U_FLASH)) {
+      otadirect::sFailed = true;
+      otadirect::sError = String("无法开始写入：") + Update.errorString();
+      Serial.printf("OTA_DIRECT_BEGIN_FAILED %s free=%lu largest=%lu\n",
+                    Update.errorString(),
+                    static_cast<unsigned long>(ESP.getFreeHeap()),
+                    static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+      return;
+    }
+    otadirect::sActive = true;
+    Serial.printf("OTA_DIRECT_START file=%s target=%s size=%u free=%lu\n",
+                  otadirect::sName.c_str(), otadirect::sTargetLabel.c_str(),
+                  static_cast<unsigned>(upload.totalSize),
+                  static_cast<unsigned long>(ESP.getFreeHeap()));
+
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (otadirect::sFailed || !otadirect::sActive) return;
+    if (otadirect::sWritten == 0) otadirect::readVersion(upload.buf, upload.currentSize);
+    const size_t n = Update.write(upload.buf, upload.currentSize);
+    if (n != upload.currentSize) {
+      otadirect::sFailed = true;
+      otadirect::sError = String("写入失败：") + Update.errorString();
+      Serial.printf("OTA_DIRECT_WRITE_FAILED %u/%u %s\n",
+                    static_cast<unsigned>(n), static_cast<unsigned>(upload.currentSize),
+                    Update.errorString());
+      Update.abort();
+      otadirect::sActive = false;
+      return;
+    }
+    otadirect::sWritten += n;
+
+  } else if (upload.status == UPLOAD_FILE_END) {
+    Serial.printf("OTA_DIRECT_UPLOAD_END file=%s bytes=%u\n",
+                  otadirect::sName.c_str(), static_cast<unsigned>(otadirect::sWritten));
+
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (otadirect::sActive) { Update.abort(); otadirect::sActive = false; }
+    otadirect::sFailed = true;
+    otadirect::sError = "上传被中断，未写入任何内容";
+    Serial.println("OTA_DIRECT_ABORTED");
+  }
+}
+
 // 上传回调。两个 OTA 路由共用同一份实现。
 // 早期 /ota/upload2 注册时漏掉了这个参数：FunctionRequestHandler 的
 // canUpload() 在回调为空时直接返回 false，multipart 数据被静默丢弃，
@@ -9237,6 +9319,57 @@ void setupRoutes() {
   // ==================== 固件库 ====================
   // 上传 → 列表 → 选中安装 → 删除。安装只是「标记 + 延时」，真正写 OTA 分区
   // 在 loop() 里做（fwlib::servicePending），这样 HTTP 响应能先回给浏览器。
+  // 系统页固件升级：网关模式下直接写空闲 OTA 分区，写完重启生效。
+  // 与 /ota/upload2 的区别是不要求先切到空中升级模式，也不经过 SPIFFS，
+  // 因此不会碰到文件系统首次格式化那二三十秒。
+  server.on("/api/v1/ota/upload", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    JsonDocument d;
+    // Update 是全局单例，固件库安装与直传不能同时进行。
+    if (Update.isRunning()) {
+      d["ok"] = false;
+      d["error"] = "busy";
+      d["hint"] = "设备正在执行另一次写入，请等它结束或重启后重试。";
+      sendJson(200, d);
+      return;
+    }
+    if (otadirect::sFailed) {
+      d["ok"] = false;
+      d["error"] = otadirect::sError;
+      sendJson(200, d);
+      Serial.printf("OTA_DIRECT_REJECT %s\n", otadirect::sError.c_str());
+      return;
+    }
+    if (otadirect::sWritten == 0) {
+      d["ok"] = false;
+      d["error"] = "no_data";
+      d["hint"] = "没有收到文件内容，请重新选择文件上传。";
+      sendJson(200, d);
+      return;
+    }
+    if (!Update.end(true)) {
+      d["ok"] = false;
+      d["error"] = String("镜像校验失败：") + Update.errorString();
+      sendJson(200, d);
+      Serial.printf("OTA_DIRECT_END_FAILED %s\n", Update.errorString());
+      return;
+    }
+    d["ok"] = true;
+    d["size"] = static_cast<uint32_t>(otadirect::sWritten);
+    d["version"] = otadirect::sVersion;
+    d["target"] = otadirect::sTargetLabel;
+    sendJson(200, d);
+
+    // 记录目标，重启后据此核对是否被 bootloader 回滚。
+    prefs.putString("ota_expect_part", otadirect::sTargetLabel);
+    prefs.putString("ota_expect_ver", otadirect::sVersion);
+    Serial.printf("OTA_DIRECT_SUCCESS part=%s ver=%s bytes=%u\n",
+                  otadirect::sTargetLabel.c_str(), otadirect::sVersion.c_str(),
+                  static_cast<unsigned>(otadirect::sWritten));
+    delay(1200);
+    ESP.restart();
+  }, otaDirectUploadCallback);
+
   server.on("/api/v1/firmware/upload", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
     JsonDocument d;
