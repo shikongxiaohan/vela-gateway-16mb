@@ -1,50 +1,60 @@
 # Vela Gateway
 
-让 ESP32 给手表当上网的桥。手表侧走蓝牙 SPP，家里走 Wi-Fi，中间用 lwIP NAPT 把两层接起来。手表不用知道 Wi-Fi 密码，换路由器也只改网关这边。
+基于 ESP32 的智能手表网络桥接固件。设备通过蓝牙 SPP 与手表建立数据链路，通过 Wi-Fi 接入本地网络，在两者之间完成 IP 层转发，使不具备 Wi-Fi 能力的手表获得网络访问能力。
 
-硬件是 16MB Flash 的 ESP32（ESP32-WROVER-E N16R8 / YD-ESP32-B）。管理台是个手机浏览器能直接开的网页，配 Wi-Fi、刷固件、看状态都在里面。
+当前版本 v0.0.0.19，RAM 占用 22.6%，Flash 占用 25.5%。
 
-当前版本 v0.0.0.18，RAM 用 22.6%，Flash 用 25.5%。
+## 功能
 
----
+- 蓝牙 SPP 与 Wi-Fi 双向 IP 转发，基于 lwIP NAPT 实现
+- 手表侧无需配置 Wi-Fi 凭据，更换路由器仅需调整网关配置
+- 内置管理台，支持网络配置、固件升级、运行状态监控
+- 支持表盘与快应用安装，经蓝牙 Mass 通道分片传输
 
-## 刷固件
+## 硬件
 
-不用装编译环境，用[乐鑫 Flash Download Tool](https://www.espressif.com/en/support/download/other-tools)就够。
+| 项目 | 规格 |
+|---|---|
+| 主控 | ESP32（ESP32-WROVER-E N16R8） |
+| Flash | 16 MB |
+| 开发板 | YD-ESP32-B |
+| 软件框架 | Arduino + ESP-IDF 4.4.4 |
 
-| 场景 | 文件 | 地址 |
+## 快速开始
+
+### 烧录
+
+预编译固件位于 `firmware/` 目录，历史版本见 [Releases](https://github.com/shikongxiaohan/vela-gateway-16mb/releases)。
+
+| 用途 | 文件 | 烧录地址 |
 |---|---|---|
-| 首次刷 / 救砖 | [`firmware/vela-gateway-v0.0.0.18-esp32-16mb-factory.bin`](firmware/) | `0x0` |
-| 网页 OTA 升级 | [`firmware/vela-gateway-v0.0.0.18-esp32-16mb-ota.bin`](firmware/) | `0x20000` |
+| 首次烧录 / 故障恢复 | `*-factory.bin` | `0x0` |
+| OTA 升级 | `*-ota.bin` | `0x20000` |
 
-factory 是整包，bootloader、分区表、otadata、app 都在里面，只刷这一个文件、地址填 `0x0`，不用另外管分区表。
+factory 镜像为完整固件包，包含 bootloader、分区表、otadata 与应用，烧录时仅需指定单个文件与地址 `0x0`。烧录工具可使用 [乐鑫 Flash Download Tool](https://www.espressif.com/en/support/download/other-tools)，操作步骤见 [docs/刷写.md](docs/刷写.md)。
 
-旧版本在 [Releases](https://github.com/shikongxiaohan/vela-gateway-16mb/releases)，都带 MD5。具体步骤见 [docs/刷写.md](docs/刷写.md)。
+### 初始配置
 
-## 用起来
+1. 设备上电后启动热点 `Vela-Setup`，默认密码 `12345678`
+2. 连接该热点，浏览器访问 `http://192.168.4.1`
+3. 选择目标 Wi-Fi 网络并输入密码
+4. 连接成功后，使用路由器分配的 IP 地址访问管理台
 
-1. 刷完自动开热点 `Vela-Setup`，密码 `12345678`
-2. 手机连上，浏览器开 `http://192.168.4.1`
-3. 选 Wi-Fi、输密码、保存
-4. 连上以后改用路由器分的 IP 开同一个管理台。IP 在路由器后台能查到
+热点名称与密码可在管理台中修改。网络连接失败时，设备将自动开启热点以便重新配置，已有配置保持不变；清除全部配置需在管理台中手动执行「恢复出厂」。
 
-热点名和密码都能在管理台改。
+## 管理台
 
-连接失败的时候会自动开热点让你重配，已有的配置不会被清掉。想彻底清空得手动点「恢复出厂」。
+### 固件升级
 
-### 升级固件
+在系统页选择 `-ota.bin` 文件上传至设备，于列表中选择目标版本后执行安装。镜像写入前完成完整性校验，通过后写入备用分区，重启后切换至新版本。若新固件无法正常启动，设备自动回退至上一版本。
 
-在系统页。选 `-ota.bin` 传进设备，列表里点一行选中，再点「升级到选中版本」。镜像会先校验一遍，通过了才写进备用分区，写完重启切过去。新固件如果起不来，会自动退回旧版。
+factory 整包镜像不支持网页升级：其首字节为空白 Flash 内容，不具备应用镜像特征，须通过数据线烧录。
 
-整包 `-factory.bin` 不能在网页上刷，它的第一个字节是空白 Flash，不是 app 镜像。整包只能走数据线。
+### 表盘与快应用安装
 
-### 装表盘 / 快应用
+在资源页上传文件，表盘为 `.bin` / `.face` 格式，快应用为 `.rpk` 格式。文件先上传至网关存储，再由网关通过蓝牙 Mass 通道分片推送至手表。
 
-在「资源」页。表盘是 `.bin` / `.face`，快应用是 `.rpk`。文件先传到网关存着，再由网关通过蓝牙 Mass 通道分片推给手表。
-
-装的过程中网关会暂停回程网络，因为 Mass 通道要独占蓝牙。手表那边的 TCP 会自己重传，装完就恢复。
-
-详见 [docs/表盘安装.md](docs/表盘安装.md)。
+安装期间网关暂停回程网络转发，原因为 Mass 通道独占蓝牙链路。手表侧 TCP 连接将自行重传，安装完成后恢复正常转发。协议细节见 [docs/表盘安装.md](docs/表盘安装.md)。
 
 ## 编译
 
@@ -52,50 +62,39 @@ factory 是整包，bootloader、分区表、otadata、app 都在里面，只刷
 pio run -e yd_esp32_16mb
 ```
 
-产物落在 `firmware/`。需要 PlatformIO，平台锁在 `espressif32@6.1.0` + ESP-IDF `4.4.4`，见 `platformio.ini`。这组版本不能随便升，升级会踩一堆坑。
+构建产物输出至 `firmware/`。依赖 PlatformIO，平台版本固定为 `espressif32@6.1.0`，ESP-IDF 版本为 `4.4.4`，配置见 `platformio.ini`。该版本组合已通过验证，不建议升级。
 
-一次构建会自动做完这些：递进版本号、编译、修 otadata、生成 factory 和 ota、校验镜像、跑回归测试。
+单次构建依次完成：版本号递增、编译、otadata 修正、factory 与 ota 镜像生成、镜像校验、回归测试。
 
-## 版本号
-
-四段，主.次.构建.修订，比如 `v0.0.0.3`。修订号最多四位，前导零不补，到 9999 进位到构建号。
-
-平时不用手工改。改了源码，构建时自动 +1；源码没动就沿用。真源是根目录的 `version.txt`，`src/vela_version.h` 从它生成。
-
-要手动调：
-
-```bash
-python3 tools/bump_version.py --show
-python3 tools/bump_version.py --set v0.0.0.7
-```
-
-修订号只在「源码变了，并且上一次真的出过包」时才 +1。中途编译失败不吃号。
-
-> v0.0.0.6 到 v0.0.0.10 这几个号从来没出过包。那是旧逻辑的遗留问题：后来改成现在这条规则了，老号已经发出去，就不回头改了。
+版本号格式为 `主.次.构建.修订`，例如 `v0.0.0.19`。修订号为整数，最多四位，前导零省略，超过 9999 进位至构建号。版本号由构建流程自动维护，源文件为根目录 `version.txt`，`src/vela_version.h` 由其生成。
 
 ## 分区
 
 | 分区 | 大小 | 用途 |
 |---|---|---|
-| nvs | 20 KB | 配置 |
+| nvs | 20 KB | 配置数据 |
 | otadata | 8 KB | OTA 启动记录 |
-| ota_0 / ota_1 | 各 6 MB | 双 app 槽，支持回滚 |
+| ota_0 / ota_1 | 各 6 MB | 双应用分区，支持回滚 |
 | spiffs | 3.875 MB | 表盘、快应用、固件包 |
 
-固件 1.6 MB 左右，6 MB 的槽有将近四倍余量。
+应用镜像约 1.6 MB，双分区方案为后续功能预留空间。
 
-## 目录
+## 目录结构
 
 ```
-src/          固件源码
-tools/        构建钩子、校验、回归测试、版本工具
-firmware/     当前版本固件
-docs/         刷写说明、表盘安装、管理台截图
-partitions_ota_16mb.csv
-platformio.ini
-version.txt   版本号真源
+src/                      固件源码
+tools/                    构建钩子、镜像校验、回归测试、版本工具
+firmware/                 当前版本固件
+docs/                     刷写说明、表盘安装、管理台截图
+partitions_ota_16mb.csv   分区表
+platformio.ini            构建配置
+version.txt               版本号源文件
 ```
 
-## 许可
+## 许可证
 
-MIT
+本项目采用 **MIT License** 发布。完整条款见 [LICENSE](LICENSE)。
+
+在遵守上述许可证条款的前提下，任何人均可自由使用、复制、修改、合并、发布、分发、再授权及销售本软件的副本，唯一限制为在软件的所有副本或实质性部分中保留上述版权声明与许可声明。本软件按「原样」提供，不附带任何明示或默示担保。
+
+Copyright (c) 2026 shikongxiaohan
