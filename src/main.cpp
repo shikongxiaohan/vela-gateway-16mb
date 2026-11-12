@@ -6490,25 +6490,6 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 <button style="width:100%;padding:15px;font-size:15.5px" data-act="save">保存并连接</button>
 <p class="muted" id="saveHint" style="text-align:center;margin-top:8px"></p>
 
-<div class="card">
-  <h2>固件升级</h2>
-  <p class="muted">进入空中升级模式后设备重启，只开启热点和升级页面，不运行蓝牙桥接。刷写完成后再重启回网关。</p>
-  <button class="ghost" style="width:100%;margin-top:9px" data-act="switchProj" data-arg="6">进入空中升级</button>
-</div>
-
-<div class="card">
-  <h2>设备动作</h2>
-  <button class="ghost" style="width:100%" data-act="reboot">重启设备</button>
-  <p class="muted" style="margin-top:8px">重启不修改任何配置。</p>
-</div>
-
-<div class="card" id="logCard">
-  <h2>运行日志 <span class="muted" style="font-weight:400">· 本页操作</span></h2>
-  <div class="log" id="oLocal">就绪</div>
-  <h2 style="margin-top:12px">设备事件 <span class="muted" style="font-weight:400">· 最近 24 条</span></h2>
-  <div class="log" id="oDev">（暂无事件）</div>
-</div>
-
 </section>
 
 <section class="panel" id="p-sys">
@@ -6731,6 +6712,26 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <div class="list" id="checks" style="max-height:none"></div>
   <button style="width:100%;margin-top:10px" data-act="runChecks">开始检查</button>
 </div>
+
+<div class="card">
+  <h2>固件升级</h2>
+  <p class="muted">进入空中升级模式后设备重启，只开启热点和升级页面，不运行蓝牙桥接。刷写完成后再重启回网关。</p>
+  <button class="ghost" style="width:100%;margin-top:9px" data-act="switchProj" data-arg="6">进入空中升级</button>
+</div>
+
+<div class="card">
+  <h2>设备动作</h2>
+  <button class="ghost" style="width:100%" data-act="reboot">重启设备</button>
+  <p class="muted" style="margin-top:8px">重启不修改任何配置。</p>
+</div>
+
+<div class="card" id="logCard">
+  <h2>运行日志 <span class="muted" style="font-weight:400">· 本页操作</span></h2>
+  <div class="log" id="oLocal">就绪</div>
+  <h2 style="margin-top:12px">设备事件 <span class="muted" style="font-weight:400">· 最近 24 条</span></h2>
+  <div class="log" id="oDev">（暂无事件）</div>
+</div>
+
 </section>
 
 
