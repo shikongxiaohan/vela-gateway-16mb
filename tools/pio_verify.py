@@ -171,6 +171,16 @@ def fix_otadata(source, target, env):
             print(r.stderr.rstrip())
             print("[spiffs] 文件系统挂载前提检查未通过，检查各路由入口是否调用 ensureSpiffs()")
 
+    # OTA 路由上传回调检查。/ota/upload2 曾经漏注册回调，文件被静默丢弃但接口
+    # 照样回成功，界面上只看到「刷完还是旧版本」。
+    ot = Path(env.subst("$PROJECT_DIR")) / "tools" / "test_ota_routes.py"
+    if ot.exists():
+        r = subprocess.run(["python3", str(ot)], capture_output=True, text=True)
+        print(r.stdout.rstrip())
+        if r.returncode != 0:
+            print(r.stderr.rstrip())
+            print("[ota] OTA 路由上传回调检查未通过，网页升级会静默失败")
+
     # 标记这次版本已出包（下次源码不变就不会再递进版本号）
     sys.path.insert(0, str(Path(env.subst("$PROJECT_DIR")) / "tools"))
     try:

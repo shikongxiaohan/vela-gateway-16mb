@@ -7,7 +7,7 @@ SPIFFS.open() 返回 false，写入全被跳过，最后误报成「不是 app �
 这个 bug 编译期查不出来，只能靠静态检查钉住。
 
 检查项：
-  1. SPIFFS.begin 只出现在 ensureSpiffs() 内部
+  1. SPIFFS.begin 只出现在 ensureSpiffs() / spiffsFormatTask() 内部
   2. 所有操作文件系统的路由入口都先调 ensureSpiffs()
   3. 上传处理器里 END 分支不能无条件清失败标志
 """
@@ -38,10 +38,11 @@ def main() -> int:
     begin_sites = [m.start() for m in re.finditer(r"SPIFFS\.begin\s*\(", text)]
     check(len(begin_sites) >= 1, "存在 SPIFFS.begin 调用")
 
-    # 找到 ensureSpiffs 函数体范围
-    m = re.search(r"bool ensureSpiffs\(\)\s*\{", text)
-    check(m is not None, "定义了 ensureSpiffs()")
-    if m:
+    def body_range(signature):
+        """返回函数体在 text 中的 [start, end] 区间；找不到返回 None。"""
+        m = re.search(signature, text)
+        if not m:
+            return None
         depth = 0
         start = m.end() - 1
         end = start
@@ -53,11 +54,35 @@ def main() -> int:
                 if depth == 0:
                     end = i
                     break
-        body = text[start:end + 1]
+        return (start, end)
+
+    # 允许调用 SPIFFS.begin 的两个函数：懒挂载入口 + 后台格式化任务。
+    # 格式化必须放在任务里：空白分区擦一遍要二十多秒，放在 HTTP 回调里
+    # 会让整个管理台卡死。
+    allowed = []
+    for sig, label in ((r"bool ensureSpiffs\(\)\s*\{", "ensureSpiffs()"),
+                       (r"static void spiffsFormatTask\(void\*\)\s*\{", "spiffsFormatTask()")):
+        rng = body_range(sig)
+        check(rng is not None, f"定义了 {label}")
+        if rng:
+            allowed.append(rng)
+    if allowed:
+        body = text[allowed[0][0]:allowed[0][1] + 1]
         check("SPIFFS.begin" in body, "ensureSpiffs() 内部调用 SPIFFS.begin")
-        outside = [p for p in begin_sites if not (start <= p <= end)]
+        outside = [p for p in begin_sites if not any(a <= p <= b for a, b in allowed)]
         check(not outside,
-              f"SPIFFS.begin 只出现在 ensureSpiffs 内（发现 {len(outside)} 处越界调用）")
+              f"SPIFFS.begin 只出现在 ensureSpiffs / spiffsFormatTask 内（发现 {len(outside)} 处越界调用）")
+
+
+    # ---- 1b. 任何 HTTP 路由都不允许直接触发格式化 ----
+    direct_format = [m.start() for m in re.finditer(r"SPIFFS\.format\s*\(", text)]
+    check(bool(direct_format), "存在 SPIFFS.format 调用")
+    fmt_rng = body_range(r"static void spiffsFormatTask\(void\*\)\s*\{")
+    if fmt_rng:
+        stray = [p for p in direct_format if not (fmt_rng[0] <= p <= fmt_rng[1])]
+        check(not stray, f"格式化只在后台任务里执行（发现 {len(stray)} 处越界调用）")
+    check("SPIFFS.begin(true)" not in text,
+          "没有 begin(true)：自动格式化会把 3.9MB 分区在请求线程里擦一遍")
 
     # ---- 2. 文件系统路由入口都要先挂载 ----
     routes = [

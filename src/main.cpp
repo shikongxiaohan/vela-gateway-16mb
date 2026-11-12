@@ -323,12 +323,21 @@ uint32_t gNextWatchAutoConnectMs = 0;
 static int gProjectMode = 1;
 static bool gOtaMode = false;        // 空中升级模式
 // OTA 回滚保护：新固件启动后不要立刻 mark_app_valid，否则回滚窗口为 0。
-// setup() 里若发现当前分区处于 NEW/PENDING_VERIFY，先置位，等主循环稳定
-// 运行 kOtaConfirmDelayMs 后再确认；期间若崩溃/看门狗复位，bootloader
-// 会自动回滚到旧固件。
+// setup() 里若发现当前分区处于 NEW/PENDING_VERIFY，先置位，等主循环跑起来
+// kOtaConfirmDelayMs 后再确认；期间若崩溃/复位，bootloader 会回滚到旧固件。
+//
+// 窗口不能开太大。此前的 30 秒踩过坑：新固件刚上线就遇到首次访问管理台触发
+// 空白 SPIFFS 分区格式化（几十秒不响应），用户以为刷坏直接断电，复位落在
+// 待确认窗口内 → bootloader 静默回滚，界面上只看到「刷完还是旧版本」。
+// 初始化阶段的崩溃集中在头一两秒，3 秒足够覆盖，剩下的交给升级结果核对。
 static bool gOtaPendingVerify = false;
 static uint32_t gOtaVerifyStartMs = 0;
-constexpr uint32_t kOtaConfirmDelayMs = 30000;  // 稳定运行 30 秒后再确认
+constexpr uint32_t kOtaConfirmDelayMs = 3000;  // 主循环跑满 3 秒即确认
+// 升级结果核对：写分区前把目标分区名和镜像里的版本号记进 NVS，重启后对不上
+// 就说明本次升级被 bootloader 回滚了，前端可以明确提示，而不是让用户猜。
+static bool gOtaRollbackDetected = false;
+static String gOtaRollbackExpected = "";
+static String gOtaRollbackRunning = "";
 // OTA上传状态
 static size_t s_otaTotalWritten = 0;
 static uint32_t s_otaFlashAddr = 0;
@@ -337,6 +346,9 @@ static String s_otaFileName = "";
 static String s_otaError = "";
 static uint32_t s_otaLastErasedSector = 0xFFFFFFFF;
 static bool s_otaIsFirmware = false;  // true=使用Update库(支持回滚), false=原始SPI写入
+// 升级结果核对用：写入前记下目标分区与镜像版本，重启后对不上即为回滚。
+static String s_otaTargetLabel = "";
+static String s_otaImageVersion = "";
 
 static volatile uint32_t gWatchRxBytes = 0;   // 从手表收到的字节
 static volatile uint32_t gWatchTxBytes = 0;   // 发送到手表的字节
@@ -1450,28 +1462,93 @@ void emitWatchRawTrace(const SppV2Frame& frame) {
                 static_cast<unsigned>(opcode));
 }
 
-// SPIFFS 懒挂载。启动阶段不挂，把那点堆让给蓝牙控制器；
-// 但任何用到文件系统的地方都必须先过这里。早期只有录音路径会挂载，
-// 结果固件库和表盘上传在没录过音的设备上必然失败：
-// SPIFFS.open() 一律返回 false，写入全被跳过，最后误报成「不是 app 镜像」。
+// SPIFFS 采用懒挂载：启动阶段不挂，把这部分堆留给蓝牙控制器。
+// 两个约束决定了下面的实现方式：
+//   1) 空白分区第一次挂载必然失败，必须格式化；而格式化要把整个 spiffs 分区
+//      （16MB 布局下约 3.9 MB）擦一遍，耗时二十秒以上。
+//   2) 本函数会被 HTTP 处理函数调用，一旦在里面格式化，整个管理台会卡住，
+//      页面看上去就是"刷完机没反应"。
+// 因此这里只做不格式化的普通挂载（几百毫秒），失败就交给后台任务去格式化，
+// 调用方拿到 false 后按「存储初始化中」返回，前端稍后重试即可。
+static volatile bool gSpiffsFormatting = false;
+
+bool spiffsFormatting() { return gSpiffsFormatting; }
+
+static void spiffsFormatTask(void*) {
+  Serial.println("SPIFFS_FORMAT_START");
+  const uint32_t started = millis();
+  bool ok = SPIFFS.format();
+  if (ok) ok = SPIFFS.begin(false);
+  gWatchStreamCaptureFsReady = ok;
+  gSpiffsFormatting = false;
+  if (ok) {
+    Serial.printf("SPIFFS_FORMAT_OK took_ms=%lu total=%u\n",
+                  static_cast<unsigned long>(millis() - started),
+                  static_cast<unsigned>(SPIFFS.totalBytes()));
+  } else {
+    Serial.printf("SPIFFS_FORMAT_FAILED took_ms=%lu\n",
+                  static_cast<unsigned long>(millis() - started));
+  }
+  vTaskDelete(nullptr);
+}
+
 bool ensureSpiffs() {
   if (gWatchStreamCaptureFsReady) return true;
-  gWatchStreamCaptureFsReady = SPIFFS.begin(true);
-  if (gWatchStreamCaptureFsReady) {
-    Serial.printf("SPIFFS_MOUNT_OK total=%u used=%u\n",
-                  static_cast<unsigned>(SPIFFS.totalBytes()),
-                  static_cast<unsigned>(SPIFFS.usedBytes()));
-  } else {
-    // 最常见的两个原因：分区表里没有 spiffs 分区（例如旧的 partitions_ota.csv），
-    // 或者分区太小/文件系统损坏。这里直接打出来，避免"功能静默失效"。
-    const esp_partition_t* fs = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
-    Serial.printf("SPIFFS_MOUNT_FAILED partition=%s size=%u hint=%s\n",
-                  fs ? fs->label : "missing",
-                  fs ? static_cast<unsigned>(fs->size) : 0u,
-                  fs ? "format_failed_or_too_small" : "no_spiffs_partition_in_table");
+  if (gSpiffsFormatting) return false;
+
+  // 最常见的问题是分区表里没有 spiffs 分区（例如旧的 4MB 分区表），这种直接报错，
+  // 不要浪费时间尝试格式化。
+  const esp_partition_t* fs = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
+  if (!fs) {
+    Serial.println("SPIFFS_MOUNT_FAILED partition=missing hint=no_spiffs_partition_in_table");
+    return false;
   }
-  return gWatchStreamCaptureFsReady;
+
+  const uint32_t started = millis();
+  if (SPIFFS.begin(false)) {
+    gWatchStreamCaptureFsReady = true;
+    Serial.printf("SPIFFS_MOUNT_OK total=%u used=%u took_ms=%lu\n",
+                  static_cast<unsigned>(SPIFFS.totalBytes()),
+                  static_cast<unsigned>(SPIFFS.usedBytes()),
+                  static_cast<unsigned long>(millis() - started));
+    return true;
+  }
+
+  // 分区在但挂不上：空白分区，转后台格式化。
+  gSpiffsFormatting = true;
+  Serial.printf("SPIFFS_MOUNT_MISS partition=%s size=%u action=format_async\n",
+                fs->label, static_cast<unsigned>(fs->size));
+  if (xTaskCreatePinnedToCore(spiffsFormatTask, "spiffs_fmt", 4096, nullptr, 1, nullptr, 0) != pdPASS) {
+    gSpiffsFormatting = false;
+    Serial.println("SPIFFS_FORMAT_TASK_FAILED");
+  }
+  return false;
+}
+
+// 给 HTTP 接口用的统一错误码/提示：区分「正在初始化」和「真的坏了」，
+// 用户看到前者知道等一会儿，看到后者知道要查分区表。
+const char* spiffsErrorCode() {
+  return gSpiffsFormatting ? "storage_initializing" : "storage_unavailable";
+}
+
+const char* spiffsErrorHint() {
+  return gSpiffsFormatting
+             ? "文件系统正在首次初始化（空白分区需要格式化，约 30 秒），请稍后重试。"
+             : "文件系统未挂载（SPIFFS 分区缺失或格式化失败），请查看串口 SPIFFS_MOUNT_FAILED 一行。";
+}
+
+// 从 app 镜像里读版本号。esp_app_desc_t 固定在镜像偏移 0x20，其中 version
+// 是结构体里第 0x10 字节起的 32 字节字符串，所以文件偏移为 0x30。
+void captureOtaImageVersion(const uint8_t* buf, size_t len) {
+  if (!s_otaImageVersion.isEmpty() || len < 0x50) return;
+  char v[33];
+  memcpy(v, buf + 0x30, 32);
+  v[32] = 0;
+  for (int i = 0; i < 32; ++i) {
+    if (v[i] < 0x20 || v[i] > 0x7e) { v[i] = 0; break; }
+  }
+  s_otaImageVersion = String(v);
 }
 
 void beginWatchStreamCapture(uint16_t mode) {
@@ -6354,6 +6431,13 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <div class="mini"><b>发布通道</b><span id="yChan">—</span></div>
 </div>
 
+<!-- 升级失败提示：写入后没能跑起来、被 bootloader 回滚时显示。 -->
+<div class="card" id="otaBadCard" style="display:none">
+  <h2>上次升级未生效</h2>
+  <p class="sub" id="otaBadText"></p>
+  <button class="ghost" style="width:100%;margin-top:10px" data-act="otaBadAck">知道了</button>
+</div>
+
 <!-- 固件升级入口：上传至设备后经列表安装。 -->
 <div class="card">
   <h2>固件升级</h2>
@@ -6834,6 +6918,14 @@ async function loadSys(){
   $('yVer').textContent=d.fwVersionFull||d.fwVersion||'—';
   $('yBuild').textContent=verParts(d);
   $('yChan').textContent=d.fwChannel||'—';
+  if(d.otaRollback){
+    $('otaBadCard').style.display='';
+    $('otaBadText').textContent='目标版本 '+(d.otaRollbackExpected||'未知')+
+      ' 未能启动，设备已自动回滚到 '+(d.otaRollbackRunning||d.fwVersionFull||'旧版本')+
+      '。可重新上传固件再试；若反复回滚，请用数据线整片刷写并查看串口日志。';
+  } else {
+    $('otaBadCard').style.display='none';
+  }
   loadFw();
 }
 /* ---------- 状态轮询 ---------- */
@@ -7163,7 +7255,11 @@ function uploadFw(input){
 
 async function loadFw(){
   var d=await api('/api/v1/firmware/list');
-  if(!d||d.ok===false){ $('fwList').innerHTML='<div class="muted">读取失败</div>'; return; }
+  if(!d||d.ok===false){
+    var why=(d&&(d.hint||d.error))||'读取失败';
+    $('fwList').innerHTML='<div class="muted">'+fwEsc(why)+'</div>';
+    return;
+  }
   var cur=d.current||'';
   var items=d.items||[];
   var keep=false;
@@ -7262,6 +7358,7 @@ document.addEventListener('click',function(ev){
   else if(act==='syncClock') syncClock();
   else if(act==='tz-preset'){ $('tzInput').value=b.dataset.arg; syncClock(); }
   else if(act==='reboot') rebootDevice();
+  else if(act==='otaBadAck'){ api('/api/v1/ota/rollback/ack',{method:'POST'}).then(function(){ loadSys(); }); }
 });
 
 async function ledTest(){
@@ -7416,15 +7513,21 @@ void handleStatus(bool publicSetup) {
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
     d["spiffsPartitionSize"] = fs ? static_cast<uint32_t>(fs->size) : 0u;
   }
+  // 上一次升级是否被回滚。前端据此提示，用户不用再靠猜版本号。
+  d["otaRollback"] = gOtaRollbackDetected;
+  d["otaRollbackExpected"] = gOtaRollbackExpected;
+  d["otaRollbackRunning"] = gOtaRollbackRunning;
   // 固件实际占用（含段头），供网页画分区占用条。
   // ESP.getSketchSize() 是 Arduino 层封装，已在 core 2.0.7 提供。
   d["fwSize"] = static_cast<uint32_t>(ESP.getSketchSize());
   d["heapFree"] = static_cast<uint32_t>(ESP.getFreeHeap());
   d["heapMinFree"] = static_cast<uint32_t>(ESP.getMinFreeHeap());
-  // 状态接口是管理台每次轮询都会调的，在这里顺手把文件系统挂上：
+  // 状态接口是管理台每次轮询都会调的，在这里顺手触发一次文件系统挂载：
   // 用户打开页面后，后面的固件库、表盘上传才有可用的文件系统。
-  // 挂载本身是一次性的，之后只是读一个 bool。
-  if (ensureSpiffs()) {
+  // 挂载成功后只是读一个 bool，未挂载时最多起一个后台格式化任务，不会阻塞。
+  const bool fsReady = ensureSpiffs();
+  d["spiffsState"] = fsReady ? "ready" : (gSpiffsFormatting ? "formatting" : "unavailable");
+  if (fsReady) {
     d["spiffsTotal"] = static_cast<uint32_t>(SPIFFS.totalBytes());
     d["spiffsUsed"] = static_cast<uint32_t>(SPIFFS.usedBytes());
   }
@@ -8613,6 +8716,197 @@ void listItems(JsonArray& items, const String& current) {
 
 }  // namespace fwlib
 
+// 上传回调。两个 OTA 路由共用同一份实现。
+// 早期 /ota/upload2 注册时漏掉了这个参数：FunctionRequestHandler 的
+// canUpload() 在回调为空时直接返回 false，multipart 数据被静默丢弃，
+// 接口却照样回「写入完成」，设备重启后版本不变 —— 手机页面刷写从来没生效过。
+void otaUploadCallback() {
+    // 上传处理回调
+    HTTPUpload& upload = server.upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+      s_otaFileName = upload.filename;
+      const bool hasExplicitAddr = server.hasArg("addr") && !server.arg("addr").isEmpty();
+      // 没给 addr 时按 16MB 分区表的 app 地址算。旧值 0x10000 是 4MB 版的
+      // 布局，在 16MB 上那个位置是 phy_init，写进去会毁掉射频校准。
+      const uint32_t addrValue = hasExplicitAddr
+                                     ? strtoul(server.arg("addr").c_str(), nullptr, 0)
+                                     : 0x20000;
+      s_otaFlashAddr = addrValue;
+      s_otaWriteAddr = s_otaFlashAddr;
+      s_otaTotalWritten = 0;
+      s_otaError = "";
+      s_otaLastErasedSector = 0xFFFFFFFF;
+      s_otaImageVersion = "";
+      {
+        const esp_partition_t* target = esp_ota_get_next_update_partition(nullptr);
+        s_otaTargetLabel = target ? String(target->label) : String("");
+      }
+      captureOtaImageVersion(upload.buf, upload.currentSize);
+
+      // 是否为固件（走 OTA 分区 + 回滚保护）：
+      //   1) 完全没有 addr 参数：默认按固件处理（网页 OTA 的正常用法）；
+      //   2) 文件名包含 "firmware"：按固件处理。
+      // 旧逻辑用 `addr == 0x10000` 判断，而 addr 缺省值恰好也是 0x10000，
+      // 于是 bootloader、partitions.bin 这些原始镜像被当成固件，全部写进
+      // OTA 分区，既刷不进去还覆盖了当前固件槽。所以改成看有没有显式 addr。
+      String fnameLower = s_otaFileName;
+      fnameLower.toLowerCase();
+      s_otaIsFirmware = !hasExplicitAddr || fnameLower.indexOf("firmware") >= 0;
+
+      Serial.printf("OTA_UPLOAD_START file=%s addr=%s0x%08X explicit_addr=%d firmware=%d size=%u\n",
+                    s_otaFileName.c_str(), s_otaIsFirmware ? "auto/" : "",
+                    s_otaFlashAddr, hasExplicitAddr ? 1 : 0,
+                    s_otaIsFirmware ? 1 : 0,
+                    static_cast<unsigned>(upload.totalSize));
+      digitalWrite(kHeartbeatLedPin, LOW);
+
+      if (!s_otaIsFirmware) {
+        // 原始镜像写入参数校验，避免一上传就把设备写死。
+        const uint32_t flashBytes = ESP.getFlashChipSize();
+        const bool allowPartitionWrite = server.arg("allow_partition") == "1";
+        if (s_otaFlashAddr % 0x1000 != 0) {
+          s_otaError = "addr 必须 4KB 对齐";
+        } else if (s_otaFlashAddr < 0x1000) {
+          s_otaError = "addr 不允许小于 0x1000（会覆盖 ROM 二级引导）";
+        } else if (s_otaFlashAddr == 0x8000 && !allowPartitionWrite) {
+          s_otaError = "写入分区表需要显式 allow_partition=1，请优先用 USB 刷写";
+        } else if (s_otaFlashAddr >= flashBytes) {
+          s_otaError = "addr 超出 Flash 容量";
+        } else if (upload.totalSize > 0 && upload.totalSize > flashBytes - s_otaFlashAddr) {
+          s_otaError = "镜像大小超出 Flash 末尾";
+        }
+        if (!s_otaError.isEmpty()) {
+          Serial.printf("OTA_RAW_ADDR_REJECTED: %s addr=0x%08X size=%u flash=%u\n",
+                        s_otaError.c_str(), s_otaFlashAddr,
+                        static_cast<unsigned>(upload.totalSize),
+                        static_cast<unsigned>(flashBytes));
+        }
+      }
+
+      if (s_otaIsFirmware) {
+        if (!s_otaError.isEmpty()) {
+          // 首包已被判定为非 app 镜像：丢弃剩余数据，结束时不调用 Update.end
+          return;
+        }
+        // 判定"这是不是 app 镜像"：看第一个段的加载地址 0x3F400020 处是不是
+        // esp_app_desc_t 的魔数 0xABCD5432。ESP-IDF 的 esp_image_verify() 用的
+        // 就是这个判据。整包（factory / merged）镜像从 0x0 开始，第一段是二级
+        // 引导，绝对不能直接塞进 OTA 分区，否则 ota_0 开头不是 app 描述符，
+        // update_core 校验失败，设备再也起不来。
+        // 注意：头部 0x18 是段表第一项，不是写地址（0x14 才是），别拿它当判据。
+        static const uint32_t kAppDescMagic = 0xABCD5432u;
+        // app 描述符固定在文件偏移 0x20，所以首包 >=36 字节即可判定，
+        // 不用等整个文件传完。不满足时只记下错误，后续包直接丢弃。
+        if (upload.currentSize >= 36) {
+          uint32_t magic = 0;
+          memcpy(&magic, upload.buf + 0x20, sizeof(magic));
+          if (upload.buf[0] != 0xE9 || magic != kAppDescMagic) {
+            s_otaError = "这不是 app 镜像（缺少 app 描述符），网页升级只能传文件名带 -ota 的那个；整包镜像请用数据线整片刷写";
+            Serial.printf("OTA_REJECT_NOT_APP_IMAGE magic=0x%08X\n", magic);
+            digitalWrite(kHeartbeatLedPin, LOW);
+            return;   // 必须先 return：否则 begin() 已经占用了目标分区
+          }
+        }
+
+        // 使用Update库：自动写入下一个OTA分区，支持回滚
+        uint32_t updateSize = upload.totalSize > 0 ? upload.totalSize : UPDATE_SIZE_UNKNOWN;
+        if (!Update.begin(updateSize, U_FLASH)) {
+          s_otaError = "Update.begin失败: " + String(Update.errorString());
+          Serial.printf("OTA_UPDATE_BEGIN_FAILED: %s\n", Update.errorString());
+        } else {
+          Serial.println("OTA_UPDATE_BEGIN ok, writing to next OTA partition");
+        }
+      }
+
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (!s_otaError.isEmpty()) return;
+
+      if (s_otaTotalWritten == 0) captureOtaImageVersion(upload.buf, upload.currentSize);
+
+      // LED闪烁指示升级中
+      static unsigned long lastBlink = 0;
+      if (millis() - lastBlink > 100) {
+        digitalWrite(kHeartbeatLedPin, !digitalRead(kHeartbeatLedPin));
+        lastBlink = millis();
+      }
+
+      if (s_otaIsFirmware) {
+        // 使用Update库写入（自动处理分区、擦除等）
+        size_t written = Update.write(upload.buf, upload.currentSize);
+        if (written != upload.currentSize) {
+          s_otaError = "Update.write失败: " + String(Update.errorString());
+          Serial.printf("OTA_UPDATE_WRITE_FAILED: %s (wrote %u/%u)\n", Update.errorString(), written, upload.currentSize);
+          return;
+        }
+      } else {
+        // 原始SPI Flash写入（用于bootloader/partitions等）
+        if (s_otaWriteAddr >= ESP.getFlashChipSize() ||
+            upload.currentSize > ESP.getFlashChipSize() - s_otaWriteAddr) {
+          s_otaError = "写入越界: addr=0x" + String(s_otaWriteAddr, HEX) + " 超出 Flash";
+          Serial.printf("OTA_RAW_WRITE_OOB addr=0x%08X len=%u flash=%u\n",
+                        s_otaWriteAddr, static_cast<unsigned>(upload.currentSize),
+                        static_cast<unsigned>(ESP.getFlashChipSize()));
+          return;
+        }
+        uint32_t startSector = s_otaWriteAddr / 0x1000;
+
+        uint32_t endSector = (s_otaWriteAddr + upload.currentSize - 1) / 0x1000;
+        for (uint32_t sec = startSector; sec <= endSector; sec++) {
+          if (sec != s_otaLastErasedSector) {
+            esp_err_t err = spi_flash_erase_sector(sec);
+            if (err != ESP_OK) {
+              s_otaError = "擦除扇区失败 sec=" + String(sec) + " err=" + String(esp_err_to_name(err));
+              return;
+            }
+            s_otaLastErasedSector = sec;
+          }
+        }
+
+        size_t writeSize = (upload.currentSize + 3) & ~3;
+        uint8_t* writeBuf = (uint8_t*)malloc(writeSize);
+        if (!writeBuf) {
+          s_otaError = "内存不足，无法分配写入缓冲区";
+          return;
+        }
+        memcpy(writeBuf, upload.buf, upload.currentSize);
+        if (writeSize > upload.currentSize) {
+          memset(writeBuf + upload.currentSize, 0xFF, writeSize - upload.currentSize);
+        }
+        esp_err_t err = spi_flash_write(s_otaWriteAddr, (uint32_t*)writeBuf, writeSize);
+        free(writeBuf);
+        if (err != ESP_OK) {
+          s_otaError = "写入Flash失败 addr=0x" + String(s_otaWriteAddr, HEX) + " err=" + String(esp_err_to_name(err));
+          return;
+        }
+        s_otaWriteAddr += upload.currentSize;
+      }
+
+      s_otaTotalWritten += upload.currentSize;
+
+      static unsigned long lastProgressPrint = 0;
+      if (s_otaTotalWritten - lastProgressPrint >= 4096 || s_otaTotalWritten < 4096) {
+        Serial.printf("OTA_UPLOAD_PROGRESS %u bytes\n", s_otaTotalWritten);
+        lastProgressPrint = s_otaTotalWritten;
+      }
+
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (!s_otaError.isEmpty() && s_otaIsFirmware && Update.isRunning()) {
+        // 首包判定失败后 Update 还没开始，但保险起见统一收尾，避免占用分区
+        Update.abort();
+        Serial.println("OTA_ABORT_ON_ERROR");
+      }
+      Serial.printf("OTA_UPLOAD_END file=%s total=%u firmware=%d\n",
+                    s_otaFileName.c_str(), s_otaTotalWritten, s_otaIsFirmware);
+
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+      s_otaError = "上传被中断";
+      if (s_otaIsFirmware) Update.abort();
+      Serial.println("OTA_UPLOAD_ABORTED");
+    }
+
+}
+
 void setupRoutes() {
   const char* keys[] = {"Authorization", "X-Vela-Token"};
   server.collectHeaders(keys, 2);
@@ -8861,6 +9155,17 @@ void setupRoutes() {
   // ====== 恢复出厂设置 / 设备自检 ======
   // 网页调用：先 GET /api/v1/factory/preview 让用户看清会丢什么，
   // 再 POST /api/v1/factory/reset?confirm=RESET。
+  // 清除「上次升级被回滚」的提示
+  server.on("/api/v1/ota/rollback/ack", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    gOtaRollbackDetected = false;
+    gOtaRollbackExpected = "";
+    gOtaRollbackRunning = "";
+    JsonDocument d;
+    d["ok"] = true;
+    sendJson(200, d);
+  });
+
   server.on("/api/v1/factory/preview", HTTP_GET, [](){
     if (!isSetupApClient() && !requireAuth()) return;
     JsonDocument d;
@@ -8912,8 +9217,8 @@ void setupRoutes() {
     // 这种情况必须报存储错误，不能报「不是 app 镜像」，否则排查方向全错。
     if (!ensureSpiffs()) {
       d["ok"] = false;
-      d["error"] = "storage_unavailable";
-      d["hint"] = "设备文件系统未挂载（SPIFFS 分区缺失或格式化失败），固件无法暂存。请查看串口 SPIFFS_MOUNT_FAILED 一行。";
+      d["error"] = spiffsErrorCode();
+      d["hint"] = spiffsErrorHint();
       sendJson(200, d);
       return;
     }
@@ -9030,8 +9335,8 @@ void setupRoutes() {
     JsonDocument d;
     if (!ensureSpiffs()) {
       d["ok"] = false;
-      d["error"] = "storage_unavailable";
-      d["hint"] = "设备文件系统未挂载，固件列表不可用。";
+      d["error"] = spiffsErrorCode();
+      d["hint"] = spiffsErrorHint();
       sendJson(200, d);
       return;
     }
@@ -9048,7 +9353,7 @@ void setupRoutes() {
   server.on("/api/v1/firmware/install", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
     if (!ensureSpiffs()) {
-      jsonError(503, "storage_unavailable", "设备文件系统未挂载，无法读取固件");
+      jsonError(503, spiffsErrorCode(), spiffsErrorHint());
       return;
     }
     const String b = body();
@@ -9088,7 +9393,7 @@ void setupRoutes() {
   server.on("/api/v1/firmware/delete", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
     if (!ensureSpiffs()) {
-      jsonError(503, "storage_unavailable", "设备文件系统未挂载，无法删除文件");
+      jsonError(503, spiffsErrorCode(), spiffsErrorHint());
       return;
     }
     const String b = body();
@@ -9400,8 +9705,8 @@ void setupRoutes() {
     JsonDocument d;
     if (!ensureSpiffs()) {
       d["ok"] = false;
-      d["error"] = "storage_unavailable";
-      d["hint"] = "设备文件系统未挂载，资源列表不可用。";
+      d["error"] = spiffsErrorCode();
+      d["hint"] = spiffsErrorHint();
       sendJson(200, d);
       return;
     }
@@ -9553,8 +9858,8 @@ void setupRoutes() {
     JsonDocument d;
     if (!ensureSpiffs()) {
       d["ok"] = false;
-      d["error"] = "storage_unavailable";
-      d["hint"] = "设备文件系统未挂载，文件无法暂存。请查看串口 SPIFFS_MOUNT_FAILED 一行。";
+      d["error"] = spiffsErrorCode();
+      d["hint"] = spiffsErrorHint();
       sendJson(200, d);
       return;
     }
@@ -9607,7 +9912,7 @@ void setupRoutes() {
 
   server.on("/api/v1/resource/install", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
-    if (!ensureSpiffs()) return jsonError(503, "storage_unavailable", "设备文件系统未挂载，无法读取文件");
+    if (!ensureSpiffs()) return jsonError(503, spiffsErrorCode(), spiffsErrorHint());
     JsonDocument in;
     if (deserializeJson(in, server.arg("plain"))) return jsonError(400, "bad_json", "");
     const String slot = in["slot"] | "";
@@ -9668,7 +9973,7 @@ void setupRoutes() {
 
   server.on("/api/v1/resource/delete", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
-    if (!ensureSpiffs()) return jsonError(503, "storage_unavailable", "设备文件系统未挂载，无法删除文件");
+    if (!ensureSpiffs()) return jsonError(503, spiffsErrorCode(), spiffsErrorHint());
     JsonDocument in;
     if (deserializeJson(in, server.arg("plain"))) return jsonError(400, "bad_json", "");
     const String slot = in["slot"] | "";
@@ -9703,6 +10008,7 @@ void setupRoutes() {
   // 会直接替换页面，前端拿不到错误原因。/ota/upload2 是 JSON 版别名。
   const bool phoneFriendlyUpload = true;
   (void)phoneFriendlyUpload;
+
   server.on("/ota/upload2", HTTP_POST, [](){
     if (!gOtaMode) { jsonError(403,"not_in_ota_mode",""); return; }
     JsonDocument d;
@@ -9711,6 +10017,17 @@ void setupRoutes() {
       d["written"] = (uint32_t)s_otaTotalWritten;
       sendJson(200, d);
       Serial.printf("OTA_PHONE_UPLOAD_ERROR: %s\n", s_otaError.c_str());
+      return;
+    }
+
+    // 兜底：一个字节都没收到就绝不能回成功。以前上传回调缺失时正是这条路径，
+    // 接口回「写入完成」、设备重启、版本不变，用户完全看不出发生了什么。
+    if (s_otaTotalWritten == 0) {
+      d["ok"] = false;
+      d["error"] = "no_data";
+      d["hint"] = "没有收到文件内容，请重新选择文件上传。";
+      sendJson(200, d);
+      Serial.println("OTA_UPLOAD_REJECT no_data");
       return;
     }
     if (s_otaIsFirmware) {
@@ -9731,13 +10048,19 @@ void setupRoutes() {
       prefs.putInt("project", 1);
       prefs.putBool("project2", false);
     }
+    if (s_otaIsFirmware) {
+      prefs.putString("ota_expect_part", s_otaTargetLabel);
+      prefs.putString("ota_expect_ver", s_otaImageVersion);
+      Serial.printf("OTA_EXPECT part=%s ver=%s\n",
+                    s_otaTargetLabel.c_str(), s_otaImageVersion.c_str());
+    }
     digitalWrite(kHeartbeatLedPin, HIGH);
     delay(2000);
     digitalWrite(kHeartbeatLedPin, LOW);
     delay(100);
     Serial.println("OTA_REBOOTING...");
     ESP.restart();
-  });
+}, otaUploadCallback);
 
   server.on("/ota/upload", HTTP_POST, [](){
     // 响应处理：上传完成后调用
@@ -9752,6 +10075,17 @@ void setupRoutes() {
       sendJson(500, d);
       digitalWrite(kHeartbeatLedPin, LOW);
       Serial.printf("OTA_UPLOAD_ERROR: %s\n", s_otaError.c_str());
+      return;
+    }
+
+    // 兜底：一个字节都没收到就绝不能回成功。以前上传回调缺失时正是这条路径，
+    // 接口回「写入完成」、设备重启、版本不变，用户完全看不出发生了什么。
+    if (s_otaTotalWritten == 0) {
+      d["ok"] = false;
+      d["error"] = "no_data";
+      d["hint"] = "没有收到文件内容，请重新选择文件上传。";
+      sendJson(200, d);
+      Serial.println("OTA_UPLOAD_REJECT no_data");
       return;
     }
 
@@ -9788,6 +10122,12 @@ void setupRoutes() {
       prefs.putBool("project2", false);
       Serial.println("OTA_SWITCH_BACK project=1 reason=firmware_upgrade_done");
     }
+    if (s_otaIsFirmware) {
+      prefs.putString("ota_expect_part", s_otaTargetLabel);
+      prefs.putString("ota_expect_ver", s_otaImageVersion);
+      Serial.printf("OTA_EXPECT part=%s ver=%s\n",
+                    s_otaTargetLabel.c_str(), s_otaImageVersion.c_str());
+    }
 
     // LED常亮2秒，然后灭掉重启
     digitalWrite(kHeartbeatLedPin, HIGH);
@@ -9796,183 +10136,7 @@ void setupRoutes() {
     delay(100);
     Serial.println("OTA_REBOOTING...");
     ESP.restart();
-  }, [](){
-    // 上传处理回调
-    HTTPUpload& upload = server.upload();
-
-    if (upload.status == UPLOAD_FILE_START) {
-      s_otaFileName = upload.filename;
-      const bool hasExplicitAddr = server.hasArg("addr") && !server.arg("addr").isEmpty();
-      // 没给 addr 时按 16MB 分区表的 app 地址算。旧值 0x10000 是 4MB 版的
-      // 布局，在 16MB 上那个位置是 phy_init，写进去会毁掉射频校准。
-      const uint32_t addrValue = hasExplicitAddr
-                                     ? strtoul(server.arg("addr").c_str(), nullptr, 0)
-                                     : 0x20000;
-      s_otaFlashAddr = addrValue;
-      s_otaWriteAddr = s_otaFlashAddr;
-      s_otaTotalWritten = 0;
-      s_otaError = "";
-      s_otaLastErasedSector = 0xFFFFFFFF;
-
-      // 是否为固件（走 OTA 分区 + 回滚保护）：
-      //   1) 完全没有 addr 参数：默认按固件处理（网页 OTA 的正常用法）；
-      //   2) 文件名包含 "firmware"：按固件处理。
-      // 旧逻辑用 `addr == 0x10000` 判断，而 addr 缺省值恰好也是 0x10000，
-      // 于是 bootloader、partitions.bin 这些原始镜像被当成固件，全部写进
-      // OTA 分区，既刷不进去还覆盖了当前固件槽。所以改成看有没有显式 addr。
-      String fnameLower = s_otaFileName;
-      fnameLower.toLowerCase();
-      s_otaIsFirmware = !hasExplicitAddr || fnameLower.indexOf("firmware") >= 0;
-
-      Serial.printf("OTA_UPLOAD_START file=%s addr=%s0x%08X explicit_addr=%d firmware=%d size=%u\n",
-                    s_otaFileName.c_str(), s_otaIsFirmware ? "auto/" : "",
-                    s_otaFlashAddr, hasExplicitAddr ? 1 : 0,
-                    s_otaIsFirmware ? 1 : 0,
-                    static_cast<unsigned>(upload.totalSize));
-      digitalWrite(kHeartbeatLedPin, LOW);
-
-      if (!s_otaIsFirmware) {
-        // 原始镜像写入参数校验，避免一上传就把设备写死。
-        const uint32_t flashBytes = ESP.getFlashChipSize();
-        const bool allowPartitionWrite = server.arg("allow_partition") == "1";
-        if (s_otaFlashAddr % 0x1000 != 0) {
-          s_otaError = "addr 必须 4KB 对齐";
-        } else if (s_otaFlashAddr < 0x1000) {
-          s_otaError = "addr 不允许小于 0x1000（会覆盖 ROM 二级引导）";
-        } else if (s_otaFlashAddr == 0x8000 && !allowPartitionWrite) {
-          s_otaError = "写入分区表需要显式 allow_partition=1，请优先用 USB 刷写";
-        } else if (s_otaFlashAddr >= flashBytes) {
-          s_otaError = "addr 超出 Flash 容量";
-        } else if (upload.totalSize > 0 && upload.totalSize > flashBytes - s_otaFlashAddr) {
-          s_otaError = "镜像大小超出 Flash 末尾";
-        }
-        if (!s_otaError.isEmpty()) {
-          Serial.printf("OTA_RAW_ADDR_REJECTED: %s addr=0x%08X size=%u flash=%u\n",
-                        s_otaError.c_str(), s_otaFlashAddr,
-                        static_cast<unsigned>(upload.totalSize),
-                        static_cast<unsigned>(flashBytes));
-        }
-      }
-
-      if (s_otaIsFirmware) {
-        if (!s_otaError.isEmpty()) {
-          // 首包已被判定为非 app 镜像：丢弃剩余数据，结束时不调用 Update.end
-          return;
-        }
-        // 判定"这是不是 app 镜像"：看第一个段的加载地址 0x3F400020 处是不是
-        // esp_app_desc_t 的魔数 0xABCD5432。ESP-IDF 的 esp_image_verify() 用的
-        // 就是这个判据。整包（factory / merged）镜像从 0x0 开始，第一段是二级
-        // 引导，绝对不能直接塞进 OTA 分区，否则 ota_0 开头不是 app 描述符，
-        // update_core 校验失败，设备再也起不来。
-        // 注意：头部 0x18 是段表第一项，不是写地址（0x14 才是），别拿它当判据。
-        static const uint32_t kAppDescMagic = 0xABCD5432u;
-        // app 描述符固定在文件偏移 0x20，所以首包 >=36 字节即可判定，
-        // 不用等整个文件传完。不满足时只记下错误，后续包直接丢弃。
-        if (upload.currentSize >= 36) {
-          uint32_t magic = 0;
-          memcpy(&magic, upload.buf + 0x20, sizeof(magic));
-          if (upload.buf[0] != 0xE9 || magic != kAppDescMagic) {
-            s_otaError = "这不是 app 镜像（缺少 app 描述符），网页升级只能传文件名带 -ota 的那个；整包镜像请用数据线整片刷写";
-            Serial.printf("OTA_REJECT_NOT_APP_IMAGE magic=0x%08X\n", magic);
-            digitalWrite(kHeartbeatLedPin, LOW);
-            return;   // 必须先 return：否则 begin() 已经占用了目标分区
-          }
-        }
-
-        // 使用Update库：自动写入下一个OTA分区，支持回滚
-        uint32_t updateSize = upload.totalSize > 0 ? upload.totalSize : UPDATE_SIZE_UNKNOWN;
-        if (!Update.begin(updateSize, U_FLASH)) {
-          s_otaError = "Update.begin失败: " + String(Update.errorString());
-          Serial.printf("OTA_UPDATE_BEGIN_FAILED: %s\n", Update.errorString());
-        } else {
-          Serial.println("OTA_UPDATE_BEGIN ok, writing to next OTA partition");
-        }
-      }
-
-    } else if (upload.status == UPLOAD_FILE_WRITE) {
-      if (!s_otaError.isEmpty()) return;
-
-      // LED闪烁指示升级中
-      static unsigned long lastBlink = 0;
-      if (millis() - lastBlink > 100) {
-        digitalWrite(kHeartbeatLedPin, !digitalRead(kHeartbeatLedPin));
-        lastBlink = millis();
-      }
-
-      if (s_otaIsFirmware) {
-        // 使用Update库写入（自动处理分区、擦除等）
-        size_t written = Update.write(upload.buf, upload.currentSize);
-        if (written != upload.currentSize) {
-          s_otaError = "Update.write失败: " + String(Update.errorString());
-          Serial.printf("OTA_UPDATE_WRITE_FAILED: %s (wrote %u/%u)\n", Update.errorString(), written, upload.currentSize);
-          return;
-        }
-      } else {
-        // 原始SPI Flash写入（用于bootloader/partitions等）
-        if (s_otaWriteAddr >= ESP.getFlashChipSize() ||
-            upload.currentSize > ESP.getFlashChipSize() - s_otaWriteAddr) {
-          s_otaError = "写入越界: addr=0x" + String(s_otaWriteAddr, HEX) + " 超出 Flash";
-          Serial.printf("OTA_RAW_WRITE_OOB addr=0x%08X len=%u flash=%u\n",
-                        s_otaWriteAddr, static_cast<unsigned>(upload.currentSize),
-                        static_cast<unsigned>(ESP.getFlashChipSize()));
-          return;
-        }
-        uint32_t startSector = s_otaWriteAddr / 0x1000;
-
-        uint32_t endSector = (s_otaWriteAddr + upload.currentSize - 1) / 0x1000;
-        for (uint32_t sec = startSector; sec <= endSector; sec++) {
-          if (sec != s_otaLastErasedSector) {
-            esp_err_t err = spi_flash_erase_sector(sec);
-            if (err != ESP_OK) {
-              s_otaError = "擦除扇区失败 sec=" + String(sec) + " err=" + String(esp_err_to_name(err));
-              return;
-            }
-            s_otaLastErasedSector = sec;
-          }
-        }
-
-        size_t writeSize = (upload.currentSize + 3) & ~3;
-        uint8_t* writeBuf = (uint8_t*)malloc(writeSize);
-        if (!writeBuf) {
-          s_otaError = "内存不足，无法分配写入缓冲区";
-          return;
-        }
-        memcpy(writeBuf, upload.buf, upload.currentSize);
-        if (writeSize > upload.currentSize) {
-          memset(writeBuf + upload.currentSize, 0xFF, writeSize - upload.currentSize);
-        }
-        esp_err_t err = spi_flash_write(s_otaWriteAddr, (uint32_t*)writeBuf, writeSize);
-        free(writeBuf);
-        if (err != ESP_OK) {
-          s_otaError = "写入Flash失败 addr=0x" + String(s_otaWriteAddr, HEX) + " err=" + String(esp_err_to_name(err));
-          return;
-        }
-        s_otaWriteAddr += upload.currentSize;
-      }
-
-      s_otaTotalWritten += upload.currentSize;
-
-      static unsigned long lastProgressPrint = 0;
-      if (s_otaTotalWritten - lastProgressPrint >= 4096 || s_otaTotalWritten < 4096) {
-        Serial.printf("OTA_UPLOAD_PROGRESS %u bytes\n", s_otaTotalWritten);
-        lastProgressPrint = s_otaTotalWritten;
-      }
-
-    } else if (upload.status == UPLOAD_FILE_END) {
-      if (!s_otaError.isEmpty() && s_otaIsFirmware && Update.isRunning()) {
-        // 首包判定失败后 Update 还没开始，但保险起见统一收尾，避免占用分区
-        Update.abort();
-        Serial.println("OTA_ABORT_ON_ERROR");
-      }
-      Serial.printf("OTA_UPLOAD_END file=%s total=%u firmware=%d\n",
-                    s_otaFileName.c_str(), s_otaTotalWritten, s_otaIsFirmware);
-
-    } else if (upload.status == UPLOAD_FILE_ABORTED) {
-      s_otaError = "上传被中断";
-      if (s_otaIsFirmware) Update.abort();
-      Serial.println("OTA_UPLOAD_ABORTED");
-    }
-  });
+  }, otaUploadCallback);
 
   // OTA状态
   server.on("/ota/status", HTTP_GET, [](){
@@ -10293,10 +10457,36 @@ void setup() {
     Serial.println("FORCE_SETUP detected, mode reset to watch, setup AP will be entered");
   }
 
+  // 升级结果核对：写分区前记下的目标分区/版本对不上，说明本次升级被 bootloader
+  // 回滚了。这种情况必须让用户看见 —— 否则界面只表现为「刷完还是旧版本」。
+  {
+    const String expectPart = prefs.getString("ota_expect_part", "");
+    const String expectVer = prefs.getString("ota_expect_ver", "");
+    if (!expectPart.isEmpty() || !expectVer.isEmpty()) {
+      prefs.remove("ota_expect_part");
+      prefs.remove("ota_expect_ver");
+      const esp_partition_t* running = esp_ota_get_running_partition();
+      const String runningPart = running ? String(running->label) : String("?");
+      const bool partOk = expectPart.isEmpty() || expectPart == runningPart;
+      const bool verOk = expectVer.isEmpty() || expectVer == String(kFwVersionFull);
+      if (partOk && verOk) {
+        Serial.printf("OTA_UPGRADE_CONFIRMED part=%s ver=%s\n",
+                      runningPart.c_str(), kFwVersionFull);
+      } else {
+        gOtaRollbackDetected = true;
+        gOtaRollbackExpected = expectVer;
+        gOtaRollbackRunning = String(kFwVersionFull);
+        Serial.printf("OTA_ROLLBACK_DETECTED expect_part=%s expect_ver=%s running_part=%s running_ver=%s\n",
+                      expectPart.c_str(), expectVer.c_str(),
+                      runningPart.c_str(), kFwVersionFull);
+      }
+    }
+  }
+
   // OTA回滚保护：标记当前固件为有效
-  // 注意：这里只置"待确认"标志，真正的 mark_app_valid 放到 loop() 里，
-  // 必须等设备稳定运行 30 秒（蓝牙、Wi-Fi、HTTP 都已经起来）之后才确认。
-  // 旧实现在 setup() 一进来就 cancel_rollback，等于回滚保护从未生效。
+  // 这里只置"待确认"标志，真正的 mark_app_valid 放到 loop() 里，等主循环跑满
+  // kOtaConfirmDelayMs 再确认。旧实现在 setup() 一进来就 cancel_rollback，
+  // 等于回滚保护从未生效。
   {
     const esp_partition_t* running = esp_ota_get_running_partition();
     if (running) {
