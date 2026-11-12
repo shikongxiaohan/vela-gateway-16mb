@@ -6535,6 +6535,8 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <input type="file" id="fwFile" accept=".bin">
   <div id="fwBar" class="muted" style="margin-top:10px">未选择文件</div>
   <div class="bar" style="margin-top:10px"><i id="fwProgress" style="width:0"></i></div>
+  <button class="ghost" style="width:100%;margin-top:10px" data-act="fwDiag">上传诊断</button>
+  <div id="fwDiag" class="muted" style="margin-top:8px"></div>
   <p class="hint" style="margin-top:10px">写入期间蓝牙桥接暂停，约 10 至 30 秒；重启后恢复。配置、手表密钥、表盘均保留。新固件若无法启动，会自动退回当前版本。</p>
 </div>
 
@@ -6765,7 +6767,7 @@ function toast(msg,err){
 // 运行日志：上半区是本页操作，下半区是设备侧事件（/api/v1/logs 环形缓冲）。
 // 以前这里只有一个本地 log()，只能看到浏览器自己干的事；升级失败、推送失败
 // 这些真正有用的原因全在设备里，不开串口根本看不到。
-var _devLogSig='';
+var _devLogSig='', devLogAt=0;
 function log(msg){
   var line=new Date().toLocaleTimeString('zh-CN',{hour12:false})+'  '+msg;
   var o=$('oLocal');
@@ -7078,7 +7080,9 @@ async function refresh(){
   $('dFl').textContent=d.flashSize?Math.round(d.flashSize/1048576)+' MB':'—';
   $('dAp').textContent=d.appPartitionSize?Math.round(d.appPartitionSize/1024)+' KB':'—';
   $('dSp').textContent=d.spiffsPartitionSize?Math.round(d.spiffsPartitionSize/1024)+' KB':'—';
-  syncDeviceLogs();
+  // 设备事件只在首页/系统页可见，别的分页没必要拉，省一次请求和一块堆。
+  var nowMs=Date.now();
+  if((activeTab==='dash'||activeTab==='sys') && nowMs-devLogAt>6000){ devLogAt=nowMs; syncDeviceLogs(); }
   if(d.fwVersionFull||d.fwVersion) $('fwTag').textContent=d.fwVersionFull||d.fwVersion;
   if(d.autoReset!==undefined) renderAuto(d);
   $('pollHint').textContent = '· '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
@@ -7434,6 +7438,22 @@ function startFwUpload(f,input,bar,prog){
   xhr.send(fd);
 }
 
+// 上传诊断：直接问设备「最近一次上传走到哪一步」。上传失败时用户不用去
+// 别处翻日志，点一下就有结论：phase=none 说明请求根本没进上传回调。
+async function fwDiag(){
+  var box=$('fwDiag');
+  box.textContent='读取中…';
+  var d=await api('/api/v1/ota/upload/diag');
+  if(!d||!d.ok){ box.textContent='读不到设备状态，可能正在重启'; return; }
+  var map={file_start:'已收到文件头',file_write:'正在写入',file_end:'写入结束，等待校验',
+           aborted:'上传被中断',done:'已完成并重启',none:'没有收到任何上传'};
+  box.textContent='阶段：'+(map[d.phase]||d.phase||'?')+'（'+d.written+' 字节）'
+    +(d.target?(' · 目标 ' + d.target):'')
+    +' · 堆 '+Math.round((d.freeHeap||0)/1024)+' KB'
+    +' · 分区写入占用 '+(d.updateRunning?'是':'否')
+    +(d.error?(' · 错误 '+d.error):'');
+}
+
 // 统一事件委托：所有按钮用 data-act，避免内联 onclick 的引号地狱
 document.addEventListener('click',function(ev){
   var b=ev.target.closest('[data-act]');
@@ -7471,6 +7491,7 @@ document.addEventListener('click',function(ev){
   else if(act==='watchRestart') watchRestart();
   else if(act==='contextReset') contextReset();
   else if(act==='pushText') pushText();
+  else if(act==='fwDiag') fwDiag();
   else if(act==='pushPreset'){ $('pushText').value=b.dataset.arg||''; pushText(); }
   else if(act==='syncClock') syncClock();
   else if(act==='tz-preset'){ $('tzInput').value=b.dataset.arg; syncClock(); }
