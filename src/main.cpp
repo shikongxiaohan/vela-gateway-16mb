@@ -1357,14 +1357,17 @@ void rgbLedPush(uint8_t pin, uint8_t r, uint8_t g, uint8_t b) {
   }
   rmt_item32_t items[24];
   const uint8_t grb[3] = {g, r, b};   // WS2812 的传输顺序是 G→R→B
+  // 时序取 WS2812 规范中心值（div=1，一 tick 12.5ns）。此前 '0' 码 T0H=350ns
+  // 正好踩在部分灯珠（按 T1H/2 判定阈值 ≈350ns）的 0/1 判定线上，导致
+  // '0' 被误判为 '1'：任何颜色都显示白色、熄灭无效。现将 0/1 高电平差拉开。
   for (int i = 0; i < 3; ++i) {
     for (int bit = 0; bit < 8; ++bit) {
       const bool one = (grb[i] >> (7 - bit)) & 0x01;
       rmt_item32_t& it = items[i * 8 + bit];
       it.level0 = 1;
-      it.duration0 = one ? 56 : 28;   // '1' 高 0.70 µs / '0' 高 0.35 µs
+      it.duration0 = one ? 60 : 24;   // '1' 高 0.75 µs / '0' 高 0.30 µs
       it.level1 = 0;
-      it.duration1 = one ? 44 : 52;   //      低 0.55 µs /      低 0.65 µs
+      it.duration1 = one ? 40 : 76;   //      低 0.50 µs /      低 0.95 µs
     }
   }
   rmt_write_items(gRgbRmtChannel, items, 24, true);
