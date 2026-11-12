@@ -376,11 +376,15 @@ static uint32_t gTrafficHistLastTx = 0;
 // 日志环形缓冲：抓关键事件（连接/断开/重连/恢复出厂/OTA），
 // 页面「运行日志」区可直接查看，无需接入串口。
 constexpr uint8_t kLogRingLines = 24;
-constexpr uint8_t kLogLineMax = 72;
+constexpr uint8_t kLogLineMax = 96;
 static char gLogRing[kLogRingLines][kLogLineMax] = {{0}};
 static uint32_t gLogRingMs[kLogRingLines] = {0};
 static uint8_t gLogRingNext = 0;
 static uint8_t gLogRingCount = 0;
+// 写日志的线程不止一个：蓝牙任务（推送结果）、HTTP 任务（改配置、OTA）、
+// 主循环。环形缓冲的 next/count 是跨线程的共享下标，被别的任务切一下就会
+// 写串行或者漏一行，所以这里用递归锁保护。
+static SemaphoreHandle_t gLogMutex = nullptr;
 
 static void velaLog(const char* fmt, ...) {
   char line[kLogLineMax];
@@ -388,10 +392,13 @@ static void velaLog(const char* fmt, ...) {
   va_start(ap, fmt);
   vsnprintf(line, sizeof(line), fmt, ap);
   va_end(ap);
+  const bool locked = gLogMutex &&
+                      xSemaphoreTakeRecursive(gLogMutex, pdMS_TO_TICKS(20)) == pdTRUE;
   snprintf(gLogRing[gLogRingNext], kLogLineMax, "%s", line);
   gLogRingMs[gLogRingNext] = millis();
   gLogRingNext = static_cast<uint8_t>((gLogRingNext + 1) % kLogRingLines);
   if (gLogRingCount < kLogRingLines) ++gLogRingCount;
+  if (locked) xSemaphoreGiveRecursive(gLogMutex);
   Serial.printf("LOG %s\n", line);
 }
 
@@ -419,6 +426,22 @@ static String gNtpTz = "CST-8";
 static char gPendingWatchText[420] = {0};
 static volatile bool gPendingWatchTextReady = false;
 static volatile uint32_t gPendingWatchTextAtMs = 0;   // 入队时刻，用于判断是否卡住
+// 推送结果：HTTP 接口等待一次真实投递尝试后再回复，不再「入队即成功」。
+// 0=空闲，1=正在投递，2=成功（已写入 SPP），3=失败（原因在 sFail）
+static volatile uint8_t gPushTaskState = 0;
+static volatile uint8_t gPushTaskAttempts = 0;
+static char gPushTaskFail[56] = {0};
+static portMUX_TYPE gPushMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void pushWatchFail(const char* reason);   // 实现在 flushPendingWatchText 旁
+static void pushWatchSuccess();
+
+// 桥接断开或重连开始时调用：把「正在投递」立刻判失败，别让页面等超时。
+static void settlePushOnLinkReset(const char* reason) {
+  if (gPushTaskState != 1) return;
+  pushWatchFail(reason);
+  velaLog("PUSH_DROPPED reason=%s", reason ? reason : "link_down");
+}
 
 // 重启标志：避免在HTTP handler中直接调用ESP.restart()
 static volatile bool gRestartRequested = false;
@@ -3011,13 +3034,37 @@ static bool pushWatchText(const char* text) {
   snprintf(gPendingWatchText, sizeof(gPendingWatchText), "%s", text);
   gPendingWatchTextAtMs = millis();
   gPendingWatchTextReady = true;
+  // 新任务：重置上一次的结果，HTTP 接口据此判断「这一条」有没有发出去。
+  taskENTER_CRITICAL(&gPushMux);
+  gPushTaskState = 1;
+  gPushTaskAttempts = 0;
+  gPushTaskFail[0] = '\0';
+  taskEXIT_CRITICAL(&gPushMux);
   velaLog("PUSH_QUEUED bytes=%u", static_cast<unsigned>(strlen(text)));
   return true;
+}
+
+// 由投递方记录失败原因，供 /api/v1/watch/push/result 回给页面。
+static void pushWatchFail(const char* reason) {
+  taskENTER_CRITICAL(&gPushMux);
+  gPushTaskState = 3;
+  snprintf(gPushTaskFail, sizeof(gPushTaskFail), "%s", reason ? reason : "unknown");
+  taskEXIT_CRITICAL(&gPushMux);
+}
+
+static void pushWatchSuccess() {
+  taskENTER_CRITICAL(&gPushMux);
+  gPushTaskState = 2;
+  gPushTaskFail[0] = '\0';
+  taskEXIT_CRITICAL(&gPushMux);
 }
 
 bool flushPendingWatchText(uint8_t& sequence, const uint8_t encKey[16]) {
   if (!gPendingWatchTextReady) return false;
   gPendingWatchTextReady = false;
+  taskENTER_CRITICAL(&gPushMux);
+  if (++gPushTaskAttempts == 0) gPushTaskAttempts = 1;   // 防回绕成 0
+  taskEXIT_CRITICAL(&gPushMux);
   char text[sizeof(gPendingWatchText)];
   snprintf(text, sizeof(text), "%s", gPendingWatchText);
   gPendingWatchText[0] = '\0';
@@ -3025,12 +3072,14 @@ bool flushPendingWatchText(uint8_t& sequence, const uint8_t encKey[16]) {
   WatchAppInfo target;
   if (!lookupCachedWatchApp(target)) {
     velaLog("PUSH_FAIL reason=app_unknown");
+    pushWatchFail("手表上的快应用未定位，重连手表后再试");
     return false;
   }
   uint8_t pb[1024]{};
   size_t pbLength = 0;
   if (!buildXiaoAiTranscript(text, true, 1, pb, sizeof(pb), pbLength)) {
     velaLog("PUSH_FAIL reason=encode");
+    pushWatchFail("内容编码失败");
     return false;
   }
   const bool ok = sendEncryptedWatchPb(sequence, encKey, pb, pbLength);
@@ -3040,7 +3089,9 @@ bool flushPendingWatchText(uint8_t& sequence, const uint8_t encKey[16]) {
     gPendingWatchTextReady = true;
     gPendingWatchTextAtMs = millis();
   }
-  velaLog(ok ? "PUSH_OK bytes=%u" : "PUSH_FAIL reason=tx", static_cast<unsigned>(pbLength));
+  velaLog(ok ? "PUSH_SPP_OK bytes=%u" : "PUSH_FAIL reason=tx", static_cast<unsigned>(pbLength));
+  // 注意：这里只能确认「帧写进蓝牙发送队列」，手表 App 有没有弹通知要看回执。
+  if (ok) pushWatchSuccess();
   return ok;
 }
 
@@ -4543,12 +4594,22 @@ void authenticateWatchSpp(String target, String secretText) {
         // 待投递文本：这个会话是长连接，只在刚建立时补发一次的话，之后的
         // 推送会一直排在队列里出不去 —— 第二次点「发送到手表」就会报
         // 「发送队列已满」。空闲时定期补发，最短间隔 1.5 秒。
-        static uint32_t sNextPushAttemptMs = 0;
-        if (gPendingWatchTextReady &&
-            static_cast<int32_t>(millis() - sNextPushAttemptMs) >= 0) {
-          sNextPushAttemptMs = millis() + 1500u;
-          if (flushPendingWatchText(outgoingSequence, encKey)) {
-            velaLog("PUSH_SENT via=idle_loop");
+        if (gPendingWatchTextReady) {
+          static uint32_t sNextPushAttemptMs = 0;
+          if (static_cast<int32_t>(millis() - sNextPushAttemptMs) >= 0) {
+            sNextPushAttemptMs = millis() + 1500u;
+            if (flushPendingWatchText(outgoingSequence, encKey)) {
+              velaLog("PUSH_SENT via=idle_loop");
+            }
+          }
+        } else if (gPushTaskState == 1) {
+          // 队列是空的、也没在投递，说明这条消息根本没走到发送函数
+          // （文本被新一轮覆盖、或会话刚重建）。别让页面一直转圈。
+          static uint32_t sPushIdleSinceMs = 0;
+          if (sPushIdleSinceMs == 0) sPushIdleSinceMs = millis();
+          if (millis() - sPushIdleSinceMs > 3000u) {
+            sPushIdleSinceMs = 0;
+            pushWatchFail("消息未投递，链路已重建，请重试");
           }
         }
       }
@@ -6444,8 +6505,10 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 </div>
 
 <div class="card" id="logCard">
-  <h2>运行日志 <span class="muted" style="font-weight:400">· 最近 24 条</span></h2>
-  <div class="log" id="o">就绪</div>
+  <h2>运行日志 <span class="muted" style="font-weight:400">· 本页操作</span></h2>
+  <div class="log" id="oLocal">就绪</div>
+  <h2 style="margin-top:12px">设备事件 <span class="muted" style="font-weight:400">· 最近 24 条，升级与推送失败原因看这里</span></h2>
+  <div class="log" id="oDev">（暂无事件）</div>
 </div>
 
 </section>
@@ -6699,11 +6762,29 @@ function toast(msg,err){
   var t=$('toast'); t.textContent=msg; t.className='toast on'+(err?' err':'');
   clearTimeout(toastT); toastT=setTimeout(function(){t.className='toast';},2600);
 }
+// 运行日志：上半区是本页操作，下半区是设备侧事件（/api/v1/logs 环形缓冲）。
+// 以前这里只有一个本地 log()，只能看到浏览器自己干的事；升级失败、推送失败
+// 这些真正有用的原因全在设备里，不开串口根本看不到。
+var _devLogSig='';
 function log(msg){
-  var o=$('o');
   var line=new Date().toLocaleTimeString('zh-CN',{hour12:false})+'  '+msg;
+  var o=$('oLocal');
   o.textContent=line+'\n'+o.textContent;
-  if(o.textContent.length>6000) o.textContent=o.textContent.slice(0,6000);
+  if(o.textContent.length>4000) o.textContent=o.textContent.slice(0,4000);
+}
+async function syncDeviceLogs(){
+  var d=await api('/api/v1/logs');
+  if(!d||!d.ok||!d.lines) return;
+  var out=[];
+  for(var i=d.lines.length-1;i>=0;i--){
+    var l=d.lines[i];
+    if(!l||!l.m) continue;
+    out.push(new Date(l.t||0).toLocaleTimeString('zh-CN',{hour12:false})+'  '+l.m);
+  }
+  var txt=out.join('\n');
+  if(txt===_devLogSig) return;
+  _devLogSig=txt;
+  $('oDev').textContent=txt||'（暂无事件）';
 }
 async function api(path,opt){
   try{
@@ -6997,6 +7078,7 @@ async function refresh(){
   $('dFl').textContent=d.flashSize?Math.round(d.flashSize/1048576)+' MB':'—';
   $('dAp').textContent=d.appPartitionSize?Math.round(d.appPartitionSize/1024)+' KB':'—';
   $('dSp').textContent=d.spiffsPartitionSize?Math.round(d.spiffsPartitionSize/1024)+' KB':'—';
+  syncDeviceLogs();
   if(d.fwVersionFull||d.fwVersion) $('fwTag').textContent=d.fwVersionFull||d.fwVersion;
   if(d.autoReset!==undefined) renderAuto(d);
   $('pollHint').textContent = '· '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
@@ -7266,7 +7348,31 @@ function uploadFw(input){
   var bar=$('fwBar'), prog=$('fwProgress');
   if(!/\.bin$/i.test(f.name)){ bar.textContent='只接受 .bin 文件'; input.value=''; return; }
   if(f.size>6*1024*1024){ bar.textContent='文件超过 6 MB，超出升级分区容量'; input.value=''; return; }
-  if(!confirm('刷入 '+f.name+' ？\n\n写入期间蓝牙桥接暂停约 10 至 30 秒，完成后设备自动重启。\n新固件若无法启动，会自动退回当前版本。')){ input.value=''; return; }
+  // 上传前先自检镜像头：app 镜像首字节必须是 0xE9，且 0x20 处是 esp_app_desc_t
+  // 魔数 0xABCD5432。选错文件（比如 -factory.bin 或压缩包）在这里就能拦住，
+  // 不用把 1.6 MB 传完再被设备拒绝。设备侧也有同一道检查，两边都留着。
+  return checkFwHeader(f).then(function(why){
+    if(why){ bar.textContent=why; prog.style.background='#e74c3c'; input.value=''; return; }
+    if(!confirm('刷入 '+f.name+' ？\n\n写入期间蓝牙桥接暂停约 10 至 30 秒，完成后设备自动重启。\n新固件若无法启动，会自动退回当前版本。')){ input.value=''; return; }
+    startFwUpload(f,input,bar,prog);
+  });
+}
+function checkFwHeader(f){
+  return new Promise(function(resolve){
+    if(f.size<64){ resolve('文件太小，不像固件镜像'); return; }
+    var fr=new FileReader();
+    fr.onload=function(){
+      var b=new Uint8Array(fr.result);
+      if(b[0]!==0xE9) { resolve('不是 ESP32 应用镜像（首字节 '+(b[0]||0).toString(16)+'，应为 e9）'); return; }
+      var magic=(b[0x20]|(b[0x21]<<8)|(b[0x22]<<16)|(b[0x23]<<24))>>>0;
+      if(magic!==0xABCD5432){ resolve('缺少应用描述符（magic='+magic.toString(16)+'），这是整包或表盘文件，不能网页升级'); return; }
+      resolve('');
+    };
+    fr.onerror=function(){ resolve('读取文件失败，请重新选择'); };
+    fr.readAsArrayBuffer(f.slice(0,64));
+  });
+}
+function startFwUpload(f,input,bar,prog){
 
   var fd=new FormData(); fd.append('file',f,f.name);
   var xhr=new XMLHttpRequest();
@@ -7274,15 +7380,19 @@ function uploadFw(input){
   xhr.setRequestHeader('X-Vela-Token',VELA_TOKEN);
   prog.style.width='0'; prog.style.background='';
   bar.textContent='准备写入…';
+  var pct=0;
   xhr.upload.onprogress=function(e){
     if(!e.lengthComputable) return;
-    var pct=Math.min(100,Math.round(e.loaded/e.total*100));
+    pct=Math.min(100,Math.round(e.loaded/e.total*100));
     prog.style.width=pct+'%';
     bar.textContent='写入中 '+pct+'%（'+fwSize(e.loaded)+' / '+fwSize(e.total)+'）';
   };
+  var sentAt=Date.now();
+  log('固件上传开始 '+f.name+'（'+fwSize(f.size)+'）');
   xhr.onload=function(){
     var j={}; try{ j=JSON.parse(xhr.responseText); }catch(e){}
     if(j.ok){
+      log('固件写入成功 '+(j.version||'')+' → '+(j.target||'?')+'，设备重启中');
       prog.style.width='100%';
       bar.textContent='写入完成，共 '+fwSize(j.size)+(j.version?('，版本 '+fwEsc(j.version)):'')+'，设备重启中…';
       setTimeout(function(){
@@ -7290,17 +7400,37 @@ function uploadFw(input){
           '<h2 style="margin:12px 0">固件已写入</h2>'+
           '<p class="muted">设备正在重启，约 15 秒后恢复。<br>刷新本页面可查看新版本。</p></div>';
       },1200);
+    } else if(j.error==='no_data'&&!j.hint){
+      bar.textContent='设备没收到文件内容（多半是路径没匹配或请求被挡）。已做镜像头自检，仍失败请看「设备事件」。';
+      log('固件上传无数据');
+      input.value='';
     } else {
       prog.style.background='#e74c3c';
       bar.textContent='写入失败：'+fwEsc(j.error||('HTTP '+xhr.status))+(j.hint?(' — '+fwEsc(j.hint)):'');
+      log('固件写入失败：'+(j.error||('HTTP '+xhr.status))+(j.hint?(' / '+(j.hint)):''));
       input.value='';
     }
   };
-  xhr.onerror=function(){
+  xhr.ontimeout=function(){
     prog.style.background='#e74c3c';
-    bar.textContent='上传中断，设备状态未改变，可重新选择文件';
+    bar.textContent='设备长时间没有响应，可能正在重启或链路中断';
     input.value='';
   };
+  xhr.onerror=function(){
+    var waited=Math.round((Date.now()-sentAt)/1000);
+    prog.style.background='#e74c3c';
+    // 进度走满后设备会立刻重启，浏览器此时断开是正常现象；没走满就是真断了。
+    // 以前这里一律报「上传中断」，用户会以为没写进去。
+    if(pct>=100){
+      bar.textContent='进度已走满，设备正在重启。约 15 秒后刷新页面确认版本。';
+      log('固件上传完成，连接随设备重启断开');
+    } else {
+      bar.textContent='上传在第 '+pct+'% 中断（'+waited+' 秒）';
+      log('固件上传中断于 '+pct+'%，设备事件里可看 OTA_ABORT / OTA_REJECT');
+    }
+    input.value='';
+  };
+  xhr.timeout=120000;
   xhr.send(fd);
 }
 
@@ -7365,8 +7495,30 @@ async function pushText(){
   var t=$('pushText').value.trim();
   if(!t){ toast('内容为空',true); return; }
   var r=await api('/api/v1/watch/push',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});
-  if(r&&r.ok){ toast('已加入发送队列，会话空闲后投递'); $('pushText').value=''; }
-  else toast('发送失败：'+((r&&r.message)||(r&&r.error)||''), true);
+  if(!r||!r.ok){ toast('发送失败：'+((r&&r.message)||(r&&r.error)||''), true); return; }
+  $('pushText').value='';
+  toast('已入队，等待蓝牙链路投递…');
+  // 入队不等于发出去。真正结果只有会话线程知道，这里轮询最多 6 秒。
+  var got=await waitPushResult(6000);
+  if(got===2){
+    toast('已写入蓝牙发送通道');
+    log('PUSH 已发出（state=2）。若手表未弹通知，说明是手表端快应用不处理该消息，与本机无关。');
+  } else if(got===3){
+    toast('发送失败，详见运行日志', true);
+    log('PUSH 失败，原因见上方 PUSH_FAIL / PUSH_DROPPED 行');
+  } else {
+    toast('暂无回执，去看运行日志', true);
+  }
+  refresh();
+}
+async function waitPushResult(maxMs){
+  var until=Date.now()+maxMs;
+  while(Date.now()<until){
+    var d=await api('/api/v1/watch/push/result');
+    if(d&&d.ok&&(d.state===2||d.state===3)) return d.state;
+    await new Promise(function(r){ setTimeout(r,400); });
+  }
+  return 0;
 }
 async function syncClock(){
   var tz=$('tzInput').value.trim();
@@ -7414,6 +7566,7 @@ void watchBridgeTaskMain(void*) {
   gWatchBridgeRunning = true;
   gWatchBridgeStopRequested = false;
   setWatchBridgeState("connecting");
+  settlePushOnLinkReset("桥接断开或重连中");
   String mac = watchMac;
   String auth = watchAuthKey;
   authenticateWatchSpp(mac, auth);
@@ -7424,6 +7577,7 @@ void watchBridgeTaskMain(void*) {
   gWatchBridgeRunning = false;
   gWatchBridgeStopRequested = false;
   setWatchBridgeState("idle");
+  settlePushOnLinkReset("桥接断开或重连中");
   gWatchBridgeTask = nullptr;
   vTaskDelete(nullptr);
 }
@@ -8735,6 +8889,21 @@ static String sName;
 static size_t sWritten = 0;
 static String sVersion;           // 从镜像 app 描述符读出的版本
 static String sTargetLabel;       // 本次写入的分区
+// 最近一次上传停在哪个阶段：upload_page / upload_callback 里没有阶段名的话，
+// 「页面没反应」和「传到一半断了」在设备侧看起来一模一样。
+static uint8_t sPhase = 0;        // 0=未开始 1=START 2=WRITE 3=END 4=ABORTED 5=完成重启
+static uint32_t sLastRxMs = 0;
+
+const char* phaseName() {
+  switch (sPhase) {
+    case 1: return "file_start";
+    case 2: return "file_write";
+    case 3: return "file_end";
+    case 4: return "aborted";
+    case 5: return "done";
+    default: return "none";
+  }
+}
 
 void reset() {
   sActive = false;
@@ -8744,6 +8913,8 @@ void reset() {
   sWritten = 0;
   sVersion = "";
   sTargetLabel = "";
+  sPhase = 0;
+  sLastRxMs = 0;
 }
 
 // app 描述符固定在镜像偏移 0x20，version 是其中偏移 0x10 的 32 字节字符串。
@@ -8766,6 +8937,8 @@ void otaDirectUploadCallback() {
 
   if (upload.status == UPLOAD_FILE_START) {
     otadirect::reset();
+    otadirect::sPhase = 1;
+    otadirect::sLastRxMs = millis();
     otadirect::sName = upload.filename;
     const esp_partition_t* target = esp_ota_get_next_update_partition(nullptr);
     otadirect::sTargetLabel = target ? String(target->label) : String("");
@@ -8800,7 +8973,11 @@ void otaDirectUploadCallback() {
 
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (otadirect::sFailed || !otadirect::sActive) return;
-    if (otadirect::sWritten == 0) otadirect::readVersion(upload.buf, upload.currentSize);
+    if (otadirect::sWritten == 0) {
+      otadirect::sPhase = 2;
+      otadirect::sLastRxMs = millis();
+      otadirect::readVersion(upload.buf, upload.currentSize);
+    }
     const size_t n = Update.write(upload.buf, upload.currentSize);
     if (n != upload.currentSize) {
       otadirect::sFailed = true;
@@ -8815,14 +8992,18 @@ void otaDirectUploadCallback() {
     otadirect::sWritten += n;
 
   } else if (upload.status == UPLOAD_FILE_END) {
+    otadirect::sPhase = 3;
     Serial.printf("OTA_DIRECT_UPLOAD_END file=%s bytes=%u\n",
                   otadirect::sName.c_str(), static_cast<unsigned>(otadirect::sWritten));
 
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     if (otadirect::sActive) { Update.abort(); otadirect::sActive = false; }
     otadirect::sFailed = true;
+    otadirect::sPhase = 4;
     otadirect::sError = "上传被中断，未写入任何内容";
     Serial.println("OTA_DIRECT_ABORTED");
+    velaLog("OTA_ABORT file=%s bytes=%u", otadirect::sName.c_str(),
+            static_cast<unsigned>(otadirect::sWritten));
   }
 }
 
@@ -9020,6 +9201,27 @@ void otaUploadCallback() {
 void setupRoutes() {
   const char* keys[] = {"Authorization", "X-Vela-Token"};
   server.collectHeaders(keys, 2);
+  // 上传诊断：页面打完 POST 就断了，或者压根没进上传回调，只能从设备侧看。
+  // 这里记录最近一次上传的每个阶段，出问题时能在「设备事件」里看到。
+  {
+    server.on("/api/v1/ota/upload/diag", HTTP_GET, [](){
+      if (!isSetupApClient() && !requireAuth()) return;
+      JsonDocument d;
+      d["ok"] = true;
+      d["phase"] = otadirect::phaseName();
+      d["name"] = otadirect::sName;
+      d["written"] = static_cast<uint32_t>(otadirect::sWritten);
+      d["target"] = otadirect::sTargetLabel;
+      d["error"] = otadirect::sError;
+      d["updateRunning"] = Update.isRunning();
+      d["freeHeap"] = static_cast<uint32_t>(ESP.getFreeHeap());
+      // 客户端地址与接收端口：用来判断请求到底有没有落在 WebServer 上。
+      d["peer"] = server.client().remoteIP().toString();
+      d["localPort"] = server.client().localPort();
+      sendJson(200, d);
+    });
+  }
+
   server.on("/", HTTP_GET, [](){
     // 只剩两种页面：日常管理台（含配网）与空中升级页。
     if (gOtaMode) {
@@ -9338,6 +9540,7 @@ void setupRoutes() {
       d["error"] = otadirect::sError;
       sendJson(200, d);
       Serial.printf("OTA_DIRECT_REJECT %s\n", otadirect::sError.c_str());
+      velaLog("OTA_REJECT file=%s reason=not_app_image", otadirect::sName.c_str());
       return;
     }
     if (otadirect::sWritten == 0) {
@@ -9345,6 +9548,8 @@ void setupRoutes() {
       d["error"] = "no_data";
       d["hint"] = "没有收到文件内容，请重新选择文件上传。";
       sendJson(200, d);
+      Serial.println("OTA_DIRECT_REJECT no_data");
+      velaLog("OTA_REJECT file=%s reason=no_data", otadirect::sName.c_str());
       return;
     }
     if (!Update.end(true)) {
@@ -9352,6 +9557,8 @@ void setupRoutes() {
       d["error"] = String("镜像校验失败：") + Update.errorString();
       sendJson(200, d);
       Serial.printf("OTA_DIRECT_END_FAILED %s\n", Update.errorString());
+      velaLog("OTA_FAIL end=%s bytes=%u", Update.errorString(),
+              static_cast<unsigned>(otadirect::sWritten));
       return;
     }
     d["ok"] = true;
@@ -9366,6 +9573,9 @@ void setupRoutes() {
     Serial.printf("OTA_DIRECT_SUCCESS part=%s ver=%s bytes=%u\n",
                   otadirect::sTargetLabel.c_str(), otadirect::sVersion.c_str(),
                   static_cast<unsigned>(otadirect::sWritten));
+    otadirect::sPhase = 5;
+    velaLog("OTA_OK part=%s ver=%s bytes=%u", otadirect::sTargetLabel.c_str(),
+            otadirect::sVersion.c_str(), static_cast<unsigned>(otadirect::sWritten));
     delay(1200);
     ESP.restart();
   }, otaDirectUploadCallback);
@@ -9817,6 +10027,8 @@ void setupRoutes() {
   });
 
   // ==================== 投递（向手表推一条文本） ====================
+  // 这里只入队，不判断成功。真正能不能发出去只有会话线程知道（要有序列号、
+  // 会话密钥、已定位的快应用），所以页面随后轮询 /watch/push/result 拿结果。
   server.on("/api/v1/watch/push", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
     if (!server.hasArg("plain")) return jsonError(400, "no_body", "JSON body required");
@@ -9830,8 +10042,28 @@ void setupRoutes() {
     JsonDocument d;
     d["ok"] = queued;
     d["queued"] = queued;
-    if (!queued) d["message"] = "发送队列已满或链路中断，稍后重试";
+    if (!queued) d["message"] = "上一条还在投递中，等几秒再发";
     sendJson(queued ? 200 : 503, d);
+  });
+
+  // 推送结果：state 0 空闲 / 1 投递中 / 2 已写入 SPP / 3 失败。
+  // 注意 state=2 只代表帧发出去了，手表端是否弹通知还取决于手表快应用自身。
+  server.on("/api/v1/watch/push/result", HTTP_GET, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    JsonDocument d;
+    taskENTER_CRITICAL(&gPushMux);
+    const uint8_t state = gPushTaskState;
+    const uint8_t attempts = gPushTaskAttempts;
+    char reason[sizeof(gPushTaskFail)];
+    snprintf(reason, sizeof(reason), "%s", gPushTaskFail);
+    taskEXIT_CRITICAL(&gPushMux);
+    d["ok"] = true;
+    d["state"] = state;
+    d["attempts"] = attempts;
+    d["pending"] = gPendingWatchTextReady;
+    d["reason"] = reason;
+    d["bridgeState"] = getWatchBridgeState();
+    sendJson(200, d);
   });
 
   // ==================== 日志环形缓冲 ====================
@@ -10726,6 +10958,7 @@ void setup() {
   // 独立任务检测 GPIO 短接（不依赖被桥接阻塞的 loop()）。
   xTaskCreatePinnedToCore(setupTriggerTask, "vela_setup_trig", 2048, nullptr, 1, nullptr, 1);
   if (!gBridgeStateMutex) gBridgeStateMutex = xSemaphoreCreateMutex();
+  if (!gLogMutex) gLogMutex = xSemaphoreCreateRecursiveMutex();
   // ASR result queue is optional; scheduleWatchAsrJob() allocates it lazily.
   gWatchStreamCaptureFsReady = false;  // mounted lazily on first capture
   Serial.printf("WATCH_CAPTURE_FS lazy_mount=%s\n", gWatchStreamCaptureFsReady ? "true" : "false");

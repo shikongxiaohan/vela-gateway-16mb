@@ -181,6 +181,16 @@ def fix_otadata(source, target, env):
             print(r.stderr.rstrip())
             print("[ota] OTA 路由上传回调检查未通过，网页升级会静默失败")
 
+    # 「固件升级」与「推送到手表」两个功能的诚实性检查。这两个功能都出现过
+    # 「页面说成功了，实际什么都没发生」的情况，而这在手机上完全看不出来。
+    ph = Path(env.subst("$PROJECT_DIR")) / "tools" / "test_ota_push_honesty.py"
+    if ph.exists():
+        r = subprocess.run(["python3", str(ph)], capture_output=True, text=True)
+        print(r.stdout.rstrip())
+        if r.returncode != 0:
+            print(r.stderr.rstrip())
+            print("[ota-push] 升级/推送的反馈检查未通过，页面会假报成功")
+
     # 标记这次版本已出包（下次源码不变就不会再递进版本号）
     sys.path.insert(0, str(Path(env.subst("$PROJECT_DIR")) / "tools"))
     try:
