@@ -6535,7 +6535,10 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <input type="file" id="fwFile" accept=".bin">
   <div id="fwBar" class="muted" style="margin-top:10px">未选择文件</div>
   <div class="bar" style="margin-top:10px"><i id="fwProgress" style="width:0"></i></div>
-  <button class="ghost" style="width:100%;margin-top:10px" data-act="fwDiag">上传诊断</button>
+  <div class="row" style="margin-top:10px">
+    <button class="ghost" data-act="fwDiag">上传诊断</button>
+    <button class="ghost" data-act="fwSafe">安全模式</button>
+  </div>
   <div id="fwDiag" class="muted" style="margin-top:8px"></div>
   <p class="hint" style="margin-top:10px">写入期间蓝牙桥接暂停，约 10 至 30 秒；重启后恢复。配置、手表密钥、表盘均保留。新固件若无法启动，会自动退回当前版本。</p>
 </div>
@@ -7450,8 +7453,20 @@ async function fwDiag(){
   box.textContent='阶段：'+(map[d.phase]||d.phase||'?')+'（'+d.written+' 字节）'
     +(d.target?(' · 目标 ' + d.target):'')
     +' · 堆 '+Math.round((d.freeHeap||0)/1024)+' KB'
+    +' · 写入速度 '+(d.kbps||0)+' KB/s'
     +' · 分区写入占用 '+(d.updateRunning?'是':'否')
     +(d.error?(' · 错误 '+d.error):'');
+}
+
+// 安全模式：只停蓝牙桥接，其他一概不动。上传失败如果是因为蓝牙/内存把
+// 设备压垮（症状是传到某个百分比就断开、设备重启），关掉桥接后内存和
+// CPU 都松下来，同样的上传就能过去。刷完要手动重连手表。
+async function fwSafeMode(){
+  var d=await api('/api/v1/upload/safe-mode',{method:'POST'});
+  if(!d||!d.ok){ toast('切换失败：'+((d&&d.error)||'')||'', true); return; }
+  toast(d.bridgeStopped?'已停蓝牙桥接，现在可以重新上传':'蓝牙桥接本来就没在跑，直接上传吧');
+  log('安全模式：'+JSON.stringify(d));
+  refresh();
 }
 
 // 统一事件委托：所有按钮用 data-act，避免内联 onclick 的引号地狱
@@ -7492,6 +7507,7 @@ document.addEventListener('click',function(ev){
   else if(act==='contextReset') contextReset();
   else if(act==='pushText') pushText();
   else if(act==='fwDiag') fwDiag();
+  else if(act==='fwSafe') fwSafeMode();
   else if(act==='pushPreset'){ $('pushText').value=b.dataset.arg||''; pushText(); }
   else if(act==='syncClock') syncClock();
   else if(act==='tz-preset'){ $('tzInput').value=b.dataset.arg; syncClock(); }
@@ -8914,6 +8930,9 @@ static String sTargetLabel;       // 本次写入的分区
 // 「页面没反应」和「传到一半断了」在设备侧看起来一模一样。
 static uint8_t sPhase = 0;        // 0=未开始 1=START 2=WRITE 3=END 4=ABORTED 5=完成重启
 static uint32_t sLastRxMs = 0;
+// 写入速度：本次上传的字节数与起点，用来判断「卡住」到底是断链还是擦写太慢。
+static uint32_t sStartedAtMs = 0;
+static uint32_t sChunkCount = 0;
 
 const char* phaseName() {
   switch (sPhase) {
@@ -8936,6 +8955,16 @@ void reset() {
   sTargetLabel = "";
   sPhase = 0;
   sLastRxMs = 0;
+  sStartedAtMs = 0;
+  sChunkCount = 0;
+}
+
+// 写入吞吐（KB/s）。低到个位数说明卡在 Flash 擦写上，而不是网络太慢。
+uint32_t kbps() {
+  if (sStartedAtMs == 0 || sWritten == 0) return 0;
+  const uint32_t elapsed = millis() - sStartedAtMs;
+  if (elapsed == 0) return 0;
+  return static_cast<uint32_t>(static_cast<uint64_t>(sWritten) * 1000u / elapsed / 1024u);
 }
 
 // app 描述符固定在镜像偏移 0x20，version 是其中偏移 0x10 的 32 字节字符串。
@@ -8960,6 +8989,7 @@ void otaDirectUploadCallback() {
     otadirect::reset();
     otadirect::sPhase = 1;
     otadirect::sLastRxMs = millis();
+    otadirect::sStartedAtMs = millis();
     otadirect::sName = upload.filename;
     const esp_partition_t* target = esp_ota_get_next_update_partition(nullptr);
     otadirect::sTargetLabel = target ? String(target->label) : String("");
@@ -9011,6 +9041,7 @@ void otaDirectUploadCallback() {
       return;
     }
     otadirect::sWritten += n;
+    ++otadirect::sChunkCount;
 
   } else if (upload.status == UPLOAD_FILE_END) {
     otadirect::sPhase = 3;
@@ -9225,11 +9256,32 @@ void setupRoutes() {
   // 上传诊断：页面打完 POST 就断了，或者压根没进上传回调，只能从设备侧看。
   // 这里记录最近一次上传的每个阶段，出问题时能在「设备事件」里看到。
   {
-    server.on("/api/v1/ota/upload/diag", HTTP_GET, [](){
+    // 安全模式：上传固件前把蓝牙桥接停掉。
+  // 桥上跑着蓝牙 + NAPT + lwIP，设备只有几十 KB 空闲堆；网页传 1.6 MB 时
+  // HTTP 解析、Update 擦写、蓝牙收发抢同一块内存，落在中途就表现为
+  // 「传到某个百分比断开、设备重启」。停掉桥接不是修根因，但能立刻把
+  // 上传成功率拉回来，是排障时最省事的一刀。
+  server.on("/api/v1/upload/safe-mode", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    JsonDocument d;
+    const bool wasRunning = gWatchBridgeRunning;
+    if (wasRunning) stopWatchBridge();
+    d["ok"] = true;
+    d["bridgeStopped"] = wasRunning;
+    d["bridgeState"] = getWatchBridgeState();
+    d["heapFree"] = static_cast<uint32_t>(ESP.getFreeHeap());
+    sendJson(200, d);
+    velaLog("SAFE_MODE bridge_stopped=%s free=%u", wasRunning ? "true" : "false",
+            static_cast<unsigned>(ESP.getFreeHeap()));
+  });
+
+  server.on("/api/v1/ota/upload/diag", HTTP_GET, [](){
       if (!isSetupApClient() && !requireAuth()) return;
       JsonDocument d;
       d["ok"] = true;
       d["phase"] = otadirect::phaseName();
+      d["kbps"] = otadirect::kbps();
+      d["chunks"] = otadirect::sChunkCount;
       d["name"] = otadirect::sName;
       d["written"] = static_cast<uint32_t>(otadirect::sWritten);
       d["target"] = otadirect::sTargetLabel;
