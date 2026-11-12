@@ -70,25 +70,29 @@ def main() -> int:
     base = vu.artifact_basename(t, HARDWARE)
     archive_dir = root / "firmware-history"
 
-    # 0) 同版本号已经归档过 → 直接复用归档那份，不重新生成。
+    # 0) 同版本号已经归档过，且归档产物与当前构建一致，就直接复用归档那份。
     #    原因：同一份源码编译两次，字节会因为编译时间戳不同而不一样。
     #    如果版本号没变（源码没改），却重新编译并覆盖 firmware/，
     #    就会出现「firmware/ 里的 v0.0.0.3 和 Release / 归档里的 v0.0.0.3
-    #    不是同一份字节」的情况，刷机时无法用 md5 核对，非常坑。
-    #    所以：版本号已存在就认归档那份为准。
+    #    不是同一份字节」的情况，刷机时无法用 md5 核对。
+    #
+    #    注意：源码变了但版本号没变（比如改了页面文案却没触发递增）时，
+    #    归档那份是旧代码，必须重新生成，否则会把旧固件当成新的发出去。
     archived = (archive_dir / f"{base}-factory.bin", archive_dir / f"{base}-ota.bin")
-    if all(p.exists() for p in archived):
-        for src in archived:
-            dst = fw_dir / src.name
-            if not dst.exists() or dst.read_bytes() != src.read_bytes():
-                shutil.copyfile(src, dst)
-                print(f"{src.name}  （复用归档版本，字节与已发布产物一致）")
-            else:
-                print(f"{src.name}  （已是最新）")
-        return 0
+    app = build_dir / "firmware.bin"
+    if all(p.exists() for p in archived) and app.exists():
+        if archived[1].read_bytes() == app.read_bytes():
+            for src in archived:
+                dst = fw_dir / src.name
+                if not dst.exists() or dst.read_bytes() != src.read_bytes():
+                    shutil.copyfile(src, dst)
+                    print(f"{src.name}  （复用归档版本，字节与已发布产物一致）")
+                else:
+                    print(f"{src.name}  （已是最新）")
+            return 0
+        print(f"归档的 {base} 与当前构建不一致，重新生成产物")
 
     # 1) app 镜像 → ota
-    app = build_dir / "firmware.bin"
     if not app.exists():
         print(f"[FAIL] 找不到 {app}，先构建固件")
         return 1

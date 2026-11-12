@@ -153,13 +153,13 @@ constexpr char kApSsid[] = "Vela-Setup";
 //   构建    BUILD     每次对外发布源码构建 +1
 //   修订    REVISION  同一构建上的缺陷修复 +1，不动前三位
 //
-// 四段全部对外可见，都要写出来！！
+// 四段均对外可见。
 //
 //   展示形态：v0.0.0.1     （网页徽章、串口横幅、固件文件名）
 //
-// 与 semver 的区别：semver 的 0.x 会把"未发布"当特殊状态，而四段式的
-// 0.0.0.1 的含义很直白：主、次、构建都还是 0，这是第 1 个修订。
-// 前三段为 0 只说明"协议未冻结"，不代表不能发布。
+// 与 semver 的差异：semver 将 0.x 视为未发布状态；本方案中 v0.0.0.1
+// 表示主、次、构建号均为 0 的第 1 个修订。前三段为 0 仅表示协议尚未冻结，
+// 不影响发布。
 //
 // 修订号最多 4 位，前导 0 省略：v0.0.0.1 → v0.0.0.9 → v0.0.0.10
 // …… 最大 v0.0.0.9999，再往上进位到构建号。它是整数，不是定长字段，
@@ -362,7 +362,7 @@ static uint32_t gTrafficHistLastRx = 0;
 static uint32_t gTrafficHistLastTx = 0;
 
 // 日志环形缓冲：抓关键事件（连接/断开/重连/恢复出厂/OTA），
-// 页面开「运行日志」直接看，不用再插串口。
+// 页面「运行日志」区可直接查看，无需接入串口。
 constexpr uint8_t kLogRingLines = 24;
 constexpr uint8_t kLogLineMax = 72;
 static char gLogRing[kLogRingLines][kLogLineMax] = {{0}};
@@ -6258,15 +6258,15 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   </div>
   <div class="spark" id="spark"><i style="height:2px"></i></div>
   <div class="legend"><span><em style="background:#2563eb"></em>收到</span><span><em style="background:#059669"></em>发出</span></div>
-  <p class="muted" style="margin:6px 0 0">每 2 秒采一格，一共 30 格。柱高按这一分钟里的最大值缩放。</p>
+  <p class="muted" style="margin:6px 0 0">采样间隔 2 秒，共 30 个采样点，柱高按窗口内最大值归一。</p>
 </div>
 
 <div class="card" id="autoCard" style="display:none">
-  <h2>连不上 Wi-Fi，已自动开热点</h2>
+  <h2>Wi-Fi 连接失败，配网热点已开启</h2>
   <p class="muted" id="autoText"></p>
   <div class="row" style="margin-top:10px">
-    <button class="ghost" data-act="cancel">暂不开热点（30 分钟）</button>
-    <button class="ghost" data-act="goto-setup">去改配置</button>
+    <button class="ghost" data-act="cancel">暂停配网热点（30 分钟）</button>
+    <button class="ghost" data-act="goto-setup">修改配置</button>
   </div>
 </div>
 
@@ -6276,7 +6276,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
     <button class="ghost" data-act="scanWifi">扫描附近网络</button>
     <button class="ghost" data-act="manual-ssid">手动输入</button>
   </div>
-  <p class="muted" id="wifiStatus">点扫描选一个网络，或手动填写 SSID。</p>
+  <p class="muted" id="wifiStatus">扫描列表中选择网络，或手动填写 SSID。</p>
   <div class="list" id="networks"></div>
   <label>SSID</label>
   <input id="ssid" autocomplete="off" placeholder="家庭 Wi-Fi 名称">
@@ -6290,7 +6290,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
     <button class="ghost" data-act="scanBluetooth">扫描蓝牙</button>
     <button class="ghost" data-act="testBluetooth">测试连接</button>
   </div>
-  <p class="muted" id="bluetoothStatus">扫到手表后点一下，MAC 自动填入。</p>
+  <p class="muted" id="bluetoothStatus">在扫描列表中选择设备后，MAC 自动填入。</p>
   <div class="list" id="bluetoothDevices"></div>
   <label>手表 MAC</label>
   <input id="mac" autocomplete="off" placeholder="AA:BB:CC:DD:EE:FF">
@@ -6310,7 +6310,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
       <input id="ap" type="text" value="__PH_PASS__" minlength="8" autocomplete="off">
     </div>
   </div>
-  <p class="muted" style="margin-top:8px">改密码后需要用新密码重连热点。</p>
+  <p class="muted" style="margin-top:8px">修改后需使用新密码重新连接热点。</p>
 </div>
 
 <button style="width:100%;padding:15px;font-size:15.5px" data-act="save">保存并连接</button>
@@ -6318,19 +6318,19 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 
 <div class="card">
   <h2>固件升级</h2>
-  <p class="muted">进入空中升级模式后可用手机浏览器直接刷写固件。设备会重启，热点保持开启。</p>
+  <p class="muted">进入空中升级模式后，可通过手机浏览器刷写固件。设备将重启，热点保持开启。</p>
   <button class="ghost" style="width:100%;margin-top:9px" data-act="switchProj" data-arg="6">进入空中升级</button>
 </div>
 
 <div class="card">
   <h2>恢复出厂设置</h2>
   <ul class="tight">
-    <li><b>长按 BOOT 3 秒</b>：只清 Wi-Fi，保留手表密钥（换路由器时用）</li>
-    <li><b>长按 BOOT 10 秒</b>：全部清空并进入配网热点</li>
-    <li><b>连不上 Wi-Fi 时</b>：自动开启配网热点，<b>配置全部保留</b>（不会清除）</li>
+    <li>长按 BOOT 3 秒：清除 Wi-Fi 配置，保留手表密钥，适用于更换路由器</li>
+    <li>长按 BOOT 10 秒：清除全部配置并进入配网热点</li>
+    <li>Wi-Fi 连接失败时：自动开启配网热点，原有配置保持不变</li>
   </ul>
   <button class="danger" style="width:100%;margin-top:10px" data-act="openReset">恢复出厂设置…</button>
-  <p class="muted" style="margin-top:8px">会清除 Wi-Fi、手表密钥与热点密码；固件、分区表和 SPIFFS 文件保留。</p>
+  <p class="muted" style="margin-top:8px">清除范围：Wi-Fi 配置、手表密钥、热点密码。固件、分区表与 SPIFFS 文件不受影响。</p>
 </div>
 
 <div class="card" id="logCard">
@@ -6348,33 +6348,31 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <div class="mini"><b>发布通道</b><span id="yChan">—</span></div>
 </div>
 
-<!-- 固件升级只在这一个地方：先把固件传进设备，再从列表里点升级。
-     旧版这里有两个「重启设备」和两个进 OTA 的按钮，点固件升级只是跳去 OTA 页，
-     用户看不到设备里到底有没有固件，就觉得点了没反应。 -->
+<!-- 固件升级入口：上传至设备后经列表安装。 -->
 <div class="card">
   <h2>固件升级</h2>
-  <p class="sub">先把 <code>-ota.bin</code> 传到设备，再点「升级」。整包 <code>-factory.bin</code> 网页刷不了，要用数据线。</p>
+  <p class="sub">上传 <code>-ota.bin</code> 后执行升级。整包 <code>-factory.bin</code> 不支持网页刷写，需通过数据线烧录。</p>
   <input type="file" id="fwFile" accept=".bin">
   <div id="fwBar" class="muted" style="margin-top:10px">未选择文件</div>
   <div class="list" id="fwList" style="margin-top:10px"><div class="muted">加载中…</div></div>
   <div class="row" style="margin-top:10px">
     <button class="ghost" data-act="fwRefresh">刷新</button>
-    <button data-act="fwInstall" id="fwInstallBtn" disabled>升级到选中版本</button>
+    <button data-act="fwInstall" id="fwInstallBtn" disabled>升级至选中版本</button>
   </div>
-  <p class="hint" style="margin-top:10px">升级会重启设备，约 15 秒后回来；配置和手表密钥不受影响。传错了的固件点「删除」就行。</p>
+  <p class="hint" style="margin-top:10px">升级过程设备将重启，约 15 秒后恢复。配置与手表密钥不受影响。上传错误时可删除后重新上传。</p>
 </div>
 
 <div class="card">
   <h2>设备动作</h2>
   <button class="ghost" style="width:100%" data-act="reboot">重启设备</button>
-  <p class="hint" style="margin-top:10px">重启只断电重启，不改任何配置；要换固件请用上面的升级。</p>
+  <p class="hint" style="margin-top:10px">重启不修改任何配置。更换固件请使用上方升级功能。</p>
 </div>
 </section>
 
 <section class="panel" id="p-res">
 <div class="card">
   <h2>上传表盘 / 快应用</h2>
-  <p class="sub">表盘支持 <code>.bin</code> / <code>.face</code>，快应用支持 <code>.rpk</code>。文件先存进设备（3.8 MB 空间），再通过蓝牙推到手表。</p>
+  <p class="sub">表盘格式为 <code>.bin</code> / <code>.face</code>，快应用为 <code>.rpk</code>。文件先写入设备存储（3.8 MB），再经蓝牙传输至手表。</p>
   <label>表盘文件</label>
   <input type="file" id="wfFile" accept=".bin,.face">
   <label>快应用包</label>
@@ -6398,7 +6396,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
     <button class="ghost" data-act="resRefresh">刷新列表</button>
     <button class="danger" data-act="resCancel">取消安装</button>
   </div>
-  <p class="sub" style="margin-top:10px">安装期间回程网络包会被丢弃（Mass 通道独占蓝牙），手表上的 TCP 会自动重传。</p>
+  <p class="sub" style="margin-top:10px">安装期间蓝牙通道被 Mass 数据传输独占，回程网络包丢弃，手表侧 TCP 自动重传。</p>
 </div>
 </section>
 
@@ -6422,7 +6420,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 
 <div class="card">
   <h2>链路质量</h2>
-  <p class="hint">信号强度、空闲内存、丢包率加权算出来的 0-100 分。低于 50 就会明显卡。</p>
+  <p class="hint">由信号强度、空闲内存与丢包率加权计算，取值 0-100。低于 50 时转发延迟明显上升。</p>
   <div style="display:flex;align-items:baseline;gap:10px">
     <div style="font-size:34px;font-weight:700;font-variant-numeric:tabular-nums" id="qScore">—</div>
     <div class="muted" id="qText">读取中</div>
@@ -6438,7 +6436,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 <section class="panel" id="p-perf">
 <div class="card">
   <h2>内存占用</h2>
-  <p class="hint">蓝牙 + lwIP + 转发缓冲都吃内部 RAM，低于 20KB 就该重启了。</p>
+  <p class="hint">蓝牙协议栈、lwIP 与转发缓冲均占用内部 RAM。空闲内存低于 20 KB 时建议重启。</p>
   <div class="grid kv-grid">
     <div class="kv"><b>空闲</b><span id="mFree">—</span></div>
     <div class="kv"><b>历史最低</b><span id="mMin">—</span></div>
@@ -6472,17 +6470,17 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 <section class="panel" id="p-net">
 <div class="card">
   <h2>家庭 Wi-Fi</h2>
-  <p class="hint">这里改的是设备连的路由器。改完需要重启才会生效。</p>
+  <p class="hint">此项配置设备连接的路由器。修改后需重启生效。</p>
   <div class="mini"><b>当前 SSID</b><span id="nSsid">—</span></div>
   <div class="mini"><b>IP 地址</b><span id="nIp">—</span></div>
   <div class="mini"><b>信号</b><span id="nRssi">—</span></div>
   <div class="mini"><b>信道</b><span id="nChan">—</span></div>
-  <button class="ghost" style="width:100%;margin-top:10px" data-act="tab" data-arg="dash">去「运行」页改 Wi-Fi</button>
+  <button class="ghost" style="width:100%;margin-top:10px" data-act="tab" data-arg="dash">在「运行」页修改 Wi-Fi</button>
 </div>
 
 <div class="card">
   <h2>时钟与校时</h2>
-  <p class="hint">时间同步后，手表侧的时间戳与日志才准。时区用 POSIX TZ 串。</p>
+  <p class="hint">完成时间同步后，手表侧时间戳与日志时间才准确。时区使用 POSIX TZ 格式。</p>
   <div style="font-size:22px;font-weight:600;font-variant-numeric:tabular-nums" id="clockNow">—</div>
   <div class="mini"><b>同步状态</b><span id="clockSync">—</span></div>
   <div class="mini"><b>时区</b><span id="clockTz">—</span></div>
@@ -6514,12 +6512,12 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 
 <div class="card">
   <h2>向手表推一条消息</h2>
-  <p class="hint">通过已认证的 SPP 会话发过去，手表上会弹通知。需要桥接处于已连接状态。</p>
+  <p class="hint">经已认证的 SPP 会话发送，手表侧以通知形式显示。要求桥接处于已连接状态。</p>
   <label>内容（最多 400 字）</label>
-  <input id="pushText" autocomplete="off" placeholder="例如：饭好了，下来吃饭">
+  <input id="pushText" autocomplete="off" placeholder="输入要推送的文本内容">
   <div class="row" style="margin-top:9px">
     <button data-act="pushText">发送到手表</button>
-    <button class="ghost" data-act="pushPreset" data-arg="测试消息：网关工作正常">发条测试消息</button>
+    <button class="ghost" data-act="pushPreset" data-arg="测试消息：网关工作正常">发送测试消息</button>
   </div>
 </div>
 </section>
@@ -6527,7 +6525,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 <section class="panel" id="p-tools">
 <div class="card">
   <h2>LED 灯效</h2>
-  <p class="hint">板载 LED 在 GPIO2。「流量联动」是出厂默认：有数据才闪。</p>
+  <p class="hint">板载 LED 位于 GPIO2。默认模式为流量联动，仅在数据转发时闪烁。</p>
   <div class="row3" id="ledGroup">
     <button class="ghost" data-act="led" data-arg="0">关闭</button>
     <button class="ghost" data-act="led" data-arg="1">常亮</button>
@@ -6544,12 +6542,12 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <div class="mini"><b>紧凑模式</b><button class="ghost" style="width:auto;padding:6px 12px;font-size:12.5px" id="prefCompact" data-act="togglePref" data-arg="compact">—</button></div>
   <div class="mini"><b>开机自动连手表</b><button class="ghost" style="width:auto;padding:6px 12px;font-size:12.5px" id="prefAuto" data-act="togglePref" data-arg="autoConnectWatch">—</button></div>
   <div class="mini"><b>跳过 TLS 证书校验</b><button class="ghost" style="width:auto;padding:6px 12px;font-size:12.5px" id="prefTls" data-act="togglePref" data-arg="insecureTls">—</button></div>
-  <p class="hint" style="margin-top:10px">「跳过 TLS 校验」只在自签证书调试时打开，长期开着有中间人风险。</p>
+  <p class="hint" style="margin-top:10px">跳过 TLS 证书校验仅适用于自签证书调试场景。长期启用存在中间人攻击风险。</p>
 </div>
 
 <div class="card">
   <h2>健康检查</h2>
-  <p class="hint">一次性把常见故障点过一遍，出问题直接看哪一项红。</p>
+  <p class="hint">逐项检查常见故障点，异常项以红色标识。</p>
   <div class="list" id="checks" style="max-height:none"></div>
   <button style="width:100%;margin-top:10px" data-act="runChecks">开始检查</button>
 </div>
@@ -6733,7 +6731,7 @@ async function loadNet(){
   var c=await api('/clock');
   if(c&&c.ok!==false){
     $('clockNow').textContent=c.localText||'未同步';
-    $('clockSync').textContent=c.synced?'已同步':'未同步（点下面按钮）';
+    $('clockSync').textContent=c.synced?'已同步':'未同步，可通过下方按钮校时';
     $('clockTz').textContent=c.timezone||'—';
     if(!$('tzInput').value) $('tzInput').value=c.timezone||'CST-8';
   }
@@ -6818,7 +6816,7 @@ async function runChecks(){
   var bad=rows.filter(function(r){return !r.ok}).length;
   toast(bad?bad+' 项异常':'全部通过', bad>0);
 }
-/* 把四段拆成"主 0 · 次 0 · 构建 0 · 修订 1"，字段缺失时退回完整字符串 */
+/* 拆分为主、次、构建、修订四段；字段缺失时回退为完整字符串 */
 function verParts(d){
   if(d.fwVerMajor===undefined) return d.fwVersion||'—';
   return '主 '+d.fwVerMajor+' · 次 '+d.fwVerMinor+' · 构建 '+d.fwVerBuild+' · 修订 '+d.fwVerRevision;
@@ -6840,7 +6838,7 @@ async function refresh(){
     setDot($('sWifi'),'bad','无响应');
     setDot($('sWatch'),'bad','无响应');
     $('sIp').textContent='—'; $('sMem').textContent='—'; $('sPkt').textContent='—';
-    $('sFlashTxt').textContent='—'; $('sPart').textContent='设备暂未响应，检查是否已重启或断连';
+    $('sFlashTxt').textContent='—'; $('sPart').textContent='设备无响应，可能正在重启或连接已断开';
     return;
   }
   setDot($('sWifi'), d.wifi?'ok':'bad', d.wifi?'已连接':'未连接');
@@ -6884,7 +6882,7 @@ function paintAuto(){
   var reason=autoReason==='never_connected'?'配网后一直没能连上（多半是密码填错）':'已长时间连不上 Wi-Fi';
   var tail=left<60000?' <b style="color:#ef4444">即将开启热点，只剩 '+s+' 秒</b>':'';
   $('autoText').innerHTML='原因：'+reason+'。剩余 <b>'+mm+' 分 '+ss+' 秒</b> 后自动开启配网热点。'+
-    '<b>不会清除任何配置</b>（Wi-Fi、手表密钥、云端 key 全部保留），连上后会自动回到正常工作模式。'+
+    '<b>原有配置不受影响</b>（Wi-Fi、手表密钥、云端 key 全部保留），连上后会自动回到正常工作模式。'+
     '期间只要成功连上一次就会自动取消。'+tail;
   if(left===0){ clearInterval(autoTimer); autoTimer=0; }
 }
@@ -6922,10 +6920,10 @@ async function pollWifi(){
   if(d.scanning){ setTimeout(pollWifi,700); return; }
   if(!d.ready){ $('wifiStatus').textContent='尚未开始扫描'; return; }
   renderNetworks(d.networks);
-  $('wifiStatus').textContent=(d.networks&&d.networks.length)?'选择你的网络（共 '+d.networks.length+' 个）':'没扫到，手动填 SSID';
+  $('wifiStatus').textContent=(d.networks&&d.networks.length)?'选择一个网络（共 '+d.networks.length+' 个）':'未发现网络，请手动填写 SSID';
 }
 async function scanWifi(){
-  $('wifiStatus').textContent='正在扫描…'; $('networks').replaceChildren();
+  $('wifiStatus').textContent='扫描中…'; $('networks').replaceChildren();
   var d=await api('/setup/wifi/scan?start=1');
   if(!d||!d.ok){ $('wifiStatus').textContent='启动失败：'+((d&&d.error)||'未知'); return; }
   setTimeout(pollWifi,900);
@@ -6949,7 +6947,7 @@ async function pollBluetooth(){
   if(d.scanning){ setTimeout(pollBluetooth,800); return; }
   if(!d.ready){ $('bluetoothStatus').textContent='尚未开始扫描'; return; }
   renderBluetooth(d.devices);
-  $('bluetoothStatus').textContent=(d.devices&&d.devices.length)?'选择你的手表':'没扫到，可手动填 MAC';
+  $('bluetoothStatus').textContent=(d.devices&&d.devices.length)?'选择手表设备':'未发现设备，请手动填写 MAC';
 }
 async function scanBluetooth(){
   $('bluetoothStatus').textContent='扫描经典蓝牙，约 8 秒…'; $('bluetoothDevices').replaceChildren();
@@ -6959,8 +6957,8 @@ async function scanBluetooth(){
 }
 async function testBluetooth(){
   var m=$('mac').value.trim();
-  if(m.length!==17){ toast('先填手表 MAC',true); $('mac').focus(); return; }
-  $('bluetoothStatus').textContent='测试连接中，约 5-10 秒…';
+  if(m.length!==17){ toast('未填写手表 MAC',true); $('mac').focus(); return; }
+  $('bluetoothStatus').textContent='连接测试中，约 5 至 10 秒…';
   var d=await api('/setup/bluetooth/test?mac='+encodeURIComponent(m));
   if(d&&d.ok){ toast('蓝牙连接成功'); log('蓝牙测试成功 '+m+' 通道 '+(d.channel||'自动'));
     $('bluetoothStatus').textContent='已连接，通道 '+(d.channel||'自动'); }
@@ -6978,11 +6976,11 @@ async function save(){
     apPassword:$('ap').value,
     apSsid:$('apname').value.trim()
   };
-  if(!body.ssid){ toast('请填写 Wi-Fi 名称',true); return; }
-  if(body.apPassword.length<8){ toast('热点密码至少 8 位',true); return; }
-  $('saveHint').textContent='正在保存…';
+  if(!body.ssid){ toast('Wi-Fi 名称不能为空',true); return; }
+  if(body.apPassword.length<8){ toast('热点密码长度不足 8 位',true); return; }
+  $('saveHint').textContent='保存中…';
   var d=await api('/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(d&&d.ok){ $('saveHint').textContent='已保存，设备重启中…'; toast('保存成功，正在重启');
+  if(d&&d.ok){ $('saveHint').textContent='配置已保存，设备重启中…'; toast('配置已保存，设备重启中');
     log('配置已保存，设备重启'); setTimeout(function(){location.reload()},4000); }
   else { $('saveHint').textContent=''; toast('保存失败',true); log('保存失败 '+(d&&d.error)); }
 }
@@ -7021,7 +7019,7 @@ async function doReset(){
     toast('已恢复出厂，设备重启中');
     document.body.innerHTML='<div style="text-align:center;padding:60px 20px;font:16px/1.8 sans-serif;color:#e8f0fa">'+
       '<h2>已恢复出厂设置</h2><p>设备正在重启…</p>'+
-      '<p style="color:#8296ad;font-size:13px">稍等 10 秒后，用手机连接热点 <b>__PH_AP__</b><br>再打开 http://192.168.4.1 重新配置</p></div>';
+      '<p style="color:#8296ad;font-size:13px">约 10 秒后使用手机连接热点 <b>__PH_AP__</b><br>然后访问 http://192.168.4.1 重新配置</p></div>';
   } else {
     $('resetBtn').textContent='确认清除'; $('resetBtn').disabled=false;
     toast('恢复失败',true);
@@ -7051,7 +7049,7 @@ async function loadRes(){
   $('resUsage').textContent=Math.round((u.used||0)/1024)+' KB / '+Math.round((u.total||0)/1024)+' KB';
   var items=d.items||[];
   if(!items.length){
-    $('resList').innerHTML='<div class="muted">还没有上传任何文件</div>';
+    $('resList').innerHTML='<div class="muted">暂无已上传文件</div>';
   }else{
     $('resList').innerHTML=items.map(function(it){
       var kb=Math.round((it.bytes||0)/1024)+' KB';
@@ -7127,8 +7125,7 @@ document.addEventListener('change',function(ev){
 });
 
 /* ---------- 固件库 ---------------------------------------------------------
-   为什么要先传再升级：原来是「点了固件升级 → 跳到 OTA 页 → 还得再选一次文件」，
-   中间那一步看着就像没反应。现在上传和安装拆成两件事，设备里有什么一目了然。 */
+   上传与安装分为两步，设备内固件在列表中可见。 */
 var fwSel=null;
 var FW_MAGIC=0xABCD5432;
 
@@ -7167,7 +7164,7 @@ async function loadFw(){
   items.forEach(function(it){ if(it.name===fwSel) keep=true; });
   if(!keep) fwSel=null;
   if(!items.length){
-    $('fwList').innerHTML='<div class="muted">设备里还没有固件，先选上面那个文件</div>';
+    $('fwList').innerHTML='<div class="muted">设备内暂无固件，请先选择上方文件</div>';
     $('fwInstallBtn').disabled=true;
     return;
   }
@@ -7188,7 +7185,7 @@ document.addEventListener('click',function(ev){
   var it=ev.target.closest('[data-fwpick]');
   if(!it || ev.target.closest('[data-act]')) return;
   fwSel=it.dataset.fwpick;
-  $('fwBar').textContent='已选中 '+fwSel+'，点下面的按钮开始升级';
+  $('fwBar').textContent='已选中 '+fwSel+'，通过下方按钮开始升级';
   loadFw();
 });
 
@@ -7201,7 +7198,7 @@ async function fwDelete(name){
 }
 
 async function installFw(){
-  if(!fwSel){ toast('先点一行选中固件',true); return; }
+  if(!fwSel){ toast('未选中固件',true); return; }
   if(!confirm('把设备刷成 '+fwSel+' ？\n\n设备会重启，约 15 秒后回来。\n刷完如果新固件起不来，会自动退回现在这个版本。')) return;
   var bar=$('fwBar');
   bar.textContent='正在写入并校验…';
@@ -7212,7 +7209,7 @@ async function installFw(){
   }
   bar.textContent='已开始写入，设备马上重启';
   document.body.innerHTML='<div style="text-align:center;padding:60px 20px">'+
-    '<h2>正在升级</h2><p>约 15 秒后设备重启完成。<br>记得把手机重新连回原来的 Wi-Fi 再看后台。</p></div>';
+    '<h2>正在升级</h2><p>设备约 15 秒后完成重启。<br>需将手机重新连接至原 Wi-Fi 后访问管理台。</p></div>';
 }
 
 // 统一事件委托：所有按钮用 data-act，避免内联 onclick 的引号地狱
@@ -7263,10 +7260,10 @@ document.addEventListener('click',function(ev){
 
 async function ledTest(){
   var r=await api('/api/v1/led/test',{method:'POST'});
-  toast(r&&r.ok?'已点亮 1.5 秒，看下板子上的灯':'测试失败', !(r&&r.ok));
+  toast(r&&r.ok?'LED 已点亮 1.5 秒':'测试失败', !(r&&r.ok));
 }
 async function watchRestart(){
-  toast('正在重连手表…');
+  toast('正在重新连接手表…');
   var r=await api('/api/v1/watch/start',{method:'POST'});
   toast(r&&r.ok?'已发起连接':'发起失败：'+((r&&r.message)||(r&&r.error)||''), !(r&&r.ok));
 }
@@ -7276,19 +7273,19 @@ async function contextReset(){
 }
 async function pushText(){
   var t=$('pushText').value.trim();
-  if(!t){ toast('先写点内容',true); return; }
+  if(!t){ toast('内容为空',true); return; }
   var r=await api('/api/v1/watch/push',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});
-  if(r&&r.ok){ toast('已排队，等会话空闲即投递'); $('pushText').value=''; }
+  if(r&&r.ok){ toast('已加入发送队列，会话空闲后投递'); $('pushText').value=''; }
   else toast('发送失败：'+((r&&r.message)||(r&&r.error)||''), true);
 }
 async function syncClock(){
   var tz=$('tzInput').value.trim();
   var r=await api('/clock/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timezone:tz})});
-  if(r&&r.ok){ toast('已请求校时，3 秒后自动刷新'); setTimeout(loadNet,3200); }
+  if(r&&r.ok){ toast('校时请求已发送，3 秒后刷新'); setTimeout(loadNet,3200); }
   else toast('校时请求失败',true);
 }
 async function rebootDevice(){
-  toast('设备重启中，约 15 秒后回来');
+  toast('设备重启中，约 15 秒后恢复');
   try{ await fetch('/api/v1/reboot',{method:'POST'}); }catch(e){}
 }
 setTimeout(function(){ showTab('dash'); loadTraffic(); },300);
@@ -8501,7 +8498,7 @@ bool parseRpkManifest(const char* path, char* outPkg, size_t pkgCap,
 }  // namespace wfi
 
 // ===========================================================================
-// 固件库：把 -ota.bin 先存进 SPIFFS，再从网页上点"升级"写进 OTA 分区。
+// 固件库：-ota.bin 先写入 SPIFFS，再由网页触发写入 OTA 分区。
 //
 // 为什么要有这一层：
 //   旧流程是「系统页点固件升级 → 跳到 OTA 页 → 在 OTA 页再选一次文件」。
@@ -8901,7 +8898,7 @@ void setupRoutes() {
     if (fwlib::gUploadFailed) {
       d["ok"] = false;
       d["error"] = "upload_failed";
-      d["hint"] = "只接受 .bin；网页升级要用 -ota 那个，整包 -factory 只能数据线刷；空间不够也会失败";
+      d["hint"] = "仅接受 .bin 文件；网页升级需使用 -ota 镜像，整包 -factory 仅支持数据线烧录；存储空间不足时同样失败";
       sendJson(200, d);
       return;
     }
@@ -8915,11 +8912,11 @@ void setupRoutes() {
     }
     if (magic != 0xE9) {
       // app 镜像必须以 0xE9 开头（ESP 镜像魔数）。整包 -factory.bin 的第一个
-      // 字节是 0xFF，直接拦下来，别等写入时才发现。
+      // 字节是 0xFF，在此处直接拒绝，避免写入阶段才失败。
       SPIFFS.remove(fwlib::kName);
       d["ok"] = false;
       d["error"] = "not_app_image";
-      d["hint"] = "这不是 app 镜像。网页升级要用文件名带 -ota 的那个；整包 -factory 请用数据线刷。";
+      d["hint"] = "文件不是应用镜像。网页升级需使用文件名含 -ota 的镜像；整包 -factory 仅支持数据线烧录。";
       sendJson(200, d);
       return;
     }
@@ -8990,7 +8987,7 @@ void setupRoutes() {
     const String name = in["name"] | "new.bin";
     String path;
     if (!fwlib::resolve(name, path)) {
-      jsonError(404, "not_found", "设备里没有这个文件");
+      jsonError(404, "not_found", "文件不存在");
       return;
     }
     File f = SPIFFS.open(path, FILE_READ);
@@ -9025,7 +9022,7 @@ void setupRoutes() {
     if (!b.isEmpty()) deserializeJson(in, b);
     String path;
     if (!fwlib::resolve(String(in["name"] | ""), path)) {
-      jsonError(404, "not_found", "设备里没有这个文件");
+      jsonError(404, "not_found", "文件不存在");
       return;
     }
     SPIFFS.remove(path);
@@ -9472,7 +9469,7 @@ void setupRoutes() {
     if (wfUploadFailed || !wfUploadPath[0]) {
       d["ok"] = false;
       d["error"] = "upload_failed";
-      d["hint"] = "只接受 .bin/.face（表盘）和 .rpk（快应用）；槽位最多 10 个；检查剩余空间";
+      d["hint"] = "仅接受 .bin/.face（表盘）与 .rpk（快应用）；槽位上限 10 个；请检查剩余空间";
       sendJson(200, d);
       return;
     }
@@ -10370,7 +10367,7 @@ a{color:#58a5ff}
 
 <div class=card id=phoneCard>
 <h3>手机刷写 · 一键</h3>
-<p class=muted style="margin-bottom:8px">手机连上本机热点后，点下面按钮选固件文件即可。上传前会先校验镜像是不是 16MB 版本，不匹配直接拦住，避免刷成半砖。</p>
+<p class=muted style="margin-bottom:8px">手机连接本机热点后选择固件文件上传。上传前校验镜像是否为 16MB 版本，版本不符时直接拒绝写入。</p>
 <div class=flex style="margin-bottom:8px">
 <button class=btn-blue style="flex:1" data-act="quickOta">选择固件并升级</button>
 </div>
@@ -10378,16 +10375,16 @@ a{color:#58a5ff}
 <div id=quickBar class=prog><i style="width:0"></i></div>
 <div id=quickText class=muted style="margin-top:6px">待选择文件</div>
 <p class=muted style="margin-top:8px;font-size:11px;line-height:1.6">
-· 手机上传全程请保持在热点范围内，别切后台太久（iOS 会冻结页面导致上传中断）<br>
-· 中断不会刷坏设备：固件是先写进另一个空闲分区，写完才切换启动项<br>
-· 刷完设备自动重启并回到手表网关模式，热点会短暂消失约 15 秒
+· 上传期间需保持在热点覆盖范围内，避免长时间切换后台（iOS 会冻结页面导致上传中断）<br>
+· 传输中断不影响设备可用性：固件先写入空闲 OTA 分区，写入完成后才切换启动分区<br>
+· 升级完成后设备自动重启并返回网关模式，热点中断约 15 秒
 </p>
 </div>
 
 <div class=card>
 <h3>新建更新包（高级）</h3>
-<p class=muted style="margin-bottom:8px">需要单独刷 bootloader / 分区表 / 自定义偏移时用这一组。日常升级只需要上面的"一键"。</p>
-<p class=muted style="color:#27ae60;margin-bottom:8px">升级带自动回滚：新固件起不来，会自动退回上一个正常固件。</p>
+<p class=muted style="margin-bottom:8px">用于单独刷写 bootloader、分区表或按自定义偏移写入。常规升级使用上方一键升级功能。</p>
+<p class=muted style="color:#27ae60;margin-bottom:8px">升级启用回滚保护：新固件启动失败时自动回退至上一个可用固件。</p>
 
 <div class=upload-item>
 <h3>固件 (firmware.bin) - 支持回滚保护</h3>
@@ -10431,7 +10428,7 @@ a{color:#58a5ff}
 
 <div class=card style="border:1px solid #e67e22">
 <h3 style="color:#e67e22">退出升级模式</h3>
-<p class=muted style="margin-bottom:8px">刷完固件会自动回到手表网关。只是进来看看的话，点下面按钮切回去。</p>
+<p class=muted style="margin-bottom:8px">固件升级完成后自动返回手表网关。仅查看信息时可切换返回。</p>
 <button class=btn-blue style="width:100%" onclick="switchProj(1)">返回手表网关</button>
 </div>
 
@@ -10463,7 +10460,7 @@ async function loadDeviceInfo(){
 async function uploadFile(n){
   var fileInput=document.getElementById('file'+n);
   var addrInput=document.getElementById('addr'+n);
-  if(!fileInput.files[0]){alert('请选择文件');return}
+  if(!fileInput.files[0]){alert('未选择文件');return}
   var addr=addrInput.value.trim()||'0x20000';
   var file=fileInput.files[0];
   document.getElementById('uploadResult').textContent='正在上传 '+file.name+' 到 '+addr+' ...';
@@ -10483,7 +10480,7 @@ async function uploadFile(n){
         document.getElementById('ledIndicator').className='led-indicator led-on';
         document.getElementById('ledText').textContent='升级完成，2秒后重启...';
         document.getElementById('otaStatus').textContent='升级完成！LED常亮2秒后设备将自动重启。';
-        setTimeout(function(){document.body.innerHTML='<div style="text-align:center;padding:40px"><h2>升级完成</h2><p>设备正在重启，请等待约15秒后重新连接WiFi热点</p></div>'},2000);
+        setTimeout(function(){document.body.innerHTML='<div style="text-align:center;padding:40px"><h2>升级完成</h2><p>设备正在重启，约 15 秒后重新连接 Wi-Fi 热点</p></div>'},2000);
       }else{
         document.getElementById('uploadResult').innerHTML='上传失败：'+esc(d.error||'未知错误');
         document.getElementById('ledIndicator').className='led-indicator';
@@ -10522,7 +10519,7 @@ async function preflight(){
     let extra=document.createElement('div');
     extra.className='warnbox';
     extra.style.marginTop='10px';
-    extra.textContent='这块芯片的 Flash 小于 16MB，本固件分区表按 16MB 划分，网页升级会失败。请先用数据线刷整包镜像重新分区。';
+    extra.textContent='芯片 Flash 容量小于 16MB，本固件分区表按 16MB 划分，网页升级将失败。需先用数据线烧录整包镜像重新分区。';
     box.appendChild(extra);
   }
 }
@@ -10537,7 +10534,7 @@ async function quickOtaPick(input){
   bar.firstElementChild.style.width='0';
   bar.firstElementChild.style.background='linear-gradient(90deg,#2c6bed,#58a5ff)';
 
-  // 本地先读前 36 字节判断镜像类型，别等传完 1.8MB 才报错。
+  // 先读取前 36 字节判断镜像类型，避免传输完整镜像后才报错。
   // app 描述符在文件偏移 0x20，魔数 0xABCD5432 是唯一可靠判据。
   let head=new Uint8Array(36);
   try{ head=new Uint8Array(await f.slice(0,36).arrayBuffer()); }catch(e){}
@@ -10546,12 +10543,12 @@ async function quickOtaPick(input){
   // 只有 app 镜像才是 0xE9，所以不能再拿首字节当过滤条件。
   let magic=((head[35]<<24)|(head[34]<<16)|(head[33]<<8)|head[32])>>>0;
   if(head[0]!==0xE9 || magic!==0xABCD5432){
-    txt.innerHTML='<span style="color:#e74c3c">这不是 app 镜像（缺少 app 描述符）。'+
-      '网页升级只能用文件名带 <b>-ota</b> 的那个；整包镜像请用数据线整片刷。</span>';
+    txt.innerHTML='<span style="color:#e74c3c">文件不是应用镜像（缺少 app 描述符）。'+
+      '网页升级只能用文件名带 <b>-ota</b> 的文件；整包镜像需通过数据线烧录。</span>';
     return;
   }
 
-  if(!confirm('准备刷入\n\n文件：'+f.name+'\n大小：'+human(f.size)+'\n\n上传过程中请不要切换 App 或锁屏。继续？'))return;
+  if(!confirm('准备刷入\n\n文件：'+f.name+'\n大小：'+human(f.size)+'\n\n上传期间请勿切换应用或锁屏，是否继续？'))return;
 
   txt.textContent='正在上传 '+f.name+'（0%）…';
   let fd=new FormData();
@@ -10565,18 +10562,18 @@ async function quickOtaPick(input){
     txt.textContent='正在刷写 '+f.name+'（'+p+'%，'+human(e.loaded)+' / '+human(e.total)+'）';
   };
   xhr.onerror=function(){
-    txt.innerHTML='<span style="color:#e74c3c">网络中断，上传失败。设备未被改动，可重试。</span>';
+    txt.innerHTML='<span style="color:#e74c3c">上传因网络中断失败，设备状态未改变，可重新上传。</span>';
   };
   xhr.onload=function(){
     let d=null;
     try{d=JSON.parse(xhr.responseText)}catch(e){}
     if(d&&d.ok){
       bar.firstElementChild.style.width='100%';
-      txt.innerHTML='<span style="color:#27ae60">写入完成，共 '+human(d.size)+'，设备正在重启…</span>';
+      txt.innerHTML='<span style="color:#27ae60">写入完成，共 '+human(d.size)+'，设备重启中…</span>';
       setTimeout(function(){
         document.body.innerHTML='<div style="text-align:center;padding:48px 16px">'+
         '<h2 style="margin:12px 0;color:#58a5ff">刷写完成</h2>'+
-        '<p class=muted>设备正在重启，约 15 秒后热点会重新出现。<br>重新连上热点后打开本页面即可看到新版本。</p></div>';
+        '<p class=muted>设备正在重启，热点约 15 秒后恢复。<br>热点恢复后刷新本页面即可查看新版本。</p></div>';
       },1200);
     }else{
       txt.innerHTML='<span style="color:#e74c3c">'+(d?esc(d.error||'未知错误'):'响应异常')+'</span>';
@@ -10601,7 +10598,7 @@ document.addEventListener('change',function(ev){
 function switchProj(t){
   var nm=t===6?'空中升级':'手表网关';
   if(!confirm('切换到「'+nm+'」？设备将重启。'))return;
-  api('/setup/project/switch?target='+t,{method:'POST'}).then(d=>{if(d.ok)document.body.innerHTML='<div style="text-align:center;padding:40px"><h2>正在切换…</h2><p>设备重启中，请等待约15秒后重新连接WiFi热点</p></div>';else alert('切换失败:'+(d.error||''))});
+  api('/setup/project/switch?target='+t,{method:'POST'}).then(d=>{if(d.ok)document.body.innerHTML='<div style="text-align:center;padding:40px"><h2>切换中…</h2><p>设备重启中，约 15 秒后重新连接 Wi-Fi 热点</p></div>';else alert('切换失败:'+(d.error||''))});
 }
 
 loadDeviceInfo();
@@ -10633,7 +10630,7 @@ void loop() {
     return;
   }
 
-  // 固件库的"延时安装"：网页那边已经回了 200，这里再把文件写进 OTA 分区并重启。
+  // 固件库延时安装：HTTP 响应已返回 200 后，在 loop 中写入 OTA 分区并重启。
   // 不能放在 HTTP 回调里做，1.6 MB 写 Flash 要好几秒，浏览器早超时了。
   fwlib::servicePending();
 
