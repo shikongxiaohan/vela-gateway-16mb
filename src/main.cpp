@@ -235,6 +235,33 @@ void statusLedSet(bool on);
 void statusLedInit();
 bool gLedOn = false;
 
+// ---------- 板载 RGB 灯（WS2812）----------
+// 出厂设计：这颗灯的数据线接 GPIO16（见 Zephyr 官方 YD-ESP32 板级文档）。
+// 注意：WROVER-E 模组（带 PSRAM 的版本）不引出 GPIO16 —— 模组内部把它接给
+// PSRAM 片选 —— 所以带 PSRAM 的板子直连点不亮。把灯的 DIN 飞线到其它空闲
+// 引脚（如 GPIO25）后，在设置页保存引脚号即可使用；扫描会自动跳过被
+// PSRAM 占用的 16/17（仅当固件开启 PSRAM 时）。
+constexpr uint8_t kRgbLedCandidates[] = {2, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33};
+constexpr uint8_t kRgbLedCandidateCount = sizeof(kRgbLedCandidates) / sizeof(kRgbLedCandidates[0]);
+constexpr uint8_t kRgbLedDefaultPin = 16;
+bool rgbPinUsable(int pin);
+void rgbLedPush(uint8_t pin, uint8_t r, uint8_t g, uint8_t b);
+void rgbLedClear();
+void rgbLedInit();
+uint8_t rgbLedPin();
+bool rgbLedReady();
+
+// ---------- 启动阶段记录 ----------
+// RTC 内存（掉电丢失，软复位/回滚重启保留）。新固件如果在启动阶段崩溃、
+// 被 bootloader 回滚，跑起来的旧固件把这份记录读出来，就能在系统页直接
+// 显示「崩在哪一步」，不用接串口。
+bool bootStageMark(uint32_t stage);
+void bootMarkerDone();
+void bootMarkerInit();
+extern bool gLastBootStageValid;
+extern uint32_t gLastBootStage;
+extern bool gLastBootDone;
+
 // 显示函数定义在状态变量之后（见文件后部），那里 gSetupMode /
 // gWatchBridgeState / 网络计数器等均已声明。
 void initDisplay();
@@ -1192,6 +1219,164 @@ void statusLedInit() {
   digitalWrite(kStatusLedPin, LOW);
   gStatusLedOn = false;
   Serial.printf("STATUS_LED pin=%u\n", kStatusLedPin);
+}
+
+// ===== 启动阶段记录（RTC 内存）=====
+// 记 4 个字：magic / stage / done / crc。done 在应用跑满 3 秒回滚确认后置位，
+// 每次进入应用（写阶段 1）先清掉。因此「读到的记录里 done 仍是完成态」只有
+// 两种可能：
+//   a) 上一次启动正常跑满 —— 非 OTA 场景显示「上次运行正常」；
+//   b) OTA 回滚场景：新固件连应用入口都没执行到，阶段记录还是上一次正常
+//      启动留下的 —— 典型即 PSRAM/系统内存初始化阶段出问题。
+#include <esp_attr.h>
+RTC_NOINIT_ATTR static uint32_t s_bmMagic;
+RTC_NOINIT_ATTR static uint32_t s_bmStage;
+RTC_NOINIT_ATTR static uint32_t s_bmDone;
+RTC_NOINIT_ATTR static uint32_t s_bmCrc;
+static constexpr uint32_t kBootMarkerMagic = 0x564C4231u;  // "VLB1"
+static constexpr uint32_t kBootMarkerDone = 0x444F4E45u;   // "DONE"
+bool gLastBootStageValid = false;
+uint32_t gLastBootStage = 0;
+bool gLastBootDone = false;
+
+static uint32_t bootMarkerCrc() {
+  return s_bmMagic ^ s_bmStage ^ s_bmDone ^ 0xC6BC2769u;
+}
+
+void bootMarkerInit() {
+  const bool valid = (s_bmMagic == kBootMarkerMagic) && (s_bmCrc == bootMarkerCrc());
+  if (valid) {
+    gLastBootStageValid = true;
+    gLastBootStage = s_bmStage;
+    gLastBootDone = (s_bmDone == kBootMarkerDone);
+    Serial.printf("BOOT_MARKER prev_stage=%lu prev_done=%d\n",
+                  static_cast<unsigned long>(gLastBootStage), gLastBootDone ? 1 : 0);
+  } else {
+    gLastBootStageValid = false;
+    gLastBootStage = 0;
+    gLastBootDone = false;
+    Serial.println("BOOT_MARKER prev=none");
+  }
+  s_bmMagic = kBootMarkerMagic;
+  s_bmDone = 0;
+  s_bmStage = 1;
+  s_bmCrc = bootMarkerCrc();
+}
+
+bool bootStageMark(uint32_t stage) {
+  s_bmStage = stage;
+  s_bmCrc = bootMarkerCrc();
+  return true;
+}
+
+void bootMarkerDone() {
+  s_bmDone = kBootMarkerDone;
+  s_bmCrc = bootMarkerCrc();
+}
+
+// ===== 板载 RGB 灯（WS2812，RMT 驱动）=====
+// 单根数据线脉宽编码（GRB 24 位，800 kHz），digitalWrite 高低电平对它无效。
+#include <driver/rmt.h>
+static rmt_channel_t gRgbRmtChannel = RMT_CHANNEL_0;
+static bool gRgbRmtReady = false;
+static uint8_t gRgbPin = kRgbLedDefaultPin;
+
+bool rgbPinUsable(int pin) {
+  if (pin >= 6 && pin <= 11) return false;              // SPI Flash
+  if (pin == 0 || pin == 1 || pin == 3) return false;   // BOOT 键 / 串口
+  if (pin >= 34 && pin <= 39) return false;             // 仅输入
+#if defined(CONFIG_ESP32_SPIRAM_SUPPORT) || defined(CONFIG_SPIRAM)
+  if (pin == 16 || pin == 17) return false;             // WROVER：PSRAM 片选/时钟
+#endif
+  return true;
+}
+
+uint8_t rgbLedPin() { return gRgbPin; }
+bool rgbLedReady() { return gRgbRmtReady; }
+
+static void rgbLedDetach() {
+  if (!gRgbRmtReady) return;
+  rmt_set_pin(gRgbRmtChannel, RMT_MODE_TX, GPIO_NUM_MAX);
+}
+
+// RMT 不可用时的忙等备用路径，只驱动一颗灯珠（24 位）。
+static void ws2812BitBang(uint8_t pin, uint8_t r, uint8_t g, uint8_t b) {
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
+  const uint8_t grb[3] = {g, r, b};
+  for (int i = 0; i < 3; ++i) {
+    const uint8_t v = grb[i];
+    for (int bit = 7; bit >= 0; --bit) {
+      digitalWrite(pin, HIGH);
+      if (v & (1u << bit)) {
+        delayMicroseconds(1);
+        digitalWrite(pin, LOW);
+        delayMicroseconds(1);
+      } else {
+        digitalWrite(pin, LOW);
+        delayMicroseconds(1);
+      }
+    }
+  }
+  delayMicroseconds(60);
+}
+
+static bool rgbLedBegin(uint8_t pin) {
+  rgbLedDetach();
+  if (gRgbRmtReady) {
+    rmt_driver_uninstall(gRgbRmtChannel);
+    gRgbRmtReady = false;
+  }
+  rmt_config_t cfg = RMT_DEFAULT_CONFIG_TX(static_cast<gpio_num_t>(pin), gRgbRmtChannel);
+  cfg.clk_div = 1;            // 80 MHz → 一 tick 12.5 ns
+  cfg.mem_block_num = 1;
+  cfg.tx_config.loop_en = false;
+  cfg.tx_config.carrier_en = false;
+  cfg.tx_config.idle_output_en = true;
+  cfg.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
+  if (rmt_config(&cfg) != ESP_OK || rmt_driver_install(gRgbRmtChannel, 0, 0) != ESP_OK) {
+    Serial.printf("RGB_LED rmt_init_failed pin=%u (fallback bitbang)\n", pin);
+    gRgbRmtReady = false;
+    gRgbPin = pin;
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+    return false;
+  }
+  gRgbRmtReady = true;
+  gRgbPin = pin;
+  Serial.printf("RGB_LED rmt_ready pin=%u\n", pin);
+  return true;
+}
+
+void rgbLedPush(uint8_t pin, uint8_t r, uint8_t g, uint8_t b) {
+  if (pin != gRgbPin || !gRgbRmtReady) {
+    if (!rgbLedBegin(pin) || !gRgbRmtReady) {
+      ws2812BitBang(pin, r, g, b);
+      return;
+    }
+  }
+  rmt_item32_t items[24];
+  const uint8_t grb[3] = {g, r, b};   // WS2812 的传输顺序是 G→R→B
+  for (int i = 0; i < 3; ++i) {
+    for (int bit = 0; bit < 8; ++bit) {
+      const bool one = (grb[i] >> (7 - bit)) & 0x01;
+      rmt_item32_t& it = items[i * 8 + bit];
+      it.level0 = 1;
+      it.duration0 = one ? 56 : 28;   // '1' 高 0.70 µs / '0' 高 0.35 µs
+      it.level1 = 0;
+      it.duration1 = one ? 44 : 52;   //      低 0.55 µs /      低 0.65 µs
+    }
+  }
+  rmt_write_items(gRgbRmtChannel, items, 24, true);
+}
+
+void rgbLedClear() { rgbLedPush(gRgbPin, 0, 0, 0); }
+
+void rgbLedInit() {
+  const uint8_t saved = prefs.getUChar("led_pin", kRgbLedDefaultPin);
+  rgbLedBegin(rgbPinUsable(saved) ? saved : kRgbLedDefaultPin);
+  rgbLedClear();
+  Serial.printf("RGB_LED init pin=%u rmt=%d\n", gRgbPin, gRgbRmtReady ? 1 : 0);
 }
 
 void serviceHeartbeatLed() {
@@ -6427,6 +6612,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
     <div class="kv"><b>芯片温度</b><span id="dTemp">—</span></div>
     <div class="kv"><b>运行时长</b><span id="dUp">—</span></div>
     <div class="kv"><b>复位原因</b><span id="dRst">—</span></div>
+    <div class="kv"><b>上次启动</b><span id="dBoot">—</span></div>
   </div>
 </div>
 
@@ -6524,6 +6710,25 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 </section>
 
 <section class="panel" id="p-tools">
+<div class="card">
+  <h2>RGB 灯（WS2812）</h2>
+  <p class="hint">板载 WS2812 灯珠的 DIN 官方定义接在 GPIO16。注意：若模组为 ESP32-WROVER-E（带 PSRAM），GPIO16/17 被模组内部占用、未引出，固件无法直接驱动——此时需飞线：把灯珠 DIN 焊到任一空闲引脚（如 GPIO25），再到下方改引脚。带 PSRAM 的固件会自动禁用 16/17 选项。</p>
+  <div class="mini"><b>当前引脚</b><span id="ledPinNow">—</span></div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">
+    <button class="ghost" style="width:auto;padding:8px 14px;background:#e53935;border:none;color:#fff" data-act="ledColor" data-arg="255,0,0">红</button>
+    <button class="ghost" style="width:auto;padding:8px 14px;background:#43a047;border:none;color:#fff" data-act="ledColor" data-arg="0,255,0">绿</button>
+    <button class="ghost" style="width:auto;padding:8px 14px;background:#1e88e5;border:none;color:#fff" data-act="ledColor" data-arg="0,0,255">蓝</button>
+    <button class="ghost" style="width:auto;padding:8px 14px;background:#fff;border:1px solid #ccc;color:#333" data-act="ledColor" data-arg="255,255,255">白</button>
+    <button class="ghost" style="width:auto;padding:8px 14px" data-act="ledColor" data-arg="0,0,0">熄灭</button>
+  </div>
+  <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
+    <input id="ledPinInput" type="number" min="0" max="39" placeholder="新引脚号" style="width:110px;padding:8px">
+    <button class="ghost" style="width:auto;padding:8px 14px" data-act="ledSavePin">保存引脚</button>
+    <button class="ghost" style="width:auto;padding:8px 14px" data-act="ledScan">全引脚扫描（约 25 秒）</button>
+  </div>
+  <p class="hint" id="ledScanMsg" style="margin-top:8px">扫描会对所有候选引脚依次尝试 WS2812 与静态电平驱动，若灯亮请记下引脚号并保存。</p>
+</div>
+
 <div class="card">
   <h2>界面偏好</h2>
   <div class="mini"><b>显示运行日志</b><button class="ghost" style="width:auto;padding:6px 12px;font-size:12.5px" id="prefLog" data-act="togglePref" data-arg="showLog">—</button></div>
@@ -6788,6 +6993,16 @@ async function loadPerf(){
     $('dUp').textContent=h.uptimeText||'—';
     var rs={1:'上电',3:'软复位',4:'看门狗',5:'深睡唤醒',6:'掉电',7:'任务看门狗',8:'其他',9:'未定义',12:'外部复位'};
     $('dRst').textContent=rs[h.resetReason]||('代码 '+h.resetReason);
+    {
+      const bs={1:'应用入口',2:'配置加载',3:'网页路由',4:'启动完成',5:'主循环'};
+      let t='无记录（断电重启过）';
+      if(h.lastBootStageValid){
+        if(h.lastBootDone) t=h.otaRollback?'新固件未进入应用（崩在 PSRAM/系统初始化）':'上次运行正常';
+        else if(h.lastBootStage>=1&&h.lastBootStage<=5) t='崩在「'+bs[h.lastBootStage]+'」附近';
+        else t='启动早期异常';
+      }
+      $('dBoot').textContent=t;
+    }
   }
   if(d&&d.spiffsUsed!==undefined){
     $('mSpiffs').textContent=fmtBytes(d.spiffsUsed)+' / '+fmtBytes(d.spiffsTotal);
@@ -6861,6 +7076,7 @@ async function loadPrefs(){
   setToggle('prefCompact', p.compact);
   setToggle('prefAuto', p.autoConnectWatch);
   setToggle('prefTls', p.insecureTls);
+  if(typeof p.ledPin==='number'){ $('ledPinNow').textContent=p.ledPin; $('ledPinInput').value=p.ledPin; }
 }
 function setToggle(id,on){
   var el=$(id); if(!el) return;
@@ -7291,6 +7507,9 @@ document.addEventListener('click',function(ev){
   else if(act==='devLogLive') devLogToggle();
   else if(act==='devLogCopy') devLogCopy();
   else if(act==='devLogClear') devLogClear();
+  else if(act==='ledColor') ledColor(arg);
+  else if(act==='ledScan') ledScan();
+  else if(act==='ledSavePin') ledSavePin();
   else if(act==='togglePref'){
     var key=b.dataset.arg;
     var nv = b.dataset.on!=='1';
@@ -7309,6 +7528,33 @@ document.addEventListener('click',function(ev){
   else if(act==='otaBadAck'){ api('/api/v1/ota/rollback/ack',{method:'POST'}).then(function(){ loadSys(); }); }
 });
 
+async function ledColor(arg){
+  const [r,g,b]=arg.split(',').map(Number);
+  try{
+    const res=await fetch('/api/v1/led/test?r='+r+'&g='+g+'&b='+b,{method:'POST'});
+    if(res.ok){ $('ledScanMsg').textContent='已发送颜色 ('+r+','+g+','+b+')'; }
+    else{ const j=await res.json().catch(()=>({})); $('ledScanMsg').textContent='失败：'+(j.error||res.status); }
+  }catch(e){ $('ledScanMsg').textContent='失败：'+e.message; }
+}
+async function ledScan(){
+  $('ledScanMsg').textContent='扫描中，请勿断电，全程约 25 秒…';
+  try{
+    const res=await fetch('/api/v1/led/scan',{method:'POST'});
+    const j=await res.json();
+    if(res.ok){ $('ledScanMsg').textContent='扫描完成。若看到灯亮，请记住对应引脚并在上方保存。'; }
+    else{ $('ledScanMsg').textContent='扫描失败：'+(j.error||res.status); }
+  }catch(e){ $('ledScanMsg').textContent='扫描失败：'+e.message; }
+}
+async function ledSavePin(){
+  const v=parseInt($('ledPinInput').value,10);
+  if(isNaN(v)||v<0||v>39){ $('ledScanMsg').textContent='请输入 0-39 的引脚号'; return; }
+  try{
+    const res=await fetch('/api/v1/led/pin?pin='+v,{method:'POST'});
+    const j=await res.json();
+    if(res.ok){ $('ledPinNow').textContent=v+'（已保存）'; $('ledScanMsg').textContent='引脚已保存为 '+v+'，可点上方颜色按钮测试。'; }
+    else{ $('ledScanMsg').textContent='保存失败：'+(j.error||res.status); }
+  }catch(e){ $('ledScanMsg').textContent='保存失败：'+e.message; }
+}
 async function watchRestart(){
   toast('正在重新连接手表…');
   var r=await api('/api/v1/watch/start',{method:'POST'});
@@ -9654,6 +9900,7 @@ void setupRoutes() {
     d["timezone"] = gNtpTz;
     d["autoConnectWatch"] = autoConnectWatch;
     d["insecureTls"] = allowInsecureTls;
+    d["ledPin"] = rgbLedPin();
     sendJson(200, d);
   });
 
@@ -9685,6 +9932,83 @@ void setupRoutes() {
     d["ok"] = true;
     d["showLog"] = gPrefShowLog;
     d["compact"] = gPrefCompact;
+    sendJson(200, d);
+  });
+
+  // ==================== 板载 RGB 灯 ====================
+  // 点亮测试：?r=&g=&b=，默认白光（亮度最大最容易看见）。
+  server.on("/api/v1/led/test", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    const uint8_t r = static_cast<uint8_t>(server.hasArg("r") ? server.arg("r").toInt() : 255);
+    const uint8_t g = static_cast<uint8_t>(server.hasArg("g") ? server.arg("g").toInt() : 255);
+    const uint8_t b = static_cast<uint8_t>(server.hasArg("b") ? server.arg("b").toInt() : 255);
+    rgbLedPush(rgbLedPin(), r, g, b);
+    JsonDocument d;
+    d["ok"] = true;
+    d["pin"] = rgbLedPin();
+    d["rmt"] = rgbLedReady();
+    d["color"] = String(r) + "," + String(g) + "," + String(b);
+    sendJson(200, d);
+  });
+
+  // 扫描引脚：每个候选引脚按三种方式各试一次 ——
+  //   1) WS2812 时序白光（数据线接到该脚且是可寻址灯珠时，灯亮出颜色）
+  //   2) 静态高电平（普通共阴 LED 会亮）
+  //   3) 静态低电平（普通共阳 LED 会亮）
+  // 全程约 25 秒。开 PSRAM 的固件会自动跳过 GPIO16/17（被 PSRAM 占用）。
+  server.on("/api/v1/led/scan", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    const uint32_t dwell = constrain(server.hasArg("ms") ? server.arg("ms").toInt() : 500, 200, 2000);
+    JsonDocument d;
+    JsonArray tried = d["tried"].to<JsonArray>();
+    Serial.printf("RGB_SCAN start dwell=%u\n", static_cast<unsigned>(dwell));
+    for (uint8_t i = 0; i < kRgbLedCandidateCount; ++i) {
+      const int pin = kRgbLedCandidates[i];
+      if (!rgbPinUsable(pin)) continue;
+      // 1) WS2812 时序，连发三帧防边缘劣化，停留 dwell 毫秒
+      for (int f = 0; f < 3; ++f) {
+        rgbLedPush(static_cast<uint8_t>(pin), 255, 255, 255);
+        delay(120);
+      }
+      delay(dwell);
+      rgbLedPush(static_cast<uint8_t>(pin), 0, 0, 0);
+      delay(80);
+      // 2) 静态高电平
+      pinMode(pin, OUTPUT);
+      digitalWrite(pin, HIGH);
+      delay(250);
+      digitalWrite(pin, LOW);
+      // 3) 静态低电平
+      pinMode(pin, OUTPUT);
+      digitalWrite(pin, LOW);
+      delay(250);
+      pinMode(pin, INPUT);
+      tried.add(pin);
+      Serial.printf("RGB_SCAN pin=%d done\n", pin);
+    }
+    // 扫完回到当前配置的引脚并熄灭
+    rgbLedBegin(gRgbPin);
+    rgbLedClear();
+    d["ok"] = true;
+    d["count"] = tried.size();
+    d["pin"] = rgbLedPin();
+    sendJson(200, d);
+  });
+
+  // 固定灯珠引脚并写进 NVS，下次开机直接用。
+  server.on("/api/v1/led/pin", HTTP_POST, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    if (!server.hasArg("pin")) return jsonError(400, "pin_required", "add ?pin=N");
+    const int pin = server.arg("pin").toInt();
+    if (!rgbPinUsable(pin)) {
+      return jsonError(400, "pin_rejected", "这个引脚被 Flash/串口/BOOT/PSRAM 占用，不能用于 RGB 灯");
+    }
+    prefs.putUChar("led_pin", static_cast<uint8_t>(pin));
+    rgbLedBegin(static_cast<uint8_t>(pin));
+    rgbLedPush(static_cast<uint8_t>(pin), 255, 255, 255);
+    JsonDocument d;
+    d["ok"] = true;
+    d["pin"] = pin;
     sendJson(200, d);
   });
 
@@ -9751,6 +10075,9 @@ void setupRoutes() {
     d["uptimeMs"] = static_cast<uint32_t>(upUs / 1000ULL);
     d["uptimeText"] = String(jsonAgo(static_cast<uint32_t>(upUs / 1000ULL)));
     d["resetReason"] = static_cast<int>(esp_reset_reason());
+    d["lastBootStageValid"] = gLastBootStageValid;
+    d["lastBootStage"] = gLastBootStage;
+    d["lastBootDone"] = gLastBootDone;
     sendJson(200, d);
   });
 
@@ -10550,6 +10877,9 @@ void connectWifi() {
 void setup() {
   Serial.begin(VELA_SERIAL_BAUD);
   delay(120);
+  // 读取上次启动的阶段记录（RTC 内存），然后把本次推进到「应用入口」。
+  // 必须最先执行：后面的任何一步都可能崩。
+  bootMarkerInit();
 
   // 协议常量在这里一次性解码（此时还没起任务，避免多任务首次并发解码）。
   // 之后再调用只是读缓存，无锁竞争。
@@ -10635,6 +10965,7 @@ void setup() {
   // this firmware only uses Bluetooth Classic, and the BLE controller would
   // otherwise reserve ~32 KB of internal DRAM that the SPP host stack needs.
   loadConfig();
+  bootStageMark(2);   // 配置加载完成
 
   // 运行模式：只认 1（手表网关）和 6（空中升级）。
   // 老固件在 NVS 里可能留着 2/3/4/5（BLE 广播 / 抓包 / 手环 / 测速），
@@ -10721,11 +11052,13 @@ void setup() {
 
     // 初始化板载 RGB 灯
     statusLedInit();
+    rgbLedInit();
 
     // 启动HTTP服务器
     setupRoutes();
     server.begin();
     gServerStarted = true;
+    bootStageMark(3);   // 网页路由挂载
 
     // BOOT键检测
     setupTriggerPins();
@@ -10741,6 +11074,7 @@ void setup() {
                 static_cast<unsigned long>(ESP.getMaxAllocHeap()));
   setupTriggerPins();
   statusLedInit();
+  rgbLedInit();
   // OLED/Wire also consume and fragment heap. If this is a configured normal
   // boot, defer their initialization until STA has obtained an IP; Bluetooth
   // auth + Wi-Fi init get the cleanest possible WROOM heap. In first-setup AP
@@ -10765,6 +11099,7 @@ void setup() {
   // Wi-Fi is NOT connected here: it is brought up inside watchBridgeTaskMain
   // AFTER Bluetooth auth succeeds, to keep heap large/unfragmented for BT init.
   setupRoutes();
+  bootStageMark(3);   // 网页路由挂载
   Serial.println("WATCH_RETURN_PATH_TRACER v7 enabled");
   Serial.println("VELA_MEM_OPT v7 shared_spp_frame=true reused_tx_scratch=true lazy_asr_queue=true");
   // PSRAM 编译开关关闭时报 size=0，全部内存走内部 RAM。
@@ -10804,6 +11139,7 @@ void setup() {
   }
   // HTTP server is started from loop() once home Wi-Fi is connected
   // (lwIP must be initialised first).
+  bootStageMark(4);   // setup() 完成
 }
 
 // ====== OTA 空中升级 Web UI ======
@@ -11102,11 +11438,14 @@ loadDeviceInfo();
 )HTMLOTA";
 
 void loop() {
+  // 首圈推进启动阶段记录（见 bootMarkerInit 说明）
+  { static bool sLoopMarked = false; if (!sLoopMarked) { sLoopMarked = true; bootStageMark(5); } }
   // OTA 回滚确认：稳定运行 30 秒后才把新固件标记为有效。
   // 放在最前面，保证所有项目模式（含 OTA 模式）都会执行。
   if (gOtaPendingVerify && millis() - gOtaVerifyStartMs >= kOtaConfirmDelayMs) {
     const esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
     gOtaPendingVerify = false;
+    bootMarkerDone();   // 启动记录：本次已跑满确认窗口
     Serial.printf("OTA_FIRMWARE_MARK_VALID uptime_ms=%lu result=%s\n",
                   static_cast<unsigned long>(millis()), esp_err_to_name(err));
   }

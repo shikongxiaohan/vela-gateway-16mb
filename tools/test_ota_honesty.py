@@ -23,7 +23,7 @@ v0.0.0.35 删除了「向手表推一条消息」与板载 RGB 灯配置：前�
   5. 主页面不再有第二条未经校验的固件上传路径
   6. 主页面「重启设备」与升级卡片分开，不随升级入口一起失效
   7. 推送接口、状态机与投递函数均已移除
-  8. 板载 RGB 灯与灯效接口均已移除
+  8. 板载 RGB 灯驱动、灯效接口与启动阶段标记均已恢复（v37）
 """
 import re
 import sys
@@ -151,12 +151,15 @@ def main() -> int:
     check("flushPendingWatchText" not in text, "推送投递函数已移除")
     check("PUSH_QUEUED" not in text, "推送日志标记已移除")
 
-    # ---- 8. 板载 RGB 灯已移除 ----
-    check("rgbLedPush" not in text, "WS2812 驱动已移除")
-    check("/api/v1/led/" not in text, "灯效接口已移除")
-    check("kRgbLedCandidates" not in text, "引脚扫描表已移除")
+    # ---- 8. 板载 RGB 灯已恢复（v37）----
+    check("rgbLedPush" in text, "WS2812 驱动已恢复")
+    check("/api/v1/led/test" in text, "灯效测试接口已恢复")
+    check("/api/v1/led/scan" in text, "引脚扫描接口已恢复")
+    check("/api/v1/led/pin" in text, "引脚配置接口已恢复")
+    check("bootMarkerDone" in text, "RTC 启动阶段标记存在")
+    check("d[\"lastBootStageValid\"]" in text, "启动阶段暴露给状态接口")
     if main_ui:
-        check("板载 RGB 灯" not in main_ui, "设置页不再有灯效卡片")
+        check('data-act="ledColor"' in main_ui, "设置页保留灯效卡片")
 
     print()
     for ok, msg in checks:
