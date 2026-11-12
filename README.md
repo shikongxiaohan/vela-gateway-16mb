@@ -4,7 +4,7 @@
 
 硬件是 16MB Flash 的 ESP32（ESP32-WROVER-E N16R8 / YD-ESP32-B）。管理台是个手机浏览器能直接开的网页，配 Wi-Fi、刷固件、看状态都在里面。
 
-当前版本 v0.0.0.17，RAM 用 22.6%，Flash 用 25.5%。
+当前版本 v0.0.0.18，RAM 用 22.6%，Flash 用 25.5%。
 
 ---
 
@@ -14,8 +14,8 @@
 
 | 场景 | 文件 | 地址 |
 |---|---|---|
-| 首次刷 / 救砖 | [`firmware/vela-gateway-v0.0.0.17-esp32-16mb-factory.bin`](firmware/) | `0x0` |
-| 网页 OTA 升级 | [`firmware/vela-gateway-v0.0.0.17-esp32-16mb-ota.bin`](firmware/) | `0x20000` |
+| 首次刷 / 救砖 | [`firmware/vela-gateway-v0.0.0.18-esp32-16mb-factory.bin`](firmware/) | `0x0` |
+| 网页 OTA 升级 | [`firmware/vela-gateway-v0.0.0.18-esp32-16mb-ota.bin`](firmware/) | `0x20000` |
 
 factory 是整包，bootloader、分区表、otadata、app 都在里面，只刷这一个文件、地址填 `0x0`，不用另外管分区表。
 

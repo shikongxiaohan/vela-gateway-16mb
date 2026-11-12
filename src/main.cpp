@@ -9713,9 +9713,11 @@ void setupRoutes() {
     if (upload.status == UPLOAD_FILE_START) {
       s_otaFileName = upload.filename;
       const bool hasExplicitAddr = server.hasArg("addr") && !server.arg("addr").isEmpty();
+      // 没给 addr 时按 16MB 分区表的 app 地址算。旧值 0x10000 是 4MB 版的
+      // 布局，在 16MB 上那个位置是 phy_init，写进去会毁掉射频校准。
       const uint32_t addrValue = hasExplicitAddr
                                      ? strtoul(server.arg("addr").c_str(), nullptr, 0)
-                                     : 0x10000;
+                                     : 0x20000;
       s_otaFlashAddr = addrValue;
       s_otaWriteAddr = s_otaFlashAddr;
       s_otaTotalWritten = 0;
@@ -9725,9 +9727,9 @@ void setupRoutes() {
       // 是否为固件（走 OTA 分区 + 回滚保护）：
       //   1) 完全没有 addr 参数：默认按固件处理（网页 OTA 的正常用法）；
       //   2) 文件名包含 "firmware"：按固件处理。
-      // 旧逻辑写成 `addr == 0x10000`，而 addr 缺省值恰好也是 0x10000，
-      // 于是 bootloader / partitions.bin 之类的原始镜像被误判为固件，
-      // 全部被写进 OTA 分区，既刷不进去还覆盖了当前固件槽。
+      // 旧逻辑用 `addr == 0x10000` 判断，而 addr 缺省值恰好也是 0x10000，
+      // 于是 bootloader、partitions.bin 这些原始镜像被当成固件，全部写进
+      // OTA 分区，既刷不进去还覆盖了当前固件槽。所以改成看有没有显式 addr。
       String fnameLower = s_otaFileName;
       fnameLower.toLowerCase();
       s_otaIsFirmware = !hasExplicitAddr || fnameLower.indexOf("firmware") >= 0;
@@ -10389,7 +10391,7 @@ a{color:#58a5ff}
 
 <div class=upload-item>
 <h3>固件 (firmware.bin) - 支持回滚保护</h3>
-<input type=text id=addr1 value=0x10000 placeholder="刷写地址（默认0x10000）">
+<input type=text id=addr1 value=0x20000 placeholder="刷写地址（默认0x20000）">
 <input type=file id=file1 accept=".bin" style="margin-bottom:8px">
 <button class=btn-green onclick=uploadFile(1)>上传固件</button>
 </div>
@@ -10462,7 +10464,7 @@ async function uploadFile(n){
   var fileInput=document.getElementById('file'+n);
   var addrInput=document.getElementById('addr'+n);
   if(!fileInput.files[0]){alert('请选择文件');return}
-  var addr=addrInput.value.trim()||'0x10000';
+  var addr=addrInput.value.trim()||'0x20000';
   var file=fileInput.files[0];
   document.getElementById('uploadResult').textContent='正在上传 '+file.name+' 到 '+addr+' ...';
   document.getElementById('ledIndicator').className='led-indicator led-blink';
