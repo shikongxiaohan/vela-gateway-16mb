@@ -1926,6 +1926,7 @@ static bool gPsramSelfTestRan = false;
 static bool gPsramSelfTestOk = false;
 static uint32_t gPsramSelfTestKb = 0;
 static uint32_t gPsramSelfTestMs = 0;
+static bool gPsramPresent = false;   // 开机时由 esp_spiram 探测结果填入
 
 static void psramRunSelfTest(uint32_t kb) {
   gPsramSelfTestRan = true;
@@ -1934,9 +1935,20 @@ static void psramRunSelfTest(uint32_t kb) {
   gPsramSelfTestMs = 0;
   const size_t bytes = static_cast<size_t>(kb) * 1024u;
   const uint32_t started = millis();
+  // 先用容量查询挡一道：8MB 的颗粒实际可用不足 8MB，申请 4MB 以上大概率失败。
+  // 直接 malloc 失败后接着 memset 会写空指针，表现为"自检就复位"，很难查。
+  const size_t psFree = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  const size_t psLargest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  if (!gPsramPresent || psLargest < bytes) {
+    Serial.printf("PSRAM_SELFTEST skip_insufficient present=%d need=%u largest=%u free=%u\n",
+                  gPsramPresent ? 1 : 0, static_cast<unsigned>(bytes),
+                  static_cast<unsigned>(psLargest), static_cast<unsigned>(psFree));
+    return;
+  }
   uint8_t* p = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!p) {
-    Serial.printf("PSRAM_SELFTEST alloc_failed kb=%u\n", static_cast<unsigned>(kb));
+    Serial.printf("PSRAM_SELFTEST alloc_failed kb=%u largest=%u\n",
+                  static_cast<unsigned>(kb), static_cast<unsigned>(psLargest));
     return;
   }
   for (size_t i = 0; i < bytes; ++i) p[i] = static_cast<uint8_t>((i * 31u + 7u) & 0xFFu);
@@ -6657,13 +6669,15 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 <section class="panel" id="p-perf">
 <div class="card">
   <h2>内存占用</h2>
-  <p class="hint">蓝牙协议栈、lwIP 与转发缓冲均占用内部 RAM。空闲内存低于 20 KB 时建议重启。</p>
+  <p class="hint">蓝牙协议栈、lwIP 与转发缓冲只能用内部 RAM，PSRAM 帮不上忙。内部空闲低于 20 KB 时会出现卡顿、网页打不开。</p>
   <div class="grid kv-grid">
     <div class="kv"><b>内部空闲</b><span id="mFree">—</span></div>
-    <div class="kv"><b>历史最低</b><span id="mMin">—</span></div>
+    <div class="kv"><b>内部历史最低</b><span id="mMin">—</span></div>
     <div class="kv"><b>最大连续块</b><span id="mMax">—</span></div>
-    <div class="kv"><b>片段化</b><span id="mFrag">—</span></div>
+    <div class="kv"><b>总空闲(含外扩)</b><span id="mFreeAll">—</span></div>
   </div>
+  <div class="mini"><b>PSRAM</b><span id="mPsram">—</span></div>
+  <div class="mini"><b>外扩空闲</b><span id="mPsramFree">—</span></div>
   <div class="mini"><b>SPIFFS 已用</b><span id="mSpiffs">—</span></div>
 </div>
 
@@ -6740,9 +6754,9 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <div class="mini"><b>自检结果</b><span id="psramTest">尚未运行</span></div>
   <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
     <button class="ghost" style="width:auto;padding:8px 14px" data-act="psramSelfTest">运行自检（256 KB）</button>
-    <button class="ghost" style="width:auto;padding:8px 14px" data-act="psramSelfTest4m">全量自检（4 MB）</button>
+    <button class="ghost" style="width:auto;padding:8px 14px" data-act="psramSelfTest1m">完整校验（1 MB）</button>
   </div>
-  <p id="psramMsg" style="margin:12px 0 0;padding:10px 12px;border-radius:8px;background:#f1f5f9;border:1px solid #e2e8f0;font-size:13px;line-height:1.5;color:#334155">点按钮开始。全量自检耗时更长，若中途设备重启说明 PSRAM 在高负载下不稳定。</p>
+  <p id="psramMsg" style="margin:12px 0 0;padding:10px 12px;border-radius:8px;background:#f1f5f9;border:1px solid #e2e8f0;font-size:13px;line-height:1.5;color:#334155">第一步点 256 KB：通过就说明这颗颗粒能正常读写。若报「请求的块太大」，说明最大连续块不够，把数值调小重试。1 MB 那档只是更大的样本，不会再提供新信息。</p>
 </div>
 
 <div class="card">
@@ -7005,6 +7019,10 @@ async function loadPerf(){
   if(d&&d.ok!==false){
     $('mFree').textContent=Math.round((d.heapInternalFree!==undefined?d.heapInternalFree:(d.heapFree||0))/1024)+' KB';
     $('mMin').textContent=Math.round((d.heapMinFree||0)/1024)+' KB';
+    // 总量（内部+外扩）与 PSRAM：用来看"扩展内存到底有没有生效"
+    $('mFreeAll').textContent=d.heapFree!==undefined?(Math.round(d.heapFree/1024)+' KB'):'—';
+    $('mPsram').textContent=d.psramSize?(Math.round(d.psramSize/1048576)+' MB'):'未启用';
+    $('mPsramFree').textContent=d.psramSize?(Math.round((d.psramFree||0)/1024)+' KB'):'—';
   }
   var t=await api('/api/v1/traffic');
   if(t&&t.ok!==false){
@@ -7015,8 +7033,7 @@ async function loadPerf(){
   }
   var h=await api('/api/v1/hal');
   if(h&&h.ok!==false){
-    $('mMax').textContent='—';
-    $('mFrag').textContent = d&&d.heapFree ? (Math.round(d.heapFree/1024)?(100-Math.round((d.heapMinFree||0)*100/(d.heapFree||1)))+'%':'—') : '—';
+    $('mMax').textContent=d&&d.heapLargest!==undefined?(Math.round(d.heapLargest/1024)+' KB'):'—';
     $('hChip').textContent=h.chipModel+' rev'+h.chipRevision+' · '+h.chipCores+' 核';
     $('hFreq').textContent=h.cpuFreqMHz+' MHz';
     $('hFlash').textContent=Math.round((h.flashSize||0)/1048576)+' MB';
@@ -7556,7 +7573,7 @@ document.addEventListener('click',function(ev){
   else if(act==='devLogClear') devLogClear();
   else if(act==='ledColor') ledColor(arg);
   else if(act==='psramSelfTest') psramSelfTest(256);
-  else if(act==='psramSelfTest4m') psramSelfTest(4096);
+  else if(act==='psramSelfTest1m') psramSelfTest(1024);
   else if(act==='ledScan') ledScan();
   else if(act==='ledSavePin') ledSavePin();
   else if(act==='togglePref'){
@@ -7582,9 +7599,13 @@ async function psramSelfTest(kb){
   const j=await api('/api/v1/psram/selftest?kb='+kb,{method:'GET'});
   if(j&&j.ok!==false&&!j.error){
     $('psramTest').textContent=(j.pass?'通过':'失败')+' · '+j.kb+' KB · '+j.tookMs+' ms';
-    $('psramMsg').textContent=j.pass
-      ? '自检通过：这颗 PSRAM 可以稳定读写（'+j.kb+' KB 校验通过，耗时 '+j.tookMs+' ms）。'
-      : '自检失败：写入后读回的数据不一致，PSRAM 不可靠，不能用于存放数据。';
+    if(j.pass){
+      $('psramMsg').textContent='自检通过：这颗 PSRAM 可以稳定读写（'+j.kb+' KB 校验通过，耗时 '+j.tookMs+' ms）。';
+    }else if(j.reason){
+      $('psramMsg').textContent='未能自检：'+j.reason+'（已识别 '+(Math.round((j.capsTotal||0)/1048576*10)/10)+' MB，最大连续 '+(Math.round((j.capsLargest||0)/1024))+' KB）。把 KB 数值调小再试。';
+    }else{
+      $('psramMsg').textContent='自检失败：写入后读回的数据不一致，PSRAM 不可靠，不能用于存放数据。';
+    }
     $('psramInfo').textContent=(Math.round((j.psramSize||0)/1048576)+' MB · 空闲 '+Math.round((j.psramFree||0)/1024)+' KB');
   }else{
     $('psramMsg').textContent='自检请求失败：'+((j&&(j.error||j.message))||'未知');
@@ -7814,11 +7835,19 @@ void handleStatus(bool publicSetup) {
     const uint32_t lastRx = gLastWatchRxMs;
     d["watchRxAgeMs"] = lastRx == 0 ? 0xFFFFFFFFu : (nowMs - lastRx);
   }
-  // PSRAM：固件当前未开启 SPIRAM 编译开关，这里恒为 0。
-  // v0.0.0.35 曾打开过，设备在启动阶段复位后被 bootloader 回滚，
-  // 没有串口日志无法定位，先退回关闭状态。
-  d["psramSize"] = static_cast<uint32_t>(ESP.getPsramSize());
-  d["psramFree"] = static_cast<uint32_t>(ESP.getFreePsram());
+  // PSRAM：v0.0.0.47 起真正启用（8MB，BOOT_INIT 初始化、不做全量自检）。
+  // 注意 ESP.getPsramSize() / getFreePsram() 走 Arduino 层缓存，偶发返回 0，
+  // 判断"有没有"统一看 heap_caps 的容量查询，别被 0 误导成"没装颗粒"。
+  {
+    const size_t capsTotal = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    const size_t capsFree = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const uint32_t arSize = static_cast<uint32_t>(ESP.getPsramSize());
+    d["psramPresent"] = gPsramPresent || capsTotal > 0;
+    d["psramSize"] = arSize ? arSize : static_cast<uint32_t>(capsTotal);
+    d["psramFree"] = arSize ? static_cast<uint32_t>(ESP.getFreePsram())
+                            : static_cast<uint32_t>(capsFree);
+    d["psramLargest"] = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+  }
   // PSRAM 自检结果：未跑过时 ran=false，跑过则 pass/kb/tookMs 有效。
   d["psramTestRan"] = gPsramSelfTestRan;
   d["psramTestPass"] = gPsramSelfTestOk;
@@ -10103,6 +10132,13 @@ void setupRoutes() {
     d["tookMs"] = gPsramSelfTestMs;
     d["psramSize"] = static_cast<uint32_t>(ESP.getPsramSize());
     d["psramFree"] = static_cast<uint32_t>(ESP.getFreePsram());
+    // 失败时前端要能说清楚是"没这颗芯片"还是"申请不到这么大的块"
+    d["present"] = gPsramPresent;
+    d["capsTotal"] = static_cast<uint32_t>(heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+    d["capsLargest"] = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    if (!gPsramSelfTestRan && gPsramSelfTestKb == 0) {
+      d["reason"] = gPsramPresent ? "请求的块太大，PSRAM 剩余空间不足" : "未检测到 PSRAM 芯片";
+    }
     sendJson(200, d);
   });
 
@@ -11216,6 +11252,13 @@ void setup() {
   Serial.printf("PSRAM size=%lu free=%lu\n",
                 static_cast<unsigned long>(ESP.getPsramSize()),
                 static_cast<unsigned long>(ESP.getFreePsram()));
+  // 容量查询是判断"这块 8MB 到底有没有被识别"的唯一可靠依据：
+  // ESP.getPsramSize() 走的是 Arduino 层缓存，早期返回 0 也不能断定不存在。
+  gPsramPresent = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+  Serial.printf("PSRAM_CAPS present=%d total=%u largest=%u\n",
+                gPsramPresent ? 1 : 0,
+                static_cast<unsigned>(heap_caps_get_total_size(MALLOC_CAP_SPIRAM)),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
   Serial.printf("Vela Gateway ready. watch_configured=%s\n",
                 (watchMac.length()==17 && watchAuthKey.length()==32) ? "true" : "false");
 
