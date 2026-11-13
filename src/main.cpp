@@ -1616,6 +1616,10 @@ static size_t gWatchStreamPacketCount = 0;
 // 最近一次收到手表数据包的时刻（毫秒）。前端据此判断「音频/数据正在传输」，
 // 自动放慢管理页轮询，避免 HTTP 处理与蓝牙音频抢 CPU 和堆。
 static volatile uint32_t gLastWatchRxMs = 0;
+// v62 补充：最近一次向手表发包的时刻。音乐播放是「网关→手表」方向（TX），
+// 只盯 RX 会把放音乐判成空闲、管理页继续 3 秒轮询，与蓝牙音频抢堆。
+// 收/发任一方向 2 秒内有流量都算忙。
+static volatile uint32_t gLastWatchTxMs = 0;
 static bool gWatchStreamCaptureActive = false;
 static bool gWatchStreamCaptureTruncated = false;
 static uint32_t gWatchStreamCaptureRxDroppedStart = 0;
@@ -1975,6 +1979,7 @@ uint16_t crc16Arc(const uint8_t* bytes, size_t length) {
 
 bool writeWatchBytes(const uint8_t* bytes, size_t length) {
   gWatchTxBytes += length;  // 流量统计
+  gLastWatchTxMs = millis();  // v62：发包时刻，供忙闲判定（音乐播放是 TX 方向）
   // Diagnostic/production candidate: BluetoothSerial already queues packets,
   // coalesces them into its internal SPP_TX_MAX buffer, and waits for the IDF
   // SPP write-complete/congestion events in its TX task. Sending an entire
@@ -7447,8 +7452,10 @@ async function refresh(){
   var mem = d.heapFree!==undefined ? d.heapFree : (d.freeHeap!==undefined?d.freeHeap:null);
   $('sMem').textContent = mem!==null ? Math.round(mem/1024)+' KB' : '—';
   if(d.heapMinFree!==undefined) $('sMem').title='历史最低 '+Math.round(d.heapMinFree/1024)+' KB';
-  // 手表链路 2 秒内有收包 → 视为忙（音频/数据传输中），放慢轮询。
+  // 手表链路 2 秒内有收/发包 → 视为忙（音频/数据传输中），放慢轮询。
+  // 音乐播放是网关→手表方向（TX），所以两个方向都要看。
   if(typeof d.watchRxAgeMs==='number') _pollBusy = (d.watchRxAgeMs < 2000);
+  if(!_pollBusy && typeof d.watchTxAgeMs==='number') _pollBusy = (d.watchTxAgeMs < 2000);
   var rx=d.networkRxPackets||0, tx=d.networkTxPackets||0;
   $('sPkt').textContent = tx+' / '+rx;
   $('sCounters').textContent = '丢包 '+(d.networkDroppedPackets||0)+' · 会话 '+(d.watchConversationTurns||0)+' 轮';
@@ -8022,13 +8029,16 @@ void handleStatus(bool publicSetup) {
   // 最大连续块：free 大而 largest 小说明堆被切碎，malloc 仍会失败。
   // 排查「传大文件到一半挂掉」时这两个数要一起看。
   d["heapLargest"] = static_cast<uint32_t>(ESP.getMaxAllocHeap());
-  // 手表链路最近收包距今多少毫秒：前端用来判断音频/数据正在传输，
+  // 手表链路最近收/发包距今多少毫秒：前端用来判断音频/数据正在传输，
   // 此时自动放慢管理页轮询（3s → 12s），把 CPU 和堆让给蓝牙通路。
+  // 收、发任一方向有流量都算忙——音乐播放走 TX 方向，只看 RX 会漏判。
   // 无收包时给一个足够大的值，前端按「空闲」处理。
   {
     const uint32_t nowMs = millis();
     const uint32_t lastRx = gLastWatchRxMs;
+    const uint32_t lastTx = gLastWatchTxMs;
     d["watchRxAgeMs"] = lastRx == 0 ? 0xFFFFFFFFu : (nowMs - lastRx);
+    d["watchTxAgeMs"] = lastTx == 0 ? 0xFFFFFFFFu : (nowMs - lastTx);
   }
   // PSRAM：v0.0.0.47 起真正启用（8MB，BOOT_INIT 初始化、不做全量自检）。
   // 注意 ESP.getPsramSize() / getFreePsram() 走 Arduino 层缓存，偶发返回 0，
@@ -8059,7 +8069,8 @@ void handleStatus(bool publicSetup) {
   d["spiffsState"] = fsReady ? "ready" : (gSpiffsFormatting ? "formatting" : "unavailable");
   // SPIFFS.totalBytes()/usedBytes() 会去文件系统统计，链路正忙时跳过这步，
   // 把 CPU 让给蓝牙音频（前端此时也已把轮询降到 12s）。
-  const bool linkBusy = gLastWatchRxMs != 0 && (millis() - gLastWatchRxMs) < 2000;
+  const bool linkBusy = (gLastWatchRxMs != 0 && (millis() - gLastWatchRxMs) < 2000) ||
+                        (gLastWatchTxMs != 0 && (millis() - gLastWatchTxMs) < 2000);
   if (fsReady && !linkBusy) {
     d["spiffsTotal"] = static_cast<uint32_t>(SPIFFS.totalBytes());
     d["spiffsUsed"] = static_cast<uint32_t>(SPIFFS.usedBytes());
