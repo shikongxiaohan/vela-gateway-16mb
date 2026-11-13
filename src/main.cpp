@@ -1919,22 +1919,47 @@ bool writeWatchBytes(const uint8_t* bytes, size_t length) {
 // PSRAM 优先分配：协议拼包缓冲不是 DMA 缓冲，放外部 RAM 不影响功能，
 // 但能把宝贵的内部 RAM 让给 Wi-Fi/蓝牙协议栈与音频通路。
 // PSRAM 不可用时自动回退内部 RAM，行为与本版本之前完全一致。
-static void* psramPreferMalloc(size_t bytes) {
-#if defined(CONFIG_SPIRAM) || defined(CONFIG_ESP32_SPIRAM_SUPPORT)
-  if (ESP.getPsramSize() > 0) {
-    void* p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (p) return p;
+// PSRAM 自检：写读校验一段外部 RAM，只在用户手动点「运行自检」时执行。
+// 不在开机路径调用——v47 的教训是 PSRAM 一旦被热路径（蓝牙 SPP）访问就会
+// 触发 cache 冲突/看门狗，所以先让用户按需验证硬件是否可读可写。
+static bool gPsramSelfTestRan = false;
+static bool gPsramSelfTestOk = false;
+static uint32_t gPsramSelfTestKb = 0;
+static uint32_t gPsramSelfTestMs = 0;
+
+static void psramRunSelfTest(uint32_t kb) {
+  gPsramSelfTestRan = true;
+  gPsramSelfTestOk = false;
+  gPsramSelfTestKb = 0;
+  gPsramSelfTestMs = 0;
+  const size_t bytes = static_cast<size_t>(kb) * 1024u;
+  const uint32_t started = millis();
+  uint8_t* p = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!p) {
+    Serial.printf("PSRAM_SELFTEST alloc_failed kb=%u\n", static_cast<unsigned>(kb));
+    return;
   }
-#endif
-  return malloc(bytes);
+  for (size_t i = 0; i < bytes; ++i) p[i] = static_cast<uint8_t>((i * 31u + 7u) & 0xFFu);
+  bool ok = true;
+  for (size_t i = 0; i < bytes; ++i) {
+    if (p[i] != static_cast<uint8_t>((i * 31u + 7u) & 0xFFu)) { ok = false; break; }
+  }
+  heap_caps_free(p);
+  gPsramSelfTestOk = ok;
+  gPsramSelfTestKb = kb;
+  gPsramSelfTestMs = millis() - started;
+  Serial.printf("PSRAM_SELFTEST %s kb=%u took_ms=%u free=%u\n",
+                ok ? "PASS" : "FAIL", static_cast<unsigned>(kb),
+                static_cast<unsigned>(gPsramSelfTestMs),
+                static_cast<unsigned>(ESP.getFreePsram()));
 }
 
 bool ensureScratchBuffers() {
   if (gSppTxFrame) return true;
-  gSppTxFrame = static_cast<uint8_t*>(psramPreferMalloc(8 + kSppV2PayloadMax));
-  gSppRxFrame = static_cast<uint8_t*>(psramPreferMalloc(8 + kSppV2PayloadMax));
-  gRawCommandPayloadScratch = static_cast<uint8_t*>(psramPreferMalloc(kSppV2PayloadMax));
-  gEncryptedPayloadScratch = static_cast<uint8_t*>(psramPreferMalloc(kSppV2PayloadMax));
+  gSppTxFrame = static_cast<uint8_t*>(malloc(8 + kSppV2PayloadMax));
+  gSppRxFrame = static_cast<uint8_t*>(malloc(8 + kSppV2PayloadMax));
+  gRawCommandPayloadScratch = static_cast<uint8_t*>(malloc(kSppV2PayloadMax));
+  gEncryptedPayloadScratch = static_cast<uint8_t*>(malloc(kSppV2PayloadMax));
   if (!gSppTxFrame || !gSppRxFrame || !gRawCommandPayloadScratch ||
       !gEncryptedPayloadScratch) {
     Serial.println("VELA_SCRATCH_MALLOC_FAILED");
@@ -1949,8 +1974,8 @@ bool ensureScratchBuffers() {
 // and as a lazy guard at the top of every consumer that needs them.
 bool ensureAppScratchBuffers() {
   if (gQuickAppMessageScratch) return true;
-  gQuickAppMessageScratch = static_cast<uint8_t*>(psramPreferMalloc(kSppV2PayloadMax));
-  gQuickAppThirdpartyScratch = static_cast<uint8_t*>(psramPreferMalloc(kSppV2PayloadMax));
+  gQuickAppMessageScratch = static_cast<uint8_t*>(malloc(kSppV2PayloadMax));
+  gQuickAppThirdpartyScratch = static_cast<uint8_t*>(malloc(kSppV2PayloadMax));
   if (!gQuickAppMessageScratch || !gQuickAppThirdpartyScratch) {
     Serial.println("VELA_APP_SCRATCH_MALLOC_FAILED");
     return false;
@@ -6709,6 +6734,18 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 
 <section class="panel" id="p-tools">
 <div class="card">
+  <h2>PSRAM 自检</h2>
+  <p class="hint">v47 曾把蓝牙协议缓冲放进 PSRAM，导致主循环被看门狗复位（PSRAM 初始化其实是成功的）。现在默认不使用 PSRAM，只有你点下面的按钮才会对它做一次写读校验，用来确认这颗 8MB 颗粒到底可不可靠。</p>
+  <div class="mini"><b>容量 / 空闲</b><span id="psramInfo">—</span></div>
+  <div class="mini"><b>自检结果</b><span id="psramTest">尚未运行</span></div>
+  <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
+    <button class="ghost" style="width:auto;padding:8px 14px" data-act="psramSelfTest">运行自检（256 KB）</button>
+    <button class="ghost" style="width:auto;padding:8px 14px" data-act="psramSelfTest4m">全量自检（4 MB）</button>
+  </div>
+  <p id="psramMsg" style="margin:12px 0 0;padding:10px 12px;border-radius:8px;background:#f1f5f9;border:1px solid #e2e8f0;font-size:13px;line-height:1.5;color:#334155">点按钮开始。全量自检耗时更长，若中途设备重启说明 PSRAM 在高负载下不稳定。</p>
+</div>
+
+<div class="card">
   <h2>RGB 灯（WS2812）</h2>
   <p class="hint">板载 WS2812 灯珠 DIN 接 GPIO21（YD-ESP32-B 商家页面确认），固件默认即用 21。注意：早期资料曾写 GPIO16，但 WROVER-E 模组未引出 16/17，实际板卡走 21。若你的板子批次不同，可用下方全引脚扫描再改引脚。</p>
   <div class="mini"><b>当前引脚</b><span id="ledPinNow">—</span></div>
@@ -7221,6 +7258,14 @@ async function refresh(){
     $('sSlots').textContent = '';
   }
   $('dFw').textContent=d.fwVersionFull||d.fwVersion||'—';
+  if($('psramInfo')){
+    $('psramInfo').textContent=d.psramSize
+      ? (Math.round(d.psramSize/1048576)+' MB · 空闲 '+(Math.round((d.psramFree||0)/1024))+' KB')
+      : '未启用';
+    if(d.psramTestRan){
+      $('psramTest').textContent=(d.psramTestPass?'通过':'失败')+' · '+(d.psramTestKb||0)+' KB'+(d.psramTestMs?' · '+(d.psramTestMs)+' ms':'');
+    }
+  }
   $('dCh').textContent=d.fwChannel||'—';
   $('dBu').textContent=d.fwVerMajor===undefined?'—':(d.fwVerMajor+'.'+d.fwVerMinor+'.'+d.fwVerBuild+'.'+d.fwVerRevision);
   $('dDate').textContent=d.fwBuildDate||'—';
@@ -7510,6 +7555,8 @@ document.addEventListener('click',function(ev){
   else if(act==='devLogCopy') devLogCopy();
   else if(act==='devLogClear') devLogClear();
   else if(act==='ledColor') ledColor(arg);
+  else if(act==='psramSelfTest') psramSelfTest(256);
+  else if(act==='psramSelfTest4m') psramSelfTest(4096);
   else if(act==='ledScan') ledScan();
   else if(act==='ledSavePin') ledSavePin();
   else if(act==='togglePref'){
@@ -7530,6 +7577,19 @@ document.addEventListener('click',function(ev){
   else if(act==='otaBadAck'){ api('/api/v1/ota/rollback/ack',{method:'POST'}).then(function(){ loadSys(); }); }
 });
 
+async function psramSelfTest(kb){
+  $('psramMsg').textContent='自检进行中（'+kb+' KB 写读校验），请稍候…';
+  const j=await api('/api/v1/psram/selftest?kb='+kb,{method:'GET'});
+  if(j&&j.ok!==false&&!j.error){
+    $('psramTest').textContent=(j.pass?'通过':'失败')+' · '+j.kb+' KB · '+j.tookMs+' ms';
+    $('psramMsg').textContent=j.pass
+      ? '自检通过：这颗 PSRAM 可以稳定读写（'+j.kb+' KB 校验通过，耗时 '+j.tookMs+' ms）。'
+      : '自检失败：写入后读回的数据不一致，PSRAM 不可靠，不能用于存放数据。';
+    $('psramInfo').textContent=(Math.round((j.psramSize||0)/1048576)+' MB · 空闲 '+Math.round((j.psramFree||0)/1024)+' KB');
+  }else{
+    $('psramMsg').textContent='自检请求失败：'+((j&&(j.error||j.message))||'未知');
+  }
+}
 async function ledColor(arg){
   const [r,g,b]=arg.split(',').map(Number);
   const j=await api('/api/v1/led/test?r='+r+'&g='+g+'&b='+b,{method:'POST'});
@@ -7759,6 +7819,11 @@ void handleStatus(bool publicSetup) {
   // 没有串口日志无法定位，先退回关闭状态。
   d["psramSize"] = static_cast<uint32_t>(ESP.getPsramSize());
   d["psramFree"] = static_cast<uint32_t>(ESP.getFreePsram());
+  // PSRAM 自检结果：未跑过时 ran=false，跑过则 pass/kb/tookMs 有效。
+  d["psramTestRan"] = gPsramSelfTestRan;
+  d["psramTestPass"] = gPsramSelfTestOk;
+  d["psramTestKb"] = gPsramSelfTestKb;
+  d["psramTestMs"] = gPsramSelfTestMs;
   // 运行时长：系统页「设备信息」直接显示，省得用户自己拿开机时间换算。
   d["uptime"] = static_cast<uint32_t>(millis() / 1000u);
   d["freeSketchSpace"] = static_cast<uint32_t>(ESP.getFreeSketchSpace());
@@ -10022,6 +10087,25 @@ void setupRoutes() {
   });
 
   // 固定灯珠引脚并写进 NVS，下次开机直接用。
+  // PSRAM 硬件自检：写读校验指定大小（默认 256KB，可 ?kb= 调整）。
+  // 手动触发，不放在开机路径——先确认这颗 PSRAM 到底能不能稳定读写。
+  server.on("/api/v1/psram/selftest", HTTP_GET, [](){
+    if (!isSetupApClient() && !requireAuth()) return;
+    uint32_t kb = server.hasArg("kb") ? server.arg("kb").toInt() : 256;
+    if (kb < 4) kb = 4;
+    if (kb > 4096) kb = 4096;
+    psramRunSelfTest(kb);
+    JsonDocument d;
+    d["ok"] = true;
+    d["ran"] = gPsramSelfTestRan;
+    d["pass"] = gPsramSelfTestOk;
+    d["kb"] = gPsramSelfTestKb;
+    d["tookMs"] = gPsramSelfTestMs;
+    d["psramSize"] = static_cast<uint32_t>(ESP.getPsramSize());
+    d["psramFree"] = static_cast<uint32_t>(ESP.getFreePsram());
+    sendJson(200, d);
+  });
+
   server.on("/api/v1/led/pin", HTTP_POST, [](){
     if (!isSetupApClient() && !requireAuth()) return;
     if (!server.hasArg("pin")) return jsonError(400, "pin_required", "add ?pin=N");
