@@ -260,9 +260,13 @@ bool rgbLedReady();
 bool bootStageMark(uint32_t stage);
 void bootMarkerDone();
 void bootMarkerInit();
+void bootMarkerSelfHeal();
+void bootMarkerBeat();
 extern bool gLastBootStageValid;
 extern uint32_t gLastBootStage;
 extern bool gLastBootDone;
+extern esp_reset_reason_t gLastBootResetReason;
+extern uint32_t gLastBootUptimeS;
 
 // 显示函数定义在状态变量之后（见文件后部），那里 gSetupMode /
 // gWatchBridgeState / 网络计数器等均已声明。
@@ -358,7 +362,10 @@ static bool gOtaMode = false;        // 空中升级模式
 // 初始化阶段的崩溃集中在头一两秒，3 秒足够覆盖，剩下的交给升级结果核对。
 static bool gOtaPendingVerify = false;
 static uint32_t gOtaVerifyStartMs = 0;
-constexpr uint32_t kOtaConfirmDelayMs = 3000;  // 主循环跑满 3 秒即确认
+// v60 重新启用 PSRAM，风险上来了：窗口从 3 秒加长到 30 秒，PSRAM 相关的
+// 启动期崩溃都能被 bootloader 自动回滚。代价是「刷完 30 秒内断电」会回滚，
+// 属可接受换手。跑满 30 秒后若再崩，由崩溃自愈计数兜底。
+constexpr uint32_t kOtaConfirmDelayMs = 30000;  // 主循环跑满 30 秒才确认
 // 升级结果核对：写分区前把目标分区名和镜像里的版本号记进 NVS，重启后对不上
 // 就说明本次升级被 bootloader 回滚了，前端可以明确提示，而不是让用户猜。
 static bool gOtaRollbackDetected = false;
@@ -1235,14 +1242,39 @@ RTC_NOINIT_ATTR static uint32_t s_bmMagic;
 RTC_NOINIT_ATTR static uint32_t s_bmStage;
 RTC_NOINIT_ATTR static uint32_t s_bmDone;
 RTC_NOINIT_ATTR static uint32_t s_bmCrc;
+// v60 起新增：上次复位原因 + 上次存活秒数（loop 心跳）+ 连续短命崩溃计数。
+// 用于「崩溃自愈」：新固件若连续 3 次短命崩溃（看门狗/panic），主动把当前
+// 应用标记为无效并重启，bootloader 自动切回另一槽的旧固件——避免
+// PSRAM 这类高危改动把设备锁进死循环、用户没法再 OTA。
+RTC_NOINIT_ATTR static uint32_t s_bmReset;
+RTC_NOINIT_ATTR static uint32_t s_bmBeat;
+RTC_NOINIT_ATTR static uint32_t s_bmCrash;
 static constexpr uint32_t kBootMarkerMagic = 0x564C4231u;  // "VLB1"
 static constexpr uint32_t kBootMarkerDone = 0x444F4E45u;   // "DONE"
+static constexpr uint32_t kSelfHealCrashLimit = 3;         // 连续 3 次短命崩溃才自愈
+static constexpr uint32_t kSelfHealMinUptimeS = 60;        // 跑满 60 秒算「活过」
 bool gLastBootStageValid = false;
 uint32_t gLastBootStage = 0;
 bool gLastBootDone = false;
+esp_reset_reason_t gLastBootResetReason = ESP_RST_UNKNOWN;
+uint32_t gLastBootUptimeS = 0;
 
 static uint32_t bootMarkerCrc() {
-  return s_bmMagic ^ s_bmStage ^ s_bmDone ^ 0xC6BC2769u;
+  return s_bmMagic ^ s_bmStage ^ s_bmDone ^ s_bmReset ^ s_bmBeat ^ s_bmCrash ^ 0xC6BC2769u;
+}
+
+// 复位原因是不是「崩溃型」：看门狗 / panic / 非法访问。电源键重启、OTA 重启、
+// 深睡唤醒这些用户主动行为不算，否则自愈会误伤正常操作。
+static bool resetReasonIsCrash(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_PANIC:
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+      return true;
+    default:
+      return false;
+  }
 }
 
 void bootMarkerInit() {
@@ -1251,18 +1283,67 @@ void bootMarkerInit() {
     gLastBootStageValid = true;
     gLastBootStage = s_bmStage;
     gLastBootDone = (s_bmDone == kBootMarkerDone);
-    Serial.printf("BOOT_MARKER prev_stage=%lu prev_done=%d\n",
-                  static_cast<unsigned long>(gLastBootStage), gLastBootDone ? 1 : 0);
+    gLastBootResetReason = static_cast<esp_reset_reason_t>(s_bmReset);
+    gLastBootUptimeS = s_bmBeat;
+    Serial.printf("BOOT_MARKER prev_stage=%lu prev_done=%d prev_reset=%d prev_uptime_s=%lu prev_crash=%lu\n",
+                  static_cast<unsigned long>(gLastBootStage), gLastBootDone ? 1 : 0,
+                  static_cast<int>(gLastBootResetReason),
+                  static_cast<unsigned long>(gLastBootUptimeS),
+                  static_cast<unsigned long>(s_bmCrash));
   } else {
     gLastBootStageValid = false;
     gLastBootStage = 0;
     gLastBootDone = false;
+    gLastBootResetReason = ESP_RST_UNKNOWN;
+    gLastBootUptimeS = 0;
     Serial.println("BOOT_MARKER prev=none");
   }
   s_bmMagic = kBootMarkerMagic;
   s_bmDone = 0;
   s_bmStage = 1;
+  s_bmReset = static_cast<uint32_t>(esp_reset_reason());
+  s_bmBeat = 0;
   s_bmCrc = bootMarkerCrc();
+}
+
+// 崩溃自愈判定：上一轮启动数据有效、复位原因是崩溃型、且没活过门槛。
+// 满足则计数 +1；正常活过则清零。计数达到上限时把当前应用标记为无效，
+// 重启后 bootloader 自动滚回另一槽的旧固件（v59 就躺在另一槽）。
+void bootMarkerSelfHeal() {
+  bool prevCrash = false;
+  if (gLastBootStageValid) {
+    if (resetReasonIsCrash(gLastBootResetReason)) {
+      const bool shortLived = gLastBootDone ? (gLastBootUptimeS < kSelfHealMinUptimeS) : true;
+      prevCrash = shortLived;
+    } else if (gLastBootDone) {
+      s_bmCrash = 0;  // 正常跑满：清零计数
+    }
+  }
+  if (prevCrash) {
+    if (s_bmCrash < 255) ++s_bmCrash;
+  }
+  s_bmCrc = bootMarkerCrc();
+  if (s_bmCrash >= kSelfHealCrashLimit) {
+    Serial.printf("SELF_HEAL_TRIGGER crashes=%lu marking_app_invalid_and_rebooting\n",
+                  static_cast<unsigned long>(s_bmCrash));
+    s_bmCrash = 0;
+    s_bmCrc = bootMarkerCrc();
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+  }
+  Serial.printf("BOOT_MARKER self_heal prev_crash=%d count=%lu\n",
+                prevCrash ? 1 : 0, static_cast<unsigned long>(s_bmCrash));
+}
+
+// loop 心跳：每 5 秒把存活秒数写进 RTC_NOINIT。设备崩了之后，下一次启动
+// 就能知道「上一轮活了几秒」。
+void bootMarkerBeat() {
+  static uint32_t sLastBeat = 0;
+  const uint32_t now = millis();
+  if (now - sLastBeat >= 5000u) {
+    sLastBeat = now;
+    s_bmBeat = now / 1000u;
+    s_bmCrc = bootMarkerCrc();
+  }
 }
 
 bool bootStageMark(uint32_t stage) {
@@ -1916,17 +1997,75 @@ bool writeWatchBytes(const uint8_t* bytes, size_t length) {
 // Only the two SPP frame buffers (needed for auth) are allocated here; the
 // four QuickApp/network workspaces are allocated later, after auth succeeds,
 // so the RFCOMM connect path still has plenty of heap.
-// PSRAM 优先分配：协议拼包缓冲不是 DMA 缓冲，放外部 RAM 不影响功能，
-// 但能把宝贵的内部 RAM 让给 Wi-Fi/蓝牙协议栈与音频通路。
-// PSRAM 不可用时自动回退内部 RAM，行为与本版本之前完全一致。
-// PSRAM 自检：写读校验一段外部 RAM，只在用户手动点「运行自检」时执行。
-// 不在开机路径调用——v47 的教训是 PSRAM 一旦被热路径（蓝牙 SPP）访问就会
-// 触发 cache 冲突/看门狗，所以先让用户按需验证硬件是否可读可写。
+// 协议缓冲一律用内部 malloc——v47 曾把它们搬进 PSRAM，SPP 热路径触发
+// cache 冲突看门狗。v60 的策略是 PSRAM 只服务 WebServer 侧的只读 JSON。
+// PSRAM 自检：写读校验一段外部 RAM，只在用户手动点「运行自检」时执行；
+// 开机路径另有 32KB 自动校验（psramBootCheck），失败即全程回退内部 RAM。
 static bool gPsramSelfTestRan = false;
 static bool gPsramSelfTestOk = false;
 static uint32_t gPsramSelfTestKb = 0;
 static uint32_t gPsramSelfTestMs = 0;
 static bool gPsramPresent = false;   // 开机时由 esp_spiram 探测结果填入
+static bool gPsramUnsafe = false;    // 开机写读校验失败后置位：全部回退内部 RAM
+
+// 开机 PSRAM 写读校验（32KB）：v60 重新启用 PSRAM 前的最后一道防线。
+// 在蓝牙/Wi-Fi 起来之前跑——此时 cache 干净，能区分「颗粒坏」和「并发
+// cache 冲突」两种失败。失败则置 gPsramUnsafe，之后所有分配回退内部 RAM，
+// 行为与 PSRAM 未启用时完全一致。
+static void psramBootCheck() {
+  gPsramPresent = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+  if (!gPsramPresent) {
+    gPsramUnsafe = true;
+    Serial.println("PSRAM_BOOT_CHECK absent");
+    return;
+  }
+  const size_t bytes = 32u * 1024u;
+  uint8_t* p = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!p) {
+    gPsramUnsafe = true;
+    Serial.println("PSRAM_BOOT_CHECK alloc_failed");
+    return;
+  }
+  for (size_t i = 0; i < bytes; ++i) p[i] = static_cast<uint8_t>((i * 131u + 17u) & 0xFFu);
+  bool ok = true;
+  for (size_t i = 0; i < bytes; ++i) {
+    if (p[i] != static_cast<uint8_t>((i * 131u + 17u) & 0xFFu)) { ok = false; break; }
+  }
+  heap_caps_free(p);
+  gPsramUnsafe = !ok;
+  Serial.printf("PSRAM_BOOT_CHECK %s total=%u largest=%u\n",
+                ok ? "PASS" : "FAIL",
+                static_cast<unsigned>(heap_caps_get_total_size(MALLOC_CAP_SPIRAM)),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+}
+
+// JSON 文档分配器：优先落 PSRAM（管理台轮询的只读数据），失败回退内部堆。
+// 蓝牙热路径绝不使用本分配器——v47 教训：SPP 拼包缓冲进 PSRAM 触发 cache
+// 冲突看门狗。只有 WebServer 侧、每 3 秒轮询的只读 JSON 文档走这条路，
+// 把 10KB 级别的瞬态内存压力从内部 DRAM 挪到 8MB 外扩上去。
+class PsramJsonAllocator : public ArduinoJson::Allocator {
+ public:
+  void* allocate(size_t size) override {
+    if (gPsramUnsafe) return malloc(size);
+    void* p = ps_malloc(size);
+    return p ? p : malloc(size);
+  }
+  void deallocate(void* ptr) override { free(ptr); }
+  void* reallocate(void* ptr, size_t new_size) override {
+    if (!gPsramUnsafe) {
+      const uint32_t a = reinterpret_cast<uint32_t>(ptr);
+      const bool inPsram = (a >= 0x3F800000u) && (a < 0x3FC00000u);
+      if (inPsram) {
+        void* p = ps_realloc(ptr, new_size);
+        if (p) return p;   // 扩展成功，旧内容已保留
+      }
+    }
+    // 标准 realloc 对 PSRAM 指针同样安全：按堆块头取旧尺寸、拷内容、
+    // 新块落在内部堆。JSON 文档是请求级瞬态对象，落哪都行。
+    return realloc(ptr, new_size);
+  }
+};
+static PsramJsonAllocator gPsramJsonAlloc;
 
 static void psramRunSelfTest(uint32_t kb) {
   gPsramSelfTestRan = true;
@@ -6805,7 +6944,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
 <section class="panel" id="p-tools">
 <div class="card">
   <h2>PSRAM 自检</h2>
-  <p class="hint">v47 曾把蓝牙协议缓冲放进 PSRAM，导致主循环被看门狗复位（PSRAM 初始化其实是成功的）。现在默认不使用 PSRAM，只有你点下面的按钮才会对它做一次写读校验，用来确认这颗 8MB 颗粒到底可不可靠。</p>
+  <p class="hint">v60 策略：PSRAM 只承载管理台轮询的只读 JSON（蓝牙与 Wi-Fi 全程内部 RAM，v47 曾把蓝牙协议缓冲放进 PSRAM 导致看门狗）。开机时固件自动做 32KB 写读校验，失败即全程回退内部 RAM。下方按钮可手动验证这颗 8MB 颗粒。</p>
   <div class="mini"><b>容量 / 空闲</b><span id="psramInfo">—</span></div>
   <div class="mini"><b>自检结果</b><span id="psramTest">尚未运行</span></div>
   <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
@@ -7077,7 +7216,7 @@ async function loadPerf(){
     $('mMin').textContent=Math.round((d.heapMinFree||0)/1024)+' KB';
     // 总量（内部+外扩）与 PSRAM：用来看"扩展内存到底有没有生效"
     $('mFreeAll').textContent=d.heapFree!==undefined?(Math.round(d.heapFree/1024)+' KB'):'—';
-    $('mPsram').textContent=d.psramSize?(Math.round(d.psramSize/1048576)+' MB'):'未启用';
+    $('mPsram').textContent=d.psramSize?(Math.round(d.psramSize/1048576)+' MB'+(d.psramUnsafe?'（异常已禁用）':'')):'未启用';
     $('mPsramFree').textContent=d.psramSize?(Math.round((d.psramFree||0)/1024)+' KB'):'—';
   }
   var t=await api('/api/v1/traffic');
@@ -7819,7 +7958,7 @@ void handleStatus(bool publicSetup) {
     return;
   }
   if (!setupApClient && !requireAuth()) return;
-  JsonDocument d;
+  JsonDocument d(&gPsramJsonAlloc);
   d["ok"] = true;
   d["bridge"] = "vela-gateway";
   d["version"] = 3;                       // 历史字段，保留兼容旧脚本
@@ -7899,6 +8038,7 @@ void handleStatus(bool publicSetup) {
     const size_t capsFree = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     const uint32_t arSize = static_cast<uint32_t>(ESP.getPsramSize());
     d["psramPresent"] = gPsramPresent || capsTotal > 0;
+    d["psramUnsafe"] = gPsramUnsafe;
     d["psramSize"] = arSize ? arSize : static_cast<uint32_t>(capsTotal);
     d["psramFree"] = arSize ? static_cast<uint32_t>(ESP.getFreePsram())
                             : static_cast<uint32_t>(capsFree);
@@ -10258,7 +10398,7 @@ void setupRoutes() {
   // ==================== HAL：硬件与外设状态 ====================
   server.on("/api/v1/hal", HTTP_GET, [](){
     if (!isSetupApClient() && !requireAuth()) return;
-    JsonDocument d;
+    JsonDocument d(&gPsramJsonAlloc);
     d["ok"] = true;
     d["chipModel"] = ESP.getChipModel();
     d["chipRevision"] = static_cast<uint32_t>(ESP.getChipRevision());
@@ -10286,7 +10426,7 @@ void setupRoutes() {
   // ==================== 链路质量 / 信道分析 ====================
   server.on("/api/v1/linkscore", HTTP_GET, [](){
     if (!isSetupApClient() && !requireAuth()) return;
-    JsonDocument d;
+    JsonDocument d(&gPsramJsonAlloc);
     d["ok"] = true;
     const int rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
     const uint32_t totalPkts = gWatchNetworkRxPackets + gWatchNetworkTxPackets;
@@ -10317,7 +10457,7 @@ void setupRoutes() {
   // ==================== 流量与心跳（带历史曲线） ====================
   server.on("/api/v1/traffic", HTTP_GET, [](){
     if (!isSetupApClient() && !requireAuth()) return;
-    JsonDocument d;
+    JsonDocument d(&gPsramJsonAlloc);
     d["ok"] = true;
     d["rxBytes"] = gWatchRxBytes;
     d["txBytes"] = gWatchTxBytes;
@@ -11082,6 +11222,10 @@ void setup() {
   // 读取上次启动的阶段记录（RTC 内存），然后把本次推进到「应用入口」。
   // 必须最先执行：后面的任何一步都可能崩。
   bootMarkerInit();
+  // 崩溃自愈：连续短命崩溃时把本固件标记无效，bootloader 自动滚回另一槽。
+  bootMarkerSelfHeal();
+  // PSRAM 开机写读校验：失败则本固件全程回退内部 RAM（行为等同 v59）。
+  psramBootCheck();
 
   // 协议常量在这里一次性解码（此时还没起任务，避免多任务首次并发解码）。
   // 之后再调用只是读缓存，无锁竞争。
@@ -11647,6 +11791,8 @@ loadDeviceInfo();
 )HTMLOTA";
 
 void loop() {
+  // 存活心跳：每 5 秒把运行秒数写进 RTC_NOINIT，供崩溃自愈判定「活了多久」。
+  bootMarkerBeat();
   // 首圈推进启动阶段记录（见 bootMarkerInit 说明）
   { static bool sLoopMarked = false; if (!sLoopMarked) { sLoopMarked = true; bootStageMark(5); } }
   // OTA 回滚确认：稳定运行 30 秒后才把新固件标记为有效。
