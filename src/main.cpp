@@ -5744,16 +5744,40 @@ bool authorized() {
 // 每次调用都要在堆上额外挂一份与响应体等大的 String。内部空闲只有 10KB
 // 出头，而管理台每 3 秒轮询一次 /api/v1/status，等于在紧巴巴的堆上
 // 每 3 秒做一次 3~5KB 的分配/释放——碎片化越滚越大，蓝牙音乐一开网页
-// 就卡死。改成 measureJson 先算长度、直接把 JSON 打进 TCP 套接字，
-// 全程不产生响应体副本。顺序与字节内容与旧实现完全一致（都是同一个
-// JsonDocument 序列化），前端无感知。
-class DirectClientPrint : public Print {
+// 就卡死。改成 measureJson 先算长度、按 512B 分块走 server.sendContent()
+// 流式打出，全程不产生响应体副本。
+//
+// v58 教训：上一版直接写 server.client() 返回的 WiFiClient 拷贝，
+// 绕过 WebServer 自己的写通道，导致设备上所有 API 响应异常（浏览器侧
+// 全部「读取中」）。这里改用与 sendMainWebUi() 完全相同的
+// setContentLength + send(200,type,"") + sendContent 三件套——
+// 那条 49KB 页面路径已在真机上验证可用，响应体照样零堆拷贝。
+class ChunkedJsonPrint : public Print {
  public:
-  explicit DirectClientPrint(WiFiClient c) : _c(std::move(c)) {}
-  size_t write(uint8_t b) override { return _c.write(b); }
-  size_t write(const uint8_t* buf, size_t n) override { return _c.write(buf, n); }
+  explicit ChunkedJsonPrint(WebServer& s) : _s(s), _used(0) {}
+  size_t write(uint8_t b) override {
+    if (_used >= kCap) flush();
+    _buf[_used++] = static_cast<char>(b);
+    return 1;
+  }
+  size_t write(const uint8_t* buf, size_t n) override {
+    size_t done = 0;
+    while (done < n) {
+      if (_used >= kCap) flush();
+      const size_t take = (n - done < kCap - _used) ? (n - done) : (kCap - _used);
+      memcpy(_buf + _used, buf + done, take);
+      _used += take; done += take;
+    }
+    return done;
+  }
+  void flush() {
+    if (_used > 0) { _s.sendContent(_buf, _used); _used = 0; }
+  }
  private:
-  WiFiClient _c;  // WebServer::client() 返回值是拷贝，与当前连接共用同一 socket
+  static constexpr size_t kCap = 512;
+  WebServer& _s;
+  char _buf[kCap];
+  size_t _used;
 };
 
 void sendJson(int code, JsonDocument& d);
@@ -5768,8 +5792,9 @@ void sendJson(int code, JsonDocument& d) {
   const size_t n = measureJson(d);
   server.setContentLength(n);
   server.send(code, "application/json; charset=utf-8", "");
-  DirectClientPrint pr(server.client());
+  ChunkedJsonPrint pr(server);
   serializeJson(d, pr);
+  pr.flush();
 }
 
 // ==================== 诊断与运维：运行遥测 ====================
