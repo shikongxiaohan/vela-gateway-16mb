@@ -1916,12 +1916,25 @@ bool writeWatchBytes(const uint8_t* bytes, size_t length) {
 // Only the two SPP frame buffers (needed for auth) are allocated here; the
 // four QuickApp/network workspaces are allocated later, after auth succeeds,
 // so the RFCOMM connect path still has plenty of heap.
+// PSRAM 优先分配：协议拼包缓冲不是 DMA 缓冲，放外部 RAM 不影响功能，
+// 但能把宝贵的内部 RAM 让给 Wi-Fi/蓝牙协议栈与音频通路。
+// PSRAM 不可用时自动回退内部 RAM，行为与本版本之前完全一致。
+static void* psramPreferMalloc(size_t bytes) {
+#if defined(CONFIG_SPIRAM) || defined(CONFIG_ESP32_SPIRAM_SUPPORT)
+  if (ESP.getPsramSize() > 0) {
+    void* p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p) return p;
+  }
+#endif
+  return malloc(bytes);
+}
+
 bool ensureScratchBuffers() {
   if (gSppTxFrame) return true;
-  gSppTxFrame = static_cast<uint8_t*>(malloc(8 + kSppV2PayloadMax));
-  gSppRxFrame = static_cast<uint8_t*>(malloc(8 + kSppV2PayloadMax));
-  gRawCommandPayloadScratch = static_cast<uint8_t*>(malloc(kSppV2PayloadMax));
-  gEncryptedPayloadScratch = static_cast<uint8_t*>(malloc(kSppV2PayloadMax));
+  gSppTxFrame = static_cast<uint8_t*>(psramPreferMalloc(8 + kSppV2PayloadMax));
+  gSppRxFrame = static_cast<uint8_t*>(psramPreferMalloc(8 + kSppV2PayloadMax));
+  gRawCommandPayloadScratch = static_cast<uint8_t*>(psramPreferMalloc(kSppV2PayloadMax));
+  gEncryptedPayloadScratch = static_cast<uint8_t*>(psramPreferMalloc(kSppV2PayloadMax));
   if (!gSppTxFrame || !gSppRxFrame || !gRawCommandPayloadScratch ||
       !gEncryptedPayloadScratch) {
     Serial.println("VELA_SCRATCH_MALLOC_FAILED");
@@ -1936,8 +1949,8 @@ bool ensureScratchBuffers() {
 // and as a lazy guard at the top of every consumer that needs them.
 bool ensureAppScratchBuffers() {
   if (gQuickAppMessageScratch) return true;
-  gQuickAppMessageScratch = static_cast<uint8_t*>(malloc(kSppV2PayloadMax));
-  gQuickAppThirdpartyScratch = static_cast<uint8_t*>(malloc(kSppV2PayloadMax));
+  gQuickAppMessageScratch = static_cast<uint8_t*>(psramPreferMalloc(kSppV2PayloadMax));
+  gQuickAppThirdpartyScratch = static_cast<uint8_t*>(psramPreferMalloc(kSppV2PayloadMax));
   if (!gQuickAppMessageScratch || !gQuickAppThirdpartyScratch) {
     Serial.println("VELA_APP_SCRATCH_MALLOC_FAILED");
     return false;
