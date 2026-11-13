@@ -5722,23 +5722,54 @@ String sanitizeWebToken(const String& raw) {
 
 bool authorized() {
   if (localToken.isEmpty()) return true;
+  // 缓存派生值：authorized() 在每个 API 请求都会跑，管理台 3 秒一 polls，
+  // 旧实现每次都在堆上拼 "Bearer "+token 和 sanitizeWebToken 两串临时
+  // String，白白制造碎片。这两个值只在配置保存时才会变。
+  static String sBearerToken;
+  static String sSanitizedToken;
+  static bool sReady = false;
+  if (!sReady || sBearerToken.length() != 7 + localToken.length()) {
+    sBearerToken = "Bearer " + localToken;
+    sSanitizedToken = sanitizeWebToken(localToken);
+    sReady = true;
+  }
   String h = server.header("Authorization");
-  if (h == "Bearer " + localToken) return true;
+  if (h == sBearerToken) return true;
   if (server.header("X-Vela-Token") == localToken) return true;
   // 页面里下发的是过滤后的令牌，客户端回传的就是过滤后的值。
-  return server.header("X-Vela-Token") == sanitizeWebToken(localToken);
+  return server.header("X-Vela-Token") == sSanitizedToken;
 }
+
+// JSON 直写客户端：旧实现是 serializeJson(d, out) 攒一整串再 send()，
+// 每次调用都要在堆上额外挂一份与响应体等大的 String。内部空闲只有 10KB
+// 出头，而管理台每 3 秒轮询一次 /api/v1/status，等于在紧巴巴的堆上
+// 每 3 秒做一次 3~5KB 的分配/释放——碎片化越滚越大，蓝牙音乐一开网页
+// 就卡死。改成 measureJson 先算长度、直接把 JSON 打进 TCP 套接字，
+// 全程不产生响应体副本。顺序与字节内容与旧实现完全一致（都是同一个
+// JsonDocument 序列化），前端无感知。
+class DirectClientPrint : public Print {
+ public:
+  explicit DirectClientPrint(WiFiClient c) : _c(std::move(c)) {}
+  size_t write(uint8_t b) override { return _c.write(b); }
+  size_t write(const uint8_t* buf, size_t n) override { return _c.write(buf, n); }
+ private:
+  WiFiClient _c;  // WebServer::client() 返回值是拷贝，与当前连接共用同一 socket
+};
+
+void sendJson(int code, JsonDocument& d);
 
 void jsonError(int code, const char* err, const String& message) {
   JsonDocument d;
   d["ok"] = false; d["error"] = err; d["message"] = message;
-  String out; serializeJson(d, out);
-  server.send(code, "application/json; charset=utf-8", out);
+  sendJson(code, d);
 }
 
 void sendJson(int code, JsonDocument& d) {
-  String out; serializeJson(d, out);
-  server.send(code, "application/json; charset=utf-8", out);
+  const size_t n = measureJson(d);
+  server.setContentLength(n);
+  server.send(code, "application/json; charset=utf-8", "");
+  DirectClientPrint pr(server.client());
+  serializeJson(d, pr);
 }
 
 // ==================== 诊断与运维：运行遥测 ====================
@@ -6570,7 +6601,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <div class="mini"><b>运行时长</b><span id="yUp">—</span></div>
   <div class="mini"><b>空闲内存（含 PSRAM）</b><span id="yMem">—</span></div>
   <div class="mini"><b>内部 RAM 空闲</b><span id="yMemInt">—</span></div>
-  <div class="mini"><b>历史最低内存</b><span id="yMemMin">—</span></div>
+  <div class="mini"><b>历史最低内存(全部堆)</b><span id="yMemMin">—</span></div>
   <div class="mini"><b>最大连续块</b><span id="yMemLargest">—</span></div>
   <div class="mini"><b>PSRAM</b><span id="yPsram">—</span></div>
 </div>
@@ -6672,7 +6703,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
   <p class="hint">蓝牙协议栈、lwIP 与转发缓冲只能用内部 RAM，PSRAM 帮不上忙。内部空闲低于 20 KB 时会出现卡顿、网页打不开。</p>
   <div class="grid kv-grid">
     <div class="kv"><b>内部空闲</b><span id="mFree">—</span></div>
-    <div class="kv"><b>内部历史最低</b><span id="mMin">—</span></div>
+    <div class="kv"><b>历史最低(全部堆)</b><span id="mMin">—</span></div>
     <div class="kv"><b>最大连续块</b><span id="mMax">—</span></div>
     <div class="kv"><b>总空闲(含外扩)</b><span id="mFreeAll">—</span></div>
   </div>
