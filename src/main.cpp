@@ -1532,6 +1532,9 @@ constexpr size_t kWatchOpusAggregateBytes = 400;
 constexpr size_t kWatchAsrTaskStackBytes = 48 * 1024;
 static size_t gWatchStreamCaptureLength = 0;
 static size_t gWatchStreamPacketCount = 0;
+// 最近一次收到手表数据包的时刻（毫秒）。前端据此判断「音频/数据正在传输」，
+// 自动放慢管理页轮询，避免 HTTP 处理与蓝牙音频抢 CPU 和堆。
+static volatile uint32_t gLastWatchRxMs = 0;
 static bool gWatchStreamCaptureActive = false;
 static bool gWatchStreamCaptureTruncated = false;
 static uint32_t gWatchStreamCaptureRxDroppedStart = 0;
@@ -1752,6 +1755,7 @@ void appendWatchStreamPacket(const uint8_t* data, size_t length) {
     return;
   }
   ++gWatchStreamPacketCount;
+  gLastWatchRxMs = millis();
   gWatchStreamCaptureLength += length;
   if (length >= kWatchOpusSubframeBytes && (length % kWatchOpusSubframeBytes) == 0) {
     gXiaoAiAudioMs += static_cast<uint32_t>((length / kWatchOpusSubframeBytes) * 20u);
@@ -6707,7 +6711,7 @@ input[type=range]{padding:0;height:28px;accent-color:var(--accent)}
     <button class="ghost" style="width:auto;padding:8px 14px" data-act="ledSavePin">保存引脚</button>
     <button class="ghost" style="width:auto;padding:8px 14px" data-act="ledScan">全引脚扫描（约 25 秒）</button>
   </div>
-  <p class="hint" id="ledScanMsg" style="margin-top:8px">扫描会对所有候选引脚依次尝试 WS2812 与静态电平驱动，若灯亮请记下引脚号并保存。</p>
+  <p id="ledScanMsg" style="margin:12px 0 0;padding:10px 12px;border-radius:8px;background:#f1f5f9;border:1px solid #e2e8f0;font-size:13px;line-height:1.5;color:#334155">点上面任一颜色按钮，结果会显示在这里。</p>
 </div>
 
 <div class="card">
@@ -7161,6 +7165,8 @@ function uptimeText(sec){
 }
 /* ---------- 状态轮询 ---------- */
 var lastRx=0,lastTx=0;
+// 手表链路忙闲状态：音频/大包传输时把管理页轮询放慢（见页末 scheduleRefresh）。
+var _pollBusy=false;
 async function refresh(){
   var d=await api('/api/v1/status');
   if(!d||d.ok===false){
@@ -7179,6 +7185,8 @@ async function refresh(){
   var mem = d.heapFree!==undefined ? d.heapFree : (d.freeHeap!==undefined?d.freeHeap:null);
   $('sMem').textContent = mem!==null ? Math.round(mem/1024)+' KB' : '—';
   if(d.heapMinFree!==undefined) $('sMem').title='历史最低 '+Math.round(d.heapMinFree/1024)+' KB';
+  // 手表链路 2 秒内有收包 → 视为忙（音频/数据传输中），放慢轮询。
+  if(typeof d.watchRxAgeMs==='number') _pollBusy = (d.watchRxAgeMs < 2000);
   var rx=d.networkRxPackets||0, tx=d.networkTxPackets||0;
   $('sPkt').textContent = tx+' / '+rx;
   $('sCounters').textContent = '丢包 '+(d.networkDroppedPackets||0)+' · 会话 '+(d.watchConversationTurns||0)+' 轮';
@@ -7550,9 +7558,28 @@ async function rebootDevice(){
   try{ await fetch('/api/v1/reboot',{method:'POST'}); }catch(e){}
 }
 setTimeout(function(){ showTab('dash'); loadTraffic(); },300);
-setInterval(loadTraffic,4000);
-refresh();
-setInterval(refresh,3000);
+// 自适应轮询：手表链路正在传输（音频/大包）时把管理页的两次轮询
+// （状态 3s→12s、流量 4s→16s）都放慢，避免与蓝牙音频抢 CPU/堆——
+// 此前固定 3s/4s 轮询会把音乐卡死。
+var _pollIdleMs=3000, _pollTimer=null;
+var _trafficIdleMs=4000, _trafficTimer=null;
+function pollDelay(idleMs){ return _pollBusy ? idleMs*4 : idleMs; }
+function scheduleRefresh(){
+  if(_pollTimer) clearTimeout(_pollTimer);
+  _pollTimer=setTimeout(async function(){
+    await refresh();
+    scheduleRefresh();
+  }, pollDelay(_pollIdleMs));
+}
+function scheduleTraffic(){
+  if(_trafficTimer) clearTimeout(_trafficTimer);
+  _trafficTimer=setTimeout(async function(){
+    await loadTraffic();
+    scheduleTraffic();
+  }, pollDelay(_trafficIdleMs));
+}
+scheduleRefresh();
+scheduleTraffic();
 log('页面已加载 · 固件 __PH_VERFULL__');
 </script>
 </body>
@@ -7706,6 +7733,14 @@ void handleStatus(bool publicSetup) {
   // 最大连续块：free 大而 largest 小说明堆被切碎，malloc 仍会失败。
   // 排查「传大文件到一半挂掉」时这两个数要一起看。
   d["heapLargest"] = static_cast<uint32_t>(ESP.getMaxAllocHeap());
+  // 手表链路最近收包距今多少毫秒：前端用来判断音频/数据正在传输，
+  // 此时自动放慢管理页轮询（3s → 12s），把 CPU 和堆让给蓝牙通路。
+  // 无收包时给一个足够大的值，前端按「空闲」处理。
+  {
+    const uint32_t nowMs = millis();
+    const uint32_t lastRx = gLastWatchRxMs;
+    d["watchRxAgeMs"] = lastRx == 0 ? 0xFFFFFFFFu : (nowMs - lastRx);
+  }
   // PSRAM：固件当前未开启 SPIRAM 编译开关，这里恒为 0。
   // v0.0.0.35 曾打开过，设备在启动阶段复位后被 bootloader 回滚，
   // 没有串口日志无法定位，先退回关闭状态。
@@ -7719,7 +7754,10 @@ void handleStatus(bool publicSetup) {
   // 挂载成功后只是读一个 bool，未挂载时最多起一个后台格式化任务，不会阻塞。
   const bool fsReady = ensureSpiffs();
   d["spiffsState"] = fsReady ? "ready" : (gSpiffsFormatting ? "formatting" : "unavailable");
-  if (fsReady) {
+  // SPIFFS.totalBytes()/usedBytes() 会去文件系统统计，链路正忙时跳过这步，
+  // 把 CPU 让给蓝牙音频（前端此时也已把轮询降到 12s）。
+  const bool linkBusy = gLastWatchRxMs != 0 && (millis() - gLastWatchRxMs) < 2000;
+  if (fsReady && !linkBusy) {
     d["spiffsTotal"] = static_cast<uint32_t>(SPIFFS.totalBytes());
     d["spiffsUsed"] = static_cast<uint32_t>(SPIFFS.usedBytes());
   }
