@@ -216,11 +216,13 @@ constexpr int kSetupTriggerPin = 0;
 constexpr uint32_t kSetupTriggerHoldMs = 10000;  // 10秒长按重置
 
 // ---------- OLED 状态屏（SSD1306 128x64 I2C）----------
-// SDA=21, SCL=22（BOOT 使用 GPIO0；21/22 空闲）。
+// SDA=4, SCL=5。原为 21/22，但板载 WS2812 的 DIN 接在 GPIO21（YD-ESP32-B），
+// I2C 外设与 RMT 抢同一引脚会把 WS2812 波形毁成"全 1"（无论点什么颜色都是白、
+// 熄灭无效）。21 让给灯，I2C 挪到 4/5。接线 OLED 时请接 SDA→4、SCL→5。
 // 全屏 framebuffer 仅 1024 字节，对紧张的堆影响可忽略；不开新任务，
 // 直接在 loop() 里定时刷新，只读现有状态变量。
-constexpr int kOledSdaPin = 21;
-constexpr int kOledSclPin = 22;
+constexpr int kOledSdaPin = 4;
+constexpr int kOledSclPin = 5;
 constexpr uint8_t kOledI2cAddr = 0x3C;
 constexpr uint32_t kDisplayRefreshMs = 250;
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE, kOledSclPin, kOledSdaPin);
