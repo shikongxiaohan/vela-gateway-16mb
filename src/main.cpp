@@ -1278,10 +1278,12 @@ void bootMarkerDone() {
 
 // ===== 板载 RGB 灯（WS2812）=====
 // 单根数据线脉宽编码（GRB 24 位，800 kHz），digitalWrite 高低电平对它无效。
-// v43 起改用 Arduino-ESP32 内置的 esp32-hal-rmt 封装（与官方 neopixelWrite()
-// 完全同一条路径，tick=100ns：'1'=800/400ns、'0'=400/800ns），只额外支持换引脚。
-#include "esp32-hal-rmt.h"
-static rmt_obj_t* gRgbRmt = nullptr;
+// v43 曾改用 esp32-hal-rmt（官方 neopixelWrite 同源封装），实测拖垮系统
+// （网页打不开、音频卡顿）——该封装在 ESP32 上的通道/内存管理不可控，已回退。
+// v44 改用 IDF 原生 RMT + clk_div=2（40MHz，tick=25ns，FastLED 同款选择；
+// div=1 在部分 ESP32 硅片上输出异常），发送后补 300µs 低电平确保锁存。
+#include <driver/rmt.h>
+static rmt_channel_t gRgbRmtChannel = RMT_CHANNEL_0;
 static bool gRgbRmtReady = false;
 static uint8_t gRgbPin = kRgbLedDefaultPin;
 
@@ -1299,24 +1301,32 @@ uint8_t rgbLedPin() { return gRgbPin; }
 bool rgbLedReady() { return gRgbRmtReady; }
 
 static void rgbLedDetach() {
-  if (gRgbRmt) {
-    rmtDeinit(gRgbRmt);
-    gRgbRmt = nullptr;
-  }
-  gRgbRmtReady = false;
+  if (!gRgbRmtReady) return;
+  rmt_set_pin(gRgbRmtChannel, RMT_MODE_TX, GPIO_NUM_MAX);
 }
 
 static bool rgbLedBegin(uint8_t pin) {
   rgbLedDetach();
-  gRgbPin = pin;
-  gRgbRmt = rmtInit(pin, RMT_TX_MODE, RMT_MEM_64);
-  if (!gRgbRmt) {
+  if (gRgbRmtReady) {
+    rmt_driver_uninstall(gRgbRmtChannel);
+    gRgbRmtReady = false;
+  }
+  rmt_config_t cfg = RMT_DEFAULT_CONFIG_TX(static_cast<gpio_num_t>(pin), gRgbRmtChannel);
+  cfg.clk_div = 2;            // 40 MHz → 一 tick 25 ns（FastLED 同款）
+  cfg.mem_block_num = 1;
+  cfg.tx_config.loop_en = false;
+  cfg.tx_config.carrier_en = false;
+  cfg.tx_config.idle_output_en = true;
+  cfg.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
+  if (rmt_config(&cfg) != ESP_OK || rmt_driver_install(gRgbRmtChannel, 0, 0) != ESP_OK) {
     Serial.printf("RGB_LED rmt_init_failed pin=%u\n", pin);
+    gRgbRmtReady = false;
+    gRgbPin = pin;
     return false;
   }
-  rmtSetTick(gRgbRmt, 100);   // 100 ns / tick
   gRgbRmtReady = true;
-  Serial.printf("RGB_LED rmt_ready pin=%u\n", pin);
+  gRgbPin = pin;
+  Serial.printf("RGB_LED rmt_ready pin=%u div=2\n", pin);
   return true;
 }
 
@@ -1324,20 +1334,21 @@ void rgbLedPush(uint8_t pin, uint8_t r, uint8_t g, uint8_t b) {
   if (!gRgbRmtReady || pin != gRgbPin) {
     if (!rgbLedBegin(pin)) return;
   }
-  rmt_data_t data[24];
+  rmt_item32_t items[24];
   const uint8_t grb[3] = {g, r, b};   // WS2812 的传输顺序是 G→R→B
-  // 与官方 neopixelWrite() 相同的时序：'1' 高 0.8µs/低 0.4µs，'0' 高 0.4µs/低 0.8µs
+  // tick=25ns：'1'=高750ns/低500ns，'0'=高300ns/低950ns（规范中心值）
   for (int i = 0; i < 3; ++i) {
     for (int bit = 0; bit < 8; ++bit) {
       const bool one = (grb[i] >> (7 - bit)) & 0x01;
-      rmt_data_t& it = data[i * 8 + bit];
+      rmt_item32_t& it = items[i * 8 + bit];
       it.level0 = 1;
-      it.duration0 = one ? 8 : 4;
+      it.duration0 = one ? 30 : 12;
       it.level1 = 0;
-      it.duration1 = one ? 4 : 8;
+      it.duration1 = one ? 20 : 38;
     }
   }
-  rmtWrite(gRgbRmt, data, 24);
+  rmt_write_items(gRgbRmtChannel, items, 24, true);
+  delayMicroseconds(300);   // 低电平 >50µs，确保灯珠复位锁存
 }
 
 void rgbLedClear() { rgbLedPush(gRgbPin, 0, 0, 0); }
