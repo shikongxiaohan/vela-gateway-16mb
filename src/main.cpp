@@ -1276,10 +1276,12 @@ void bootMarkerDone() {
   s_bmCrc = bootMarkerCrc();
 }
 
-// ===== 板载 RGB 灯（WS2812，RMT 驱动）=====
+// ===== 板载 RGB 灯（WS2812）=====
 // 单根数据线脉宽编码（GRB 24 位，800 kHz），digitalWrite 高低电平对它无效。
-#include <driver/rmt.h>
-static rmt_channel_t gRgbRmtChannel = RMT_CHANNEL_0;
+// v43 起改用 Arduino-ESP32 内置的 esp32-hal-rmt 封装（与官方 neopixelWrite()
+// 完全同一条路径，tick=100ns：'1'=800/400ns、'0'=400/800ns），只额外支持换引脚。
+#include "esp32-hal-rmt.h"
+static rmt_obj_t* gRgbRmt = nullptr;
 static bool gRgbRmtReady = false;
 static uint8_t gRgbPin = kRgbLedDefaultPin;
 
@@ -1297,82 +1299,45 @@ uint8_t rgbLedPin() { return gRgbPin; }
 bool rgbLedReady() { return gRgbRmtReady; }
 
 static void rgbLedDetach() {
-  if (!gRgbRmtReady) return;
-  rmt_set_pin(gRgbRmtChannel, RMT_MODE_TX, GPIO_NUM_MAX);
-}
-
-// RMT 不可用时的忙等备用路径，只驱动一颗灯珠（24 位）。
-static void ws2812BitBang(uint8_t pin, uint8_t r, uint8_t g, uint8_t b) {
-  pinMode(pin, OUTPUT);
-  digitalWrite(pin, LOW);
-  const uint8_t grb[3] = {g, r, b};
-  for (int i = 0; i < 3; ++i) {
-    const uint8_t v = grb[i];
-    for (int bit = 7; bit >= 0; --bit) {
-      digitalWrite(pin, HIGH);
-      if (v & (1u << bit)) {
-        delayMicroseconds(1);
-        digitalWrite(pin, LOW);
-        delayMicroseconds(1);
-      } else {
-        digitalWrite(pin, LOW);
-        delayMicroseconds(1);
-      }
-    }
+  if (gRgbRmt) {
+    rmtDeinit(gRgbRmt);
+    gRgbRmt = nullptr;
   }
-  delayMicroseconds(60);
+  gRgbRmtReady = false;
 }
 
 static bool rgbLedBegin(uint8_t pin) {
   rgbLedDetach();
-  if (gRgbRmtReady) {
-    rmt_driver_uninstall(gRgbRmtChannel);
-    gRgbRmtReady = false;
-  }
-  rmt_config_t cfg = RMT_DEFAULT_CONFIG_TX(static_cast<gpio_num_t>(pin), gRgbRmtChannel);
-  cfg.clk_div = 1;            // 80 MHz → 一 tick 12.5 ns
-  cfg.mem_block_num = 1;
-  cfg.tx_config.loop_en = false;
-  cfg.tx_config.carrier_en = false;
-  cfg.tx_config.idle_output_en = true;
-  cfg.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
-  if (rmt_config(&cfg) != ESP_OK || rmt_driver_install(gRgbRmtChannel, 0, 0) != ESP_OK) {
-    Serial.printf("RGB_LED rmt_init_failed pin=%u (fallback bitbang)\n", pin);
-    gRgbRmtReady = false;
-    gRgbPin = pin;
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, LOW);
+  gRgbPin = pin;
+  gRgbRmt = rmtInit(pin, RMT_TX_MODE, RMT_MEM_64);
+  if (!gRgbRmt) {
+    Serial.printf("RGB_LED rmt_init_failed pin=%u\n", pin);
     return false;
   }
+  rmtSetTick(gRgbRmt, 100);   // 100 ns / tick
   gRgbRmtReady = true;
-  gRgbPin = pin;
   Serial.printf("RGB_LED rmt_ready pin=%u\n", pin);
   return true;
 }
 
 void rgbLedPush(uint8_t pin, uint8_t r, uint8_t g, uint8_t b) {
-  if (pin != gRgbPin || !gRgbRmtReady) {
-    if (!rgbLedBegin(pin) || !gRgbRmtReady) {
-      ws2812BitBang(pin, r, g, b);
-      return;
-    }
+  if (!gRgbRmtReady || pin != gRgbPin) {
+    if (!rgbLedBegin(pin)) return;
   }
-  rmt_item32_t items[24];
+  rmt_data_t data[24];
   const uint8_t grb[3] = {g, r, b};   // WS2812 的传输顺序是 G→R→B
-  // 时序取 WS2812 规范中心值（div=1，一 tick 12.5ns）。此前 '0' 码 T0H=350ns
-  // 正好踩在部分灯珠（按 T1H/2 判定阈值 ≈350ns）的 0/1 判定线上，导致
-  // '0' 被误判为 '1'：任何颜色都显示白色、熄灭无效。现将 0/1 高电平差拉开。
+  // 与官方 neopixelWrite() 相同的时序：'1' 高 0.8µs/低 0.4µs，'0' 高 0.4µs/低 0.8µs
   for (int i = 0; i < 3; ++i) {
     for (int bit = 0; bit < 8; ++bit) {
       const bool one = (grb[i] >> (7 - bit)) & 0x01;
-      rmt_item32_t& it = items[i * 8 + bit];
+      rmt_data_t& it = data[i * 8 + bit];
       it.level0 = 1;
-      it.duration0 = one ? 60 : 24;   // '1' 高 0.75 µs / '0' 高 0.30 µs
+      it.duration0 = one ? 8 : 4;
       it.level1 = 0;
-      it.duration1 = one ? 40 : 76;   //      低 0.50 µs /      低 0.95 µs
+      it.duration1 = one ? 4 : 8;
     }
   }
-  rmt_write_items(gRgbRmtChannel, items, 24, true);
+  rmtWrite(gRgbRmt, data, 24);
 }
 
 void rgbLedClear() { rgbLedPush(gRgbPin, 0, 0, 0); }
@@ -7536,7 +7501,11 @@ document.addEventListener('click',function(ev){
 async function ledColor(arg){
   const [r,g,b]=arg.split(',').map(Number);
   const j=await api('/api/v1/led/test?r='+r+'&g='+g+'&b='+b,{method:'POST'});
-  $('ledScanMsg').textContent=(j&&j.ok!==false&&!j.error)?'已发送颜色 ('+r+','+g+','+b+')':'失败：'+((j&&(j.error||j.message))||'未知');
+  if(j&&j.ok!==false&&!j.error){
+    $('ledScanMsg').textContent='已发送 ('+r+','+g+','+b+') · 引脚='+(j.pin!=null?j.pin:'?')+' · RMT='+(j.rmt?('就绪'):'未就绪');
+  }else{
+    $('ledScanMsg').textContent='失败：'+((j&&(j.error||j.message))||'未知');
+  }
 }
 async function ledScan(){
   $('ledScanMsg').textContent='扫描中，请勿断电，全程约 25 秒…';
